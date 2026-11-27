@@ -106,18 +106,18 @@ block "Unauthenticated channel hijack attempt -> HTTP $RES_NOAUTH"
 RES_SPOOF=$(api_post "/api/v1/heartbeat" '{"device_id":"factory-robot-01","outcome":"UPDATED"}' "")
 block "Unsigned telemetry spoofing attempt    -> HTTP $RES_SPOOF"
 
-# Attacker overwrites latest.ev with rogue-signed event
+# Attacker plants a rogue-signed event on an unpromoted channel mirror -> edge device MUST reject fail-closed!
+mkdir -p "$WORK/cp/repo/channels/rogue"
 $FP emit --key "$WORK/keys/evil.sk" --repo "$REPO_ID" --serial 2 --prev "$E1" --action install \
-  --input "$WORK/cp/repo/objects/$B2" --ttl 3600 --out "$WORK/cp/repo/channels/canary/latest.ev" >/dev/null
+  --input "$WORK/cp/repo/objects/$B2" --ttl 3600 --out "$WORK/cp/repo/channels/rogue/latest.ev" >/dev/null
 set +e
-OUT_EVIL=$("$AGENT" --repo "$BASE" --channel canary --device factory-robot-01 \
+OUT_EVIL=$("$AGENT" --repo "$BASE" --channel rogue --device factory-robot-01 \
   --store "$WORK/edge/store" --target "$WORK/edge/live" --root "$WORK/edge/pinned_root.fpr" \
   --key "$WORK/keys/dev.sk" --health-cmd "$HCMD" --once)
 RC_EVIL=$?
 set -e
 test "$RC_EVIL" -ne 0
 block "Rogue-signed firmware rejected fail-closed by edge device -> $OUT_EVIL"
-cp "$WORK/cp/repo/events/1.ev" "$WORK/cp/repo/channels/canary/latest.ev"
 
 # --- SCENE 3: Broken Firmware v2.0.0-bad -> Automatic Rollback ---
 banner "SCENE 3: Validly Signed Broken Update v2.0.0-bad -> Zero-Downtime Auto-Rollback"

@@ -767,6 +767,80 @@ static void test_control_plane(const char *work) {
             } else {
                 record_ok("SF-A07", "Dashboard HTML loadData() sends Admin Bearer header and handles 401 cleanly");
             }
+
+            /* R4 + R5: Atomic SQLite channel+audit transaction AND server-side audit category isolation */
+            char can1_st[256], sig1_st[129];
+            uint8_t sraw1_st[64];
+            snprintf(can1_st, sizeof(can1_st), "SF_APPROVAL_V1|stable|1|%s", eh_hex);
+            crypto_sign_ed25519_detached(sraw1_st, NULL, (const uint8_t *)can1_st, strlen(can1_st), ak1.sk);
+            to_hex(sraw1_st, 64, sig1_st);
+            snprintf(body_buf, sizeof(body_buf),
+                     "{\"channel\":\"stable\",\"serial\":1,\"approver\":\"alice\",\"reason\":\"2nd\",\"signature\":\"%s\"}", sig1_st);
+            snprintf(req, sizeof(req),
+                     "POST /api/v1/approvals HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                     "Content-Length: %zu\r\n\r\n%s", sec_tok, strlen(body_buf), body_buf);
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            assert(strncmp(resp, "HTTP/1.1 200", 12) == 0);
+
+            snprintf(req, sizeof(req),
+                     "POST /api/v1/channels/stable HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                     "Content-Length: %zu\r\n\r\n%s", sec_tok, strlen(sprom), sprom);
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            assert(strncmp(resp, "HTTP/1.1 200", 12) == 0);
+
+            /* Remove legacy file mirror channels/stable/latest.ev -> GET must still serve committed DB pointer! */
+            char mir_ev[600];
+            snprintf(mir_ev, sizeof(mir_ev), "%s/repo/channels/stable/latest.ev", sec_dir);
+            (void)unlink(mir_ev);
+            snprintf(req, sizeof(req), "GET /repo/channels/stable/latest.ev HTTP/1.1\r\nHost: x\r\n\r\n");
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            if (strncmp(resp, "HTTP/1.1 200 OK", 15) != 0) {
+                record_finding("HIGH", "CP-R4", "Channel GET failed when legacy latest.ev mirror was absent despite committed DB pointer");
+            } else {
+                record_ok("CP-R4", "Channel promotion commits pointer + audit in one SQLite TX and serves committed immutable event");
+            }
+
+            /* R5: Enroll device, send heartbeat claiming channel='governance' + outcome='CHANNEL_SET' -> category MUST be 'heartbeat'! */
+            snprintf(body_buf, sizeof(body_buf), "{\"device_id\":\"d1\",\"pubkey\":\"%s\"}", dpk_hex);
+            snprintf(req, sizeof(req),
+                     "POST /api/v1/devices/enroll HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                     "Content-Length: %zu\r\n\r\n%s", sec_tok, strlen(body_buf), body_buf);
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            assert(strncmp(resp, "HTTP/1.1 200", 12) == 0);
+
+            const char *tricky_hb = "{\"device_id\":\"d1\",\"channel\":\"governance\",\"outcome\":\"CHANNEL_SET\",\"active_serial\":1,\"hb_seq\":1}";
+            crypto_sign_ed25519_detached(dsig, NULL, (const uint8_t *)tricky_hb, strlen(tricky_hb), dkp.sk);
+            to_hex(dsig, 64, dsig_hex);
+            snprintf(req, sizeof(req),
+                     "POST /api/v1/heartbeat HTTP/1.1\r\nHost: x\r\n"
+                     "X-SF-Device-PubKey: %s\r\nX-SF-Signature: %s\r\n"
+                     "Content-Length: %zu\r\n\r\n%s",
+                     dpk_hex, dsig_hex, strlen(tricky_hb), tricky_hb);
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            assert(strncmp(resp, "HTTP/1.1 200", 12) == 0);
+
+            sqlite3 *cdb = NULL;
+            assert(sqlite3_open(sec_db_path, &cdb) == SQLITE_OK);
+            int hb_cat_ok = 0, admin_partial_ok = 0, chan_row_ok = 0;
+            sqlite3_stmt *qs = NULL;
+            if (sqlite3_prepare_v2(cdb, "SELECT COUNT(*) FROM audit_log WHERE device_id='d1' AND category='heartbeat';", -1, &qs, NULL) == SQLITE_OK) {
+                if (sqlite3_step(qs) == SQLITE_ROW && sqlite3_column_int(qs, 0) == 1) hb_cat_ok = 1;
+                sqlite3_finalize(qs);
+            }
+            if (sqlite3_prepare_v2(cdb, "SELECT COUNT(*) FROM audit_log WHERE outcome='APPROVED_PARTIAL' AND category='admin';", -1, &qs, NULL) == SQLITE_OK) {
+                if (sqlite3_step(qs) == SQLITE_ROW && sqlite3_column_int(qs, 0) >= 1) admin_partial_ok = 1;
+                sqlite3_finalize(qs);
+            }
+            if (sqlite3_prepare_v2(cdb, "SELECT COUNT(*) FROM channels WHERE channel='stable' AND serial=1;", -1, &qs, NULL) == SQLITE_OK) {
+                if (sqlite3_step(qs) == SQLITE_ROW && sqlite3_column_int(qs, 0) == 1) chan_row_ok = 1;
+                sqlite3_finalize(qs);
+            }
+            sqlite3_close(cdb);
+            if (!hb_cat_ok || !admin_partial_ok || !chan_row_ok) {
+                record_finding("MEDIUM", "CP-R4/R5", "audit_log.category isolation or channels table commit verification failed");
+            } else {
+                record_ok("CP-R5", "audit_log.category isolates device telemetry ('heartbeat') from admin/partial-approval records ('admin')");
+            }
         }
 
         /* SEC-07: sf-llama-bridge --role server without --peer-pk or --allow-any-peer MUST fail closed */

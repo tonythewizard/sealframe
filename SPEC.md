@@ -103,7 +103,7 @@ Commit state machine (recorded atomically in `<target_dir>/.sf_tx_journal`: `SFT
 ## SF-008 & SF-009 — Verified Tensor Wire Format (`SFT1`) & Distributed Inference Bridge
 
 - **`SFT1` (32 B Header):** `"SFT1"` | `version` | `dtype` (`FP32`, `FP16`, `BF16`, `INT8`, `INT4_G32`, `INT4_OUTLIER`) | `ndim` (1..4) | `flags` | `dims[4]` | `seq_id`. Per-tensor `INT8` automatically promotes frames with `crest_factor > 24` to `BF16`.
-- **`sf-llama-bridge` Compatibility Handshake (`BR_TAG_HELLO = 13`):** 34-byte session preamble (`"SFLB"` | `proto_ver=4` | `ggml_tensor_hdr_len=296` | `ggml_cmd_max=16` | `cap_bitmap` | `wire_cast` | `strict_lossless` | `logits_topk` | `abi_blake3_128[16]`) verified fail-closed at connection setup (0 overhead on per-token decode).
+- **`sf-llama-bridge` Compatibility Handshake (`BR_TAG_HELLO = 13`):** 34-byte session preamble (`"SFLB"` | `proto_ver=5` | `ggml_tensor_hdr_len=296` | `ggml_cmd_max=16` | `cap_bitmap` | `wire_cast` | `strict_lossless` | `logits_topk` | `abi_blake3_128[16]`) verified fail-closed at connection setup (0 overhead on per-token decode).
 - **Sparse FP32 Top-K Logits (`BR_TAG_RESP_TOPK`):** Transmits exact FP32 values for the top-`K` logits per row and fills excluded vocabulary entries with `-1e9f` (exact for greedy / top-k `<= K`; alters full-vocab sampling distributions when `K < vocab`). Use `--strict-lossless` to disable lossy codecs and Top-K completely.
 
 ---

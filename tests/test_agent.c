@@ -1005,6 +1005,217 @@ int main(void) {
             assert(rep.outcome == FP_AGENT_REVOKED && rep.active_serial == 7);
             assert(lstat(mcur, &st_chk) != 0 && lstat(mrev, &st_chk) == 0);
             printf("[PASS] SF-A02/P0-05 (2): Double revoke [REVOKE active V4 + REVOKE old V1] deactivated live target!\n");
+
+            /* Test N (Differential Audit 20611c4: R1 intermediate crash recovery, R2 rejected+revoke, R3 explicit rollback crash) */
+            {
+                char ntmpl[] = "/tmp/fp-ag-m5-XXXXXX";
+                char *ndir = mkdtemp(ntmpl);
+                assert(ndir != NULL);
+                char nrepo[256], nev[300], nchan[300], nst[340], nedge[256], nstore[300], ntarget[300];
+                char nsrc_dbp[300], ndst_dbp[300], nroot_p[300], nhcmd[512], notap[360], ncur[360], nunh[360];
+                snprintf(nrepo, sizeof(nrepo), "%s/repo", ndir);
+                snprintf(nev, sizeof(nev), "%s/events", nrepo);
+                snprintf(nchan, sizeof(nchan), "%s/channels", nrepo);
+                snprintf(nst, sizeof(nst), "%s/stable", nchan);
+                snprintf(nedge, sizeof(nedge), "%s/edge", ndir);
+                snprintf(nstore, sizeof(nstore), "%s/store", nedge);
+                snprintf(ntarget, sizeof(ntarget), "%s/live", nedge);
+                snprintf(nsrc_dbp, sizeof(nsrc_dbp), "%s/src.db", ndir);
+                snprintf(ndst_dbp, sizeof(ndst_dbp), "%s/dst.db", nedge);
+                snprintf(nroot_p, sizeof(nroot_p), "%s/root.fpr", nedge);
+                snprintf(notap, sizeof(notap), "%s/.sf_ota_state", ntarget);
+                snprintf(ncur, sizeof(ncur), "%s/current", ntarget);
+                snprintf(nunh, sizeof(nunh), "%s/.sf_unhealthy", ntarget);
+                assert(mkdir(nrepo, 0755) == 0 && mkdir(nev, 0755) == 0 &&
+                       mkdir(nchan, 0755) == 0 && mkdir(nst, 0755) == 0 && mkdir(nedge, 0755) == 0);
+
+                fp_keypair_t nrk, nrel;
+                assert(fp_keygen(&nrk) == FP_OK && fp_keygen(&nrel) == FP_OK);
+                fp_dna_t nrid;
+                assert(fp_random_id(&nrid) == FP_OK);
+                fp_root_doc_t nr;
+                memset(&nr, 0, sizeof(nr));
+                nr.version = 1; nr.root_version = 1; nr.root_threshold = 1; nr.repo_id = nrid;
+                nr.timestamp_unix = now - 60; nr.expires_unix = now + 86400;
+                nr.root_key_count = 1; memcpy(nr.root_keys[0], nrk.pk, FP_PK_LEN);
+                memcpy(nr.release_pk, nrel.pk, FP_PK_LEN);
+                assert(fp_root_add_sig(&nr, &nrk) == FP_OK);
+                assert(fp_root_encode(&nr, &rb, &rl) == FP_OK);
+                write_bytes_file(nroot_p, rb, rl);
+                snprintf(rp, sizeof(rp), "%s/root.fpr", nrepo); write_bytes_file(rp, rb, rl);
+                free(rb);
+
+                fp_sql_ctx_t *nsrc = NULL, *ndst = NULL;
+                assert(fp_sql_open(nsrc_dbp, &nsrc) == FP_OK && fp_sql_open(ndst_dbp, &ndst) == FP_OK);
+                assert(fp_sql_exec(nsrc, "CREATE TABLE kv(k INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+                assert(fp_sql_exec(ndst, "CREATE TABLE kv(k INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+                fp_dna_t n_empty_dig;
+                assert(fp_sql_state_digest(nsrc, "kv", &n_empty_dig) == FP_OK);
+
+                const char *nsqls[3] = {
+                    "INSERT INTO kv VALUES (1, 10);",
+                    "INSERT INTO kv VALUES (2, 20);",
+                    "INSERT INTO kv VALUES (3, 30);"
+                };
+                const char *ncfgs[3] = { "OK=1\n", "FAIL=1\n", "OK=3\n" };
+                fp_dna_t nbdnas[3], ndigs[3];
+                uint64_t nbsz[3];
+                for (int i = 0; i < 3; i++) {
+                    uint8_t *cs = NULL; size_t csl = 0;
+                    assert(fp_sql_capture_changeset(nsrc, "kv", nsqls[i], &cs, &csl) == FP_OK);
+                    assert(fp_sql_state_digest(nsrc, "kv", &ndigs[i]) == FP_OK);
+                    fp_bundle_t nb;
+                    memset(&nb, 0, sizeof(nb));
+                    nb.version = 1; nb.entry_count = 2;
+                    nb.entries[0].role = FP_ROLE_FILE; nb.entries[0].mode = 0644; nb.entries[0].size = strlen(ncfgs[i]);
+                    snprintf(nb.entries[0].path, sizeof(nb.entries[0].path), "app.cfg");
+                    assert(fp_store_put_object(nrepo, (const uint8_t *)ncfgs[i], strlen(ncfgs[i]), &nb.entries[0].dna) == FP_OK);
+                    assert(fp_store_put_object(nstore, (const uint8_t *)ncfgs[i], strlen(ncfgs[i]), NULL) == FP_OK);
+                    nb.entries[1].role = FP_ROLE_SQLITE_CHANGESET; nb.entries[1].size = csl;
+                    snprintf(nb.entries[1].path, sizeof(nb.entries[1].path), "kv");
+                    assert(fp_store_put_object(nrepo, cs, csl, &nb.entries[1].dna) == FP_OK);
+                    assert(fp_store_put_object(nstore, cs, csl, NULL) == FP_OK);
+                    free(cs);
+                    fp_dna_t tmp_d;
+                    assert(fp_bundle_pack(nrepo, &nb, &nbdnas[i]) == FP_OK);
+                    assert(fp_bundle_pack(nstore, &nb, &tmp_d) == FP_OK && fp_dna_equal(&tmp_d, &nbdnas[i]));
+                    assert(fp_store_has_object(nrepo, &nbdnas[i], &nbsz[i]));
+                }
+                fp_sql_close(nsrc);
+
+                char h0[65], h1[65], h2[65], hzero[65];
+                fp_hex_encode(nbdnas[0].bytes, FP_DNA_LEN, h0);
+                fp_hex_encode(nbdnas[1].bytes, FP_DNA_LEN, h1);
+                fp_hex_encode(nbdnas[2].bytes, FP_DNA_LEN, h2);
+                memset(hzero, '0', 64); hzero[64] = '\0';
+
+                fp_agent_cfg_t ncfg;
+                memset(&ncfg, 0, sizeof(ncfg));
+                ncfg.device_id = "edge-m5"; ncfg.repo_url = "http://127.0.0.1:1"; ncfg.channel = "stable";
+                ncfg.store_dir = nstore; ncfg.target_dir = ntarget; ncfg.db_path = ndst_dbp;
+                ncfg.root_path = nroot_p; ncfg.health_cmd = nhcmd; ncfg.health_timeout_sec = 5;
+                snprintf(nhcmd, sizeof(nhcmd), "grep -q 'OK=' '%s/current/app.cfg'", ntarget);
+
+                /* R1 (Case 1 — Initial install crashed after intermediate V1 of V1->V2):
+                 * offline recovery MUST revert SQLite to empty baseline AND unlink current! */
+                assert(fp_bundle_apply(nstore, &nbdnas[0], ntarget, ndst, 1, 0) == FP_OK);
+                fp_sql_close(ndst);
+                char oline[256];
+                int oln = snprintf(oline, sizeof(oline), "SFOTA1 HEALTH_PENDING 2 %s 0 %s 1\n", h1, hzero);
+                write_bytes_file(notap, (const uint8_t *)oline, (size_t)oln);
+                (void)fp_agent_sync_once(&ncfg, &rep);
+                assert(lstat(notap, &st_chk) != 0);
+                assert(lstat(ncur, &st_chk) != 0);
+                assert(fp_sql_open(ndst_dbp, &ndst) == FP_OK);
+                fp_dna_t ndig_now;
+                assert(fp_sql_state_digest(ndst, "kv", &ndig_now) == FP_OK && fp_dna_equal(&ndig_now, &n_empty_dig));
+
+                /* R1 (Case 2 — Upgrade V1 -> [V2, V3] crashed after intermediate V2!):
+                 * offline recovery MUST revert BOTH files AND SQLite back to V1 without FP_ERR_CHAIN! */
+                assert(fp_bundle_apply(nstore, &nbdnas[0], ntarget, ndst, 1, 0) == FP_OK);
+                assert(fp_bundle_apply(nstore, &nbdnas[1], ntarget, ndst, 2, 0) == FP_OK);
+                fp_sql_close(ndst);
+                oln = snprintf(oline, sizeof(oline), "SFOTA1 HEALTH_PENDING 3 %s 1 %s 2\n", h2, h0);
+                write_bytes_file(notap, (const uint8_t *)oline, (size_t)oln);
+                (void)fp_agent_sync_once(&ncfg, &rep);
+                assert(lstat(notap, &st_chk) != 0);
+                assert(fp_sql_open(ndst_dbp, &ndst) == FP_OK);
+                assert(fp_sql_state_digest(ndst, "kv", &ndig_now) == FP_OK && fp_dna_equal(&ndig_now, &ndigs[0]));
+                /* Repeat offline recovery -> idempotent! */
+                fp_sql_close(ndst);
+                (void)fp_agent_sync_once(&ncfg, &rep);
+                assert(fp_sql_open(ndst_dbp, &ndst) == FP_OK);
+                assert(fp_sql_state_digest(ndst, "kv", &ndig_now) == FP_OK && fp_dna_equal(&ndig_now, &ndigs[0]));
+                printf("[PASS] R1: Offline recovery from intermediate multi-step SQLite crashes (initial & upgrade) exact & idempotent\n");
+
+                /* R3: Explicit rollback crash recovery (ROLLBACK_HEALTH_PENDING after V2->V1) */
+                assert(fp_bundle_apply(nstore, &nbdnas[1], ntarget, ndst, 2, 0) == FP_OK);
+                assert(fp_bundle_rollback(nstore, &nbdnas[1], &nbdnas[0], ntarget, ndst) == FP_OK);
+                fp_sql_close(ndst);
+                /* 3a: Healthy target V1 -> offline recovery validates V1 and clears journal (no FP_ERR_CHAIN!) */
+                oln = snprintf(oline, sizeof(oline), "SFOTA1 ROLLBACK_HEALTH_PENDING 3 %s 1 %s 3\n", h0, h1);
+                write_bytes_file(notap, (const uint8_t *)oline, (size_t)oln);
+                (void)fp_agent_sync_once(&ncfg, &rep);
+                assert(lstat(notap, &st_chk) != 0);
+                assert(lstat(ncur, &st_chk) == 0);
+                assert(fp_sql_open(ndst_dbp, &ndst) == FP_OK);
+                assert(fp_sql_state_digest(ndst, "kv", &ndig_now) == FP_OK && fp_dna_equal(&ndig_now, &ndigs[0]));
+                fp_sql_close(ndst);
+                /* 3b: Unhealthy rollback target -> offline recovery durably deactivates target & creates .sf_unhealthy */
+                ncfg.health_cmd = "false";
+                write_bytes_file(notap, (const uint8_t *)oline, (size_t)oln);
+                (void)fp_agent_sync_once(&ncfg, &rep);
+                assert(lstat(notap, &st_chk) != 0);
+                assert(lstat(ncur, &st_chk) != 0 && lstat(nunh, &st_chk) == 0);
+                printf("[PASS] R3: ROLLBACK_HEALTH_PENDING offline recovery converges (healthy->keep, unhealthy->deactivate)\n");
+
+                /* R2: Rejected release V2 (serial=2) followed by historical REVOKE (serial=3) MUST NOT promote V2! */
+                char r2tmpl_e[] = "/tmp/fp-ag-r2-XXXXXX";
+                char *r2edge = mkdtemp(r2tmpl_e);
+                assert(r2edge != NULL);
+                char r2store[300], r2target[300], r2dbp[300], r2root[300], r2hcmd[512];
+                snprintf(r2store, sizeof(r2store), "%s/store", r2edge);
+                snprintf(r2target, sizeof(r2target), "%s/live", r2edge);
+                snprintf(r2dbp, sizeof(r2dbp), "%s/dst.db", r2edge);
+                snprintf(r2root, sizeof(r2root), "%s/root.fpr", r2edge);
+                snprintf(r2hcmd, sizeof(r2hcmd), "grep -q 'OK=' '%s/current/app.cfg'", r2target);
+                assert(fp_root_encode(&nr, &rb, &rl) == FP_OK);
+                write_bytes_file(r2root, rb, rl);
+                free(rb);
+                assert(fp_sql_open(r2dbp, &ndst) == FP_OK);
+                assert(fp_sql_exec(ndst, "CREATE TABLE kv(k INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+                fp_sql_close(ndst);
+
+                fp_event_t ne1, ne2, ne3;
+                memset(&ne1, 0, sizeof(ne1)); memset(&ne2, 0, sizeof(ne2)); memset(&ne3, 0, sizeof(ne3));
+                ne1.action = FP_ACTION_INSTALL; ne1.repo_id = nrid; ne1.serial = 1;
+                ne1.timestamp_unix = now; ne1.expires_unix = now + 3600;
+                ne1.target_dna = nbdnas[0]; ne1.target_size = nbsz[0];
+                assert(fp_event_sign(&ne1, &nrel) == FP_OK);
+                assert(fp_event_encode(&ne1, &eb, &el) == FP_OK);
+                snprintf(rp, sizeof(rp), "%s/1.ev", nev); write_bytes_file(rp, eb, el);
+                snprintf(rp, sizeof(rp), "%s/latest.ev", nst); write_bytes_file(rp, eb, el);
+                free(eb);
+
+                srv.repo_dir = nrepo;
+                fp_agent_cfg_t r2cfg;
+                memset(&r2cfg, 0, sizeof(r2cfg));
+                r2cfg.device_id = "edge-r2"; r2cfg.repo_url = base_url; r2cfg.channel = "stable";
+                r2cfg.store_dir = r2store; r2cfg.target_dir = r2target; r2cfg.db_path = r2dbp;
+                r2cfg.root_path = r2root; r2cfg.health_cmd = r2hcmd; r2cfg.health_timeout_sec = 5;
+                assert(fp_agent_sync_once(&r2cfg, &rep) == FP_OK && rep.active_serial == 1);
+
+                /* Serial 2: INSTALL V2 (FAIL=1 -> fails health check -> auto-rolls back to V1, failed_serial=2) */
+                ne2.action = FP_ACTION_INSTALL; ne2.repo_id = nrid; ne2.serial = 2;
+                ne2.prev_event_hash = ne1.event_hash; ne2.timestamp_unix = now; ne2.expires_unix = now + 3600;
+                ne2.target_dna = nbdnas[1]; ne2.target_size = nbsz[1];
+                assert(fp_event_sign(&ne2, &nrel) == FP_OK);
+                assert(fp_event_encode(&ne2, &eb, &el) == FP_OK);
+                snprintf(rp, sizeof(rp), "%s/2.ev", nev); write_bytes_file(rp, eb, el);
+                snprintf(rp, sizeof(rp), "%s/latest.ev", nst); write_bytes_file(rp, eb, el);
+                free(eb);
+                assert(fp_agent_sync_once(&r2cfg, &rep) == FP_OK && rep.outcome == FP_AGENT_ROLLED_BACK && rep.active_serial == 1);
+
+                /* Serial 3: REVOKE unrelated historical DNA (nbdnas[2]) -> simulated target is STILL failed V2! */
+                ne3.action = FP_ACTION_REVOKE; ne3.repo_id = nrid; ne3.serial = 3;
+                ne3.prev_event_hash = ne2.event_hash; ne3.timestamp_unix = now; ne3.expires_unix = now + 3600;
+                ne3.target_dna = nbdnas[2]; ne3.target_size = 0;
+                snprintf(ne3.reason, sizeof(ne3.reason), "revoke-unrelated");
+                assert(fp_event_sign(&ne3, &nrel) == FP_OK);
+                assert(fp_event_encode(&ne3, &eb, &el) == FP_OK);
+                snprintf(rp, sizeof(rp), "%s/3.ev", nev); write_bytes_file(rp, eb, el);
+                snprintf(rp, sizeof(rp), "%s/latest.ev", nst); write_bytes_file(rp, eb, el);
+                free(eb);
+                assert(fp_agent_sync_once(&r2cfg, &rep) == FP_OK);
+                assert(rep.outcome == FP_AGENT_ROLLED_BACK && rep.active_serial == 1);
+                assert(fp_dna_equal(&rep.active_bundle_dna, &nbdnas[0]));
+                fp_store_state_t r2st;
+                assert(fp_store_load_state(r2store, &r2st) == FP_OK && r2st.serial == 1);
+                assert(fp_sql_open(r2dbp, &ndst) == FP_OK);
+                assert(fp_sql_state_digest(ndst, "kv", &ndig_now) == FP_OK && fp_dna_equal(&ndig_now, &ndigs[0]));
+                fp_sql_close(ndst);
+                printf("[PASS] R2: Historical REVOKE after rejected V2 stays ROLLED_BACK on V1 (ledger/DB/telemetry concordant)\n");
+            }
         }
     }
 

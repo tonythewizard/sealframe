@@ -384,7 +384,9 @@ static ota_parse_status_t parse_ota_lifecycle(const char *target_dir, ota_lifecy
                      magic, out->state, &oseq, out->new_hex, &out->has_prev, out->prev_hex, &sseq, extra);
     if (got != 6 && got != 7) return OTA_ST_CORRUPTED;
     if (strcmp(magic, "SFOTA1") != 0 || oseq == 0) return OTA_ST_CORRUPTED;
-    if (strcmp(out->state, "HEALTH_PENDING") != 0 && strcmp(out->state, "LEDGER_PENDING") != 0) {
+    if (strcmp(out->state, "HEALTH_PENDING") != 0 &&
+        strcmp(out->state, "ROLLBACK_HEALTH_PENDING") != 0 &&
+        strcmp(out->state, "LEDGER_PENDING") != 0) {
         return OTA_ST_CORRUPTED;
     }
     if ((out->has_prev != 0 && out->has_prev != 1) ||
@@ -499,29 +501,32 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
             rerr = fp_sql_get_progress(rec_sql, &sql_seq, sql_dna);
             if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
         }
+        /* R1: Identify the ACTUAL committed head DNA (may be an intermediate step in a multi-event catch-up!) */
+        const char *actual_hex = NULL;
+        if (rec_sql && sql_seq > 0 && is_hex64_str(sql_dna)) actual_hex = sql_dna;
+        else if (has_live) actual_hex = live_cur;
+        fp_dna_t actual_dna = ndna;
+        if (actual_hex && fp_hex_decode(actual_hex, actual_dna.bytes, FP_DNA_LEN) != FP_OK) {
+            fp_sql_close(rec_sql);
+            return FP_ERR_INTEGRITY;
+        }
+
         if (ol.has_prev) {
-            int new_active = (has_live && strcmp(live_cur, ol.new_hex) == 0) ||
-                             (rec_sql && strcmp(sql_dna, ol.new_hex) == 0);
             int prev_active = (has_live && strcmp(live_cur, ol.prev_hex) == 0) &&
                               (!rec_sql || strcmp(sql_dna, ol.prev_hex) == 0);
-            if (new_active) {
-                /* Crashed after activating new generation -> roll back cleanly & mark failed serial */
-                rerr = fp_bundle_rollback(cfg->store_dir, &ndna, &pdna, cfg->target_dir, rec_sql);
+            if (!prev_active) {
+                /* Crashed at ANY intermediate or final step -> roll back from actual_dna all the way to prev_dna! */
+                rerr = fp_bundle_rollback(cfg->store_dir, &actual_dna, &pdna, cfg->target_dir, rec_sql);
                 if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
                 save_failed_serial(cfg->store_dir, ol.serial, 1);
-            } else if (!prev_active) {
-                /* Inconsistent symlink vs DB -> reconcile idempotently back to prev_dna */
-                rerr = fp_bundle_rollback(cfg->store_dir, &ndna, &pdna, cfg->target_dir, rec_sql);
-                if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
             }
             /* Else: crashed BEFORE apply OR AFTER rollback already completed -> idempotent cleanup! */
             rerr = clear_ota_lifecycle(cfg->target_dir);
         } else {
-            int new_active = (has_live && strcmp(live_cur, ol.new_hex) == 0) ||
-                             (rec_sql && strcmp(sql_dna, ol.new_hex) == 0);
-            if (new_active) {
-                /* P1-01: Initial install crashed after apply -> invert SQLite & deactivate current! */
-                rerr = fp_bundle_rollback(cfg->store_dir, &ndna, NULL, cfg->target_dir, rec_sql);
+            int any_applied = has_live || (rec_sql && (sql_seq > 0 || sql_dna[0] != '\0'));
+            if (any_applied) {
+                /* R1 + P1-01: Initial install (single or multi-step) crashed after apply -> invert ALL SQLite steps & unlink current! */
+                rerr = fp_bundle_rollback(cfg->store_dir, &actual_dna, NULL, cfg->target_dir, rec_sql);
                 if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
                 save_failed_serial(cfg->store_dir, ol.serial, 0);
             } else {
@@ -532,6 +537,49 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
         }
         fp_sql_close(rec_sql);
         return rerr;
+    }
+
+    /* R3: Explicit ROLLBACK health recovery — NEVER attempt backward SQLite inversion toward newer deleted ancestor! */
+    if (strcmp(ol.state, "ROLLBACK_HEALTH_PENDING") == 0) {
+        char live_cur[65], sql_dna[65];
+        int has_live = read_current_gen_hex(cfg->target_dir, live_cur);
+        uint64_t sql_seq = 0;
+        sql_dna[0] = '\0';
+        if (rec_sql) {
+            rerr = fp_sql_get_progress(rec_sql, &sql_seq, sql_dna);
+            if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
+        }
+        int still_at_prev = ol.has_prev &&
+                            (has_live && strcmp(live_cur, ol.prev_hex) == 0) &&
+                            (!rec_sql || strcmp(sql_dna, ol.prev_hex) == 0);
+        if (still_at_prev) {
+            /* Crashed BEFORE explicit rollback mutated target -> idempotent cleanup */
+            rerr = clear_ota_lifecycle(cfg->target_dir);
+            fp_sql_close(rec_sql);
+            return rerr;
+        }
+        /* Rollback was partially or fully applied -> complete idempotently to target `ndna` if needed */
+        int at_target = (has_live && strcmp(live_cur, ol.new_hex) == 0) &&
+                        (!rec_sql || strcmp(sql_dna, ol.new_hex) == 0);
+        if (!at_target) {
+            const char *actual_hex = (rec_sql && sql_seq > 0 && is_hex64_str(sql_dna)) ? sql_dna
+                                     : (has_live ? live_cur : ol.prev_hex);
+            fp_dna_t actual_dna = pdna;
+            if (fp_hex_decode(actual_hex, actual_dna.bytes, FP_DNA_LEN) != FP_OK) {
+                fp_sql_close(rec_sql);
+                return FP_ERR_INTEGRITY;
+            }
+            rerr = fp_bundle_rollback(cfg->store_dir, &actual_dna, &ndna, cfg->target_dir, rec_sql);
+            if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
+        }
+        fp_sql_close(rec_sql);
+        /* Re-validate rollback target health offline: if unhealthy, durably deactivate BEFORE clearing journal! */
+        int hrc = fp_agent_run_health_check(cfg->health_cmd, cfg->health_timeout_sec);
+        if (hrc != 0) {
+            rerr = deactivate_live_target(cfg->target_dir, ".sf_unhealthy", "ROLLBACK_HEALTH_FAILED=1\n");
+            if (rerr != FP_OK) return rerr;
+        }
+        return clear_ota_lifecycle(cfg->target_dir);
     }
 
     /* P0-03: Offline idempotent completion of LEDGER_PENDING (health check already PASSED!) */
@@ -1110,12 +1158,38 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     /* 7. Download target Particle Bundle AND all intermediate bundles/entries needed for sequential SQLite catch-up (P0-02) */
     fp_dna_t final_target_dna = target_st.current_dna;
     uint64_t final_target_size = latest_ev.target_size;
+    uint64_t final_target_serial = 0;
     for (uint64_t i = chain_len; i > 0; i--) {
         if (chain[i - 1u].action != FP_ACTION_REVOKE &&
             fp_dna_equal(&chain[i - 1u].target_dna, &final_target_dna)) {
             final_target_size = chain[i - 1u].target_size;
+            final_target_serial = chain[i - 1u].serial;
             break;
         }
+    }
+
+    /* R2: If the simulated target release is STILL the exact serial previously rejected by local health-check
+     * (e.g. [INSTALL V2 (failed), REVOKE historical V0]), NEVER promote V2 as active while running V1! */
+    if (failed_serial > 0u && final_target_serial == failed_serial) {
+        free(chain); free(chain_ridx);
+        if (failed_had_prev && st.has_current) {
+            rep.outcome = FP_AGENT_ROLLED_BACK;
+            rep.active_serial = st.serial;
+            rep.active_bundle_dna = st.current_dna;
+            snprintf(rep.detail, sizeof(rep.detail),
+                     "target release serial %llu previously failed health-check (remaining on serial %llu)",
+                     (unsigned long long)failed_serial, (unsigned long long)st.serial);
+            err = FP_OK;
+        } else {
+            rep.outcome = FP_AGENT_INITIAL_INSTALL_FAILED;
+            rep.active_serial = 0;
+            memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
+            snprintf(rep.detail, sizeof(rep.detail),
+                     "target initial release serial %llu previously failed health-check; waiting for newer release",
+                     (unsigned long long)failed_serial);
+            err = FP_ERR_POLICY;
+        }
+        goto done;
     }
 
     err = download_bundle_and_entries(cfg, &final_target_dna, final_target_size,
@@ -1164,9 +1238,10 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     }
 
     int is_explicit_rollback = (latest_ev.action == FP_ACTION_ROLLBACK);
-    /* P0-03: Persist HEALTH_PENDING uniformly for BOTH INSTALL and ROLLBACK before any mutation! */
-    err = write_ota_lifecycle(cfg->target_dir, "HEALTH_PENDING", latest_ev.serial,
-                              chain[0].serial, &final_target_dna,
+    /* P0-03 + R3: Persist direction-aware lifecycle marker before any mutation! */
+    err = write_ota_lifecycle(cfg->target_dir,
+                              is_explicit_rollback ? "ROLLBACK_HEALTH_PENDING" : "HEALTH_PENDING",
+                              latest_ev.serial, chain[0].serial, &final_target_dna,
                               st.has_current ? 1 : 0, &st.current_dna);
     if (err != FP_OK) {
         fp_sql_close(sql);
@@ -1244,6 +1319,29 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         goto done;
     }
 
+    /* R2: Strict post-apply concordance check BEFORE running health watchdog & committing ledger!
+     * Ensures symlink `current`, SQLite `_fp_progress`, and reported `final_target_dna` are identical. */
+    {
+        char target_hex[65], live_cur[65];
+        fp_hex_encode(final_target_dna.bytes, FP_DNA_LEN, target_hex);
+        int cur_ok = read_current_gen_hex(cfg->target_dir, live_cur) && strcmp(live_cur, target_hex) == 0;
+        int sql_ok = 1;
+        if (sql) {
+            uint64_t cseq = 0;
+            char cdna[65];
+            cdna[0] = '\0';
+            sql_ok = (fp_sql_get_progress(sql, &cseq, cdna) == FP_OK && strcmp(cdna, target_hex) == 0);
+        }
+        if (!cur_ok || !sql_ok) {
+            fp_sql_close(sql);
+            free(chain); free(chain_ridx);
+            err = FP_ERR_INTEGRITY;
+            snprintf(rep.detail, sizeof(rep.detail),
+                     "post-apply state mismatch (current/SQLite != target DNA)");
+            goto done;
+        }
+    }
+
     /* 9. Run Application Health-Check with Watchdog -> AUTO-ROLLBACK ON FAILURE! */
     int hrc = fp_agent_run_health_check(cfg->health_cmd, cfg->health_timeout_sec);
     rep.health_exit_code = hrc;
@@ -1291,18 +1389,21 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
                      derr == FP_OK ? "reverted & deactivated" : "rollback error");
             err = (derr == FP_OK) ? FP_ERR_POLICY : derr;
         } else {
-            /* Explicit rollback failed health check: keep HEALTH_PENDING or deactivate unhealthy target */
-            (void)deactivate_live_target(cfg->target_dir, ".sf_unhealthy", "ROLLBACK_HEALTH_FAILED=1\n");
-            (void)clear_ota_lifecycle(cfg->target_dir);
+            /* R3: Explicit rollback failed health check -> propagate deactivation errors & keep journal if deactivation fails! */
+            fp_err_t derr = deactivate_live_target(cfg->target_dir, ".sf_unhealthy", "ROLLBACK_HEALTH_FAILED=1\n");
+            if (derr == FP_OK) {
+                derr = clear_ota_lifecycle(cfg->target_dir);
+            }
             fp_sql_close(sql);
             free(chain); free(chain_ridx);
             rep.outcome = FP_AGENT_ROLLBACK_FAILED;
             rep.active_serial = 0;
             memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
             snprintf(rep.detail, sizeof(rep.detail),
-                     "explicit rollback health-check failed (exit=%d) on serial %llu; target deactivated",
-                     hrc, (unsigned long long)latest_ev.serial);
-            err = FP_ERR_POLICY;
+                     "explicit rollback health-check failed (exit=%d) on serial %llu; %s",
+                     hrc, (unsigned long long)latest_ev.serial,
+                     derr == FP_OK ? "target deactivated" : "CRITICAL: deactivation failed");
+            err = (derr == FP_OK) ? FP_ERR_POLICY : derr;
         }
         goto done;
     }
