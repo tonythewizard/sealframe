@@ -650,6 +650,39 @@ static int copy_file_atomic(const char *src_path, const char *dst_path) {
         unlink(tmp_path);
         return -1;
     }
+    const char *slash = strrchr(dst_path, '/');
+    if (slash && slash > dst_path) {
+        char pdir[PATH_MAX];
+        size_t dlen = (size_t)(slash - dst_path);
+        if (dlen < sizeof(pdir)) {
+            memcpy(pdir, dst_path, dlen);
+            pdir[dlen] = '\0';
+            int pfd = open(pdir, O_RDONLY | O_DIRECTORY);
+            if (pfd >= 0) { (void)fsync(pfd); close(pfd); }
+        }
+    }
+    return 0;
+}
+
+static int cp_load_event_file(const char *ev_path, fp_event_t *out_ev, char out_hash_hex[65]) {
+    struct stat sb;
+    if (lstat(ev_path, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size <= 0 || sb.st_size > (1 << 20)) {
+        return -1;
+    }
+    FILE *f = fopen(ev_path, "rb");
+    if (!f) return -1;
+    size_t sz = (size_t)sb.st_size;
+    uint8_t *buf = malloc(sz);
+    if (!buf) { fclose(f); return -1; }
+    size_t rd = fread(buf, 1, sz, f);
+    fclose(f);
+    if (rd != sz) { free(buf); return -1; }
+    fp_err_t err = fp_event_decode(buf, sz, out_ev);
+    free(buf);
+    if (err != FP_OK) return -1;
+    if (out_hash_hex) {
+        to_hex_lower(out_ev->event_hash.bytes, FP_DNA_LEN, out_hash_hex);
+    }
     return 0;
 }
 
@@ -664,16 +697,21 @@ typedef struct {
     char            sbom_path[PATH_MAX];
     char            admin_token[128];
     int             require_signed_hb;
+    int             require_enrolled;
+    int             require_quorum;
     sqlite3        *db;
     pthread_mutex_t mu;
     _Atomic int     active_workers;
 } cp_state_t;
 
 static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_path,
-                         const char *explicit_tok, int require_signed_hb) {
+                         const char *explicit_tok, int require_signed_hb,
+                         int require_enrolled, int require_quorum) {
     memset(st, 0, sizeof(*st));
     pthread_mutex_init(&st->mu, NULL);
     st->require_signed_hb = require_signed_hb;
+    st->require_enrolled = require_enrolled;
+    st->require_quorum = require_quorum;
 
     if (mkdir_p(data_dir) != 0) return -1;
     if (!realpath(data_dir, st->data_dir)) {
@@ -773,13 +811,27 @@ static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_
         "  auth_verified INTEGER NOT NULL,"
         "  last_seen_utc TEXT NOT NULL"
         ");"
+        "CREATE TABLE IF NOT EXISTS enrolled_devices ("
+        "  device_id TEXT PRIMARY KEY,"
+        "  pubkey TEXT NOT NULL,"
+        "  last_seq INTEGER NOT NULL DEFAULT 0,"
+        "  enrolled_utc TEXT NOT NULL"
+        ");"
+        "CREATE TABLE IF NOT EXISTS approvers ("
+        "  approver TEXT PRIMARY KEY,"
+        "  pubkey TEXT NOT NULL,"
+        "  added_utc TEXT NOT NULL"
+        ");"
         "CREATE TABLE IF NOT EXISTS approvals ("
+        "  channel TEXT NOT NULL DEFAULT 'stable',"
         "  serial INTEGER NOT NULL,"
         "  approver TEXT NOT NULL,"
+        "  event_hash TEXT NOT NULL DEFAULT '',"
+        "  signature TEXT NOT NULL DEFAULT '',"
         "  approved_utc TEXT NOT NULL,"
         "  reason TEXT NOT NULL,"
         "  threshold INTEGER NOT NULL,"
-        "  PRIMARY KEY (serial, approver)"
+        "  PRIMARY KEY (channel, serial, approver)"
         ");";
     if (sqlite3_exec(st->db, schema, NULL, NULL, NULL) != SQLITE_OK) return -1;
     return 0;
@@ -829,15 +881,34 @@ static void db_append_audit(sqlite3 *db, const char *dev_id, const char *ip, con
 }
 
 static int cp_record_heartbeat(cp_state_t *st, const char *ip, const jval_t *body,
-                               int auth_ok, const char *pk_hex, char out_dev[65]) {
+                               int auth_ok, const char *pk_hex, char out_dev[65],
+                               int *out_http_status, char *err_msg, size_t err_cap) {
+    *out_http_status = 400;
+    snprintf(err_msg, err_cap, "invalid heartbeat field");
     if (!body || body->type != J_OBJ) return -1;
     char dev_id[65], channel[33], outcome[33], active_dna[65], att_dna[65], detail[257];
-    jobj_copy_str(body, "device_id", "unknown", dev_id, sizeof(dev_id));
+    jobj_copy_str(body, "device_id", "", dev_id, sizeof(dev_id));
+    if (!dev_id[0]) {
+        snprintf(err_msg, err_cap, "device_id required");
+        return -1;
+    }
     jobj_copy_str(body, "channel", "stable", channel, sizeof(channel));
     jobj_copy_str(body, "outcome", "UNKNOWN", outcome, sizeof(outcome));
     jobj_copy_str(body, "active_dna", "", active_dna, sizeof(active_dna));
     jobj_copy_str(body, "attempted_dna", "", att_dna, sizeof(att_dna));
     jobj_copy_str(body, "detail", "", detail, sizeof(detail));
+
+    int has_hb_seq = 0;
+    int64_t hb_seq = 0;
+    const jval_t *sqv = jobj_get(body, "hb_seq");
+    if (sqv) {
+        if (sqv->type != J_INT || sqv->ival < 1) {
+            snprintf(err_msg, err_cap, "hb_seq must be positive integer");
+            return -1;
+        }
+        has_hb_seq = 1;
+        hb_seq = sqv->ival;
+    }
 
     int64_t active_serial = 0, att_serial = 0, root_ver = 0, health_exit = 0;
     int64_t b_dl = 0, b_lan = 0, b_res = 0;
@@ -859,14 +930,98 @@ static int cp_record_heartbeat(cp_state_t *st, const char *ip, const jval_t *bod
     snprintf(pk_trunc, sizeof(pk_trunc), "%.64s", pk_hex ? pk_hex : "");
 
     pthread_mutex_lock(&st->mu);
+
+    /* Enforce device identity pinning & monotonic anti-replay counter */
+    sqlite3_stmt *es = NULL;
+    int enrolled = 0;
+    char pinned_pk[65];
+    int64_t last_seq = 0;
+    pinned_pk[0] = '\0';
+    if (sqlite3_prepare_v2(st->db,
+                           "SELECT pubkey, last_seq FROM enrolled_devices WHERE device_id=?;",
+                           -1, &es, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(es, 1, dev_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(es) == SQLITE_ROW) {
+            enrolled = 1;
+            const char *pkc = (const char *)sqlite3_column_text(es, 0);
+            snprintf(pinned_pk, sizeof(pinned_pk), "%.64s", pkc ? pkc : "");
+            last_seq = sqlite3_column_int64(es, 1);
+        }
+        sqlite3_finalize(es);
+    }
+
+    if (enrolled) {
+        if (!auth_ok || strlen(pk_trunc) != 64 || strlen(pinned_pk) != 64 ||
+            sodium_memcmp(pk_trunc, pinned_pk, 64) != 0) {
+            pthread_mutex_unlock(&st->mu);
+            *out_http_status = 401;
+            snprintf(err_msg, err_cap, "device identity mismatch: pubkey does not match enrolled key");
+            return -1;
+        }
+        if (has_hb_seq) {
+            if (hb_seq <= last_seq) {
+                pthread_mutex_unlock(&st->mu);
+                *out_http_status = 409;
+                snprintf(err_msg, err_cap, "heartbeat replay detected (hb_seq=%lld <= last=%lld)",
+                         (long long)hb_seq, (long long)last_seq);
+                return -1;
+            }
+            sqlite3_stmt *us = NULL;
+            if (sqlite3_prepare_v2(st->db,
+                                   "UPDATE enrolled_devices SET last_seq=? WHERE device_id=?;",
+                                   -1, &us, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(us, 1, hb_seq);
+                sqlite3_bind_text(us, 2, dev_id, -1, SQLITE_TRANSIENT);
+                (void)sqlite3_step(us);
+                sqlite3_finalize(us);
+            }
+        } else if (last_seq > 0) {
+            pthread_mutex_unlock(&st->mu);
+            *out_http_status = 409;
+            snprintf(err_msg, err_cap, "heartbeat replay protection active: monotonic hb_seq required");
+            return -1;
+        }
+    } else {
+        if (st->require_enrolled) {
+            pthread_mutex_unlock(&st->mu);
+            *out_http_status = 401;
+            snprintf(err_msg, err_cap, "device not enrolled");
+            return -1;
+        }
+        if (auth_ok && strlen(pk_trunc) == 64) {
+            /* Pin first cryptographically authenticated device key (TOFU pinning) */
+            sqlite3_stmt *is = NULL;
+            if (sqlite3_prepare_v2(
+                    st->db,
+                    "INSERT INTO enrolled_devices(device_id,pubkey,last_seq,enrolled_utc) VALUES(?,?,?,?);",
+                    -1, &is, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(is, 1, dev_id, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(is, 2, pk_trunc, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(is, 3, has_hb_seq ? hb_seq : 0);
+                sqlite3_bind_text(is, 4, utc, -1, SQLITE_TRANSIENT);
+                (void)sqlite3_step(is);
+                sqlite3_finalize(is);
+            }
+        }
+    }
+
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(
         st->db,
-        "INSERT OR REPLACE INTO devices("
+        "INSERT INTO devices("
         "device_id,ip,channel,outcome,active_serial,active_dna,attempted_serial,attempted_dna,"
         "root_version,health_exit,bytes_downloaded,bytes_from_lan,bytes_resumed,elapsed_ms,"
         "detail,auth_verified,device_pubkey,last_seen_utc) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(device_id) DO UPDATE SET "
+        "ip=excluded.ip,channel=excluded.channel,outcome=excluded.outcome,"
+        "active_serial=excluded.active_serial,active_dna=excluded.active_dna,"
+        "attempted_serial=excluded.attempted_serial,attempted_dna=excluded.attempted_dna,"
+        "root_version=excluded.root_version,health_exit=excluded.health_exit,"
+        "bytes_downloaded=excluded.bytes_downloaded,bytes_from_lan=excluded.bytes_from_lan,"
+        "bytes_resumed=excluded.bytes_resumed,elapsed_ms=excluded.elapsed_ms,"
+        "detail=excluded.detail,auth_verified=excluded.auth_verified,"
+        "device_pubkey=excluded.device_pubkey,last_seen_utc=excluded.last_seen_utc;",
         -1, &stmt, NULL);
     if (rc == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, dev_id, -1, SQLITE_TRANSIENT);
@@ -894,11 +1049,14 @@ static int cp_record_heartbeat(cp_state_t *st, const char *ip, const jval_t *bod
     pthread_mutex_unlock(&st->mu);
 
     snprintf(out_dev, 65, "%s", dev_id);
+    *out_http_status = 200;
     return 0;
 }
 
 static int cp_set_channel_serial(cp_state_t *st, const char *ch, int64_t serial,
-                                 const char *reason, char *msg, size_t msg_cap) {
+                                 const char *reason, int is_emergency_rollback,
+                                 char *msg, size_t msg_cap, int *out_http_status) {
+    *out_http_status = 400;
     if (!is_valid_channel(ch)) {
         snprintf(msg, msg_cap, "invalid channel");
         return -1;
@@ -908,9 +1066,21 @@ static int cp_set_channel_serial(cp_state_t *st, const char *ch, int64_t serial,
         snprintf(msg, msg_cap, "path too long");
         return -1;
     }
-    struct stat sb;
-    if (lstat(src, &sb) != 0 || !S_ISREG(sb.st_mode)) {
-        snprintf(msg, msg_cap, "event %lld.ev not found", (long long)serial);
+    fp_event_t ev;
+    char ev_hash_hex[65];
+    if (cp_load_event_file(src, &ev, ev_hash_hex) != 0) {
+        *out_http_status = 404;
+        snprintf(msg, msg_cap, "event %lld.ev not found or invalid", (long long)serial);
+        return -1;
+    }
+    if ((int64_t)ev.serial != serial) {
+        *out_http_status = 400;
+        snprintf(msg, msg_cap, "event file serial mismatch");
+        return -1;
+    }
+    if (is_emergency_rollback && ev.action != FP_ACTION_ROLLBACK) {
+        *out_http_status = 400;
+        snprintf(msg, msg_cap, "emergency rollback requires a signed FP_ACTION_ROLLBACK event");
         return -1;
     }
     if (snprintf(cdir, sizeof(cdir), "%s/%s", st->chan_dir, ch) >= (int)sizeof(cdir) ||
@@ -918,7 +1088,54 @@ static int cp_set_channel_serial(cp_state_t *st, const char *ch, int64_t serial,
         snprintf(msg, msg_cap, "path too long");
         return -1;
     }
+
+    /* Enforce strict monotonicity on channel serial (agents ignore serial <= current!) */
+    fp_event_t cur_ev;
+    if (cp_load_event_file(dst, &cur_ev, NULL) == 0 && (uint64_t)serial <= cur_ev.serial) {
+        *out_http_status = 409;
+        snprintf(msg, msg_cap,
+                 "monotonic violation: serial %lld <= active channel '%s' serial %llu "
+                 "(emit a new signed event with serial > %llu)",
+                 (long long)serial, ch, (unsigned long long)cur_ev.serial,
+                 (unsigned long long)cur_ev.serial);
+        return -1;
+    }
+
+    /* Enforce cryptographic 2-of-N approver quorum whenever approvers are registered or --require-quorum is set */
+    pthread_mutex_lock(&st->mu);
+    int approver_count = 0;
+    sqlite3_stmt *cs = NULL;
+    if (sqlite3_prepare_v2(st->db, "SELECT COUNT(*) FROM approvers;", -1, &cs, NULL) == SQLITE_OK) {
+        if (sqlite3_step(cs) == SQLITE_ROW) approver_count = sqlite3_column_int(cs, 0);
+        sqlite3_finalize(cs);
+    }
+    if (st->require_quorum || approver_count > 0) {
+        int verified_approvals = 0;
+        if (sqlite3_prepare_v2(
+                st->db,
+                "SELECT COUNT(DISTINCT a.approver) FROM approvals a "
+                "JOIN approvers r ON a.approver = r.approver "
+                "WHERE a.channel=? AND a.serial=? AND a.event_hash=?;",
+                -1, &cs, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(cs, 1, ch, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(cs, 2, serial);
+            sqlite3_bind_text(cs, 3, ev_hash_hex, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(cs) == SQLITE_ROW) verified_approvals = sqlite3_column_int(cs, 0);
+            sqlite3_finalize(cs);
+        }
+        if (verified_approvals < 2) {
+            pthread_mutex_unlock(&st->mu);
+            *out_http_status = 403;
+            snprintf(msg, msg_cap,
+                     "quorum not met for channel '%s' serial %lld (%d/2 distinct Ed25519 approvals)",
+                     ch, (long long)serial, verified_approvals);
+            return -1;
+        }
+    }
+    pthread_mutex_unlock(&st->mu);
+
     if (mkdir_p(cdir) != 0 || copy_file_atomic(src, dst) != 0) {
+        *out_http_status = 500;
         snprintf(msg, msg_cap, "failed to write channel latest.ev");
         return -1;
     }
@@ -932,9 +1149,12 @@ static int cp_set_channel_serial(cp_state_t *st, const char *ch, int64_t serial,
     utc_now(utc);
     snprintf(detail, sizeof(detail), "%s: channel '%s' -> serial #%lld", reason, ch, (long long)serial);
     pthread_mutex_lock(&st->mu);
-    db_append_audit(st->db, "CONTROL_PLANE", "admin", ch, "CHANNEL_SET", serial, detail, 1, utc);
+    db_append_audit(st->db, "CONTROL_PLANE", "admin", ch,
+                    is_emergency_rollback ? "EMERGENCY_ROLLBACK" : "CHANNEL_SET",
+                    serial, detail, 1, utc);
     pthread_mutex_unlock(&st->mu);
     snprintf(msg, msg_cap, "%s: channel '%s' promoted to serial %lld", reason, ch, (long long)serial);
+    *out_http_status = 200;
     return 0;
 }
 
@@ -1447,8 +1667,10 @@ static const char *status_text(int code) {
         case 206: return "Partial Content";
         case 400: return "Bad Request";
         case 401: return "Unauthorized";
+        case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
         case 413: return "Payload Too Large";
         case 416: return "Range Not Satisfiable";
         case 500: return "Internal Server Error";
@@ -1851,10 +2073,18 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 send_json(cfd, 401, "{\"ok\":false,\"error\":\"signed Ed25519 heartbeat required\"}");
                 return;
             }
-            char dev_id[65];
-            if (cp_record_heartbeat(st, client_ip, body, auth_ok, hdr_pk, dev_id) != 0) {
+            char dev_id[65], err_msg[256];
+            int http_rc = 400;
+            if (cp_record_heartbeat(st, client_ip, body, auth_ok, hdr_pk, dev_id,
+                                    &http_rc, err_msg, sizeof(err_msg)) != 0) {
+                sbuf_t er;
+                sb_init(&er, 256);
+                sb_puts(&er, "{\"ok\":false,\"error\":");
+                sb_json_str(&er, err_msg);
+                sb_putc(&er, '}');
+                send_json(cfd, http_rc, er.data);
+                sb_free(&er);
                 jval_free(body); free(raw_body);
-                send_json(cfd, 400, "{\"ok\":false,\"error\":\"invalid heartbeat field\"}");
                 return;
             }
             sbuf_t resp;
@@ -1870,52 +2100,190 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
 
         if (strncmp(path, "/api/v1/channels/", 17) == 0 ||
             strcmp(path, "/api/v1/emergency/rollback") == 0 ||
-            strcmp(path, "/api/v1/approvals") == 0) {
+            strcmp(path, "/api/v1/approvals") == 0 ||
+            strcmp(path, "/api/v1/approvers") == 0 ||
+            strcmp(path, "/api/v1/devices/enroll") == 0) {
             if (!check_admin_bearer(st, hdr_auth)) {
                 jval_free(body); free(raw_body);
                 send_json(cfd, 401, "{\"ok\":false,\"error\":\"unauthorized: valid Bearer token required\"}");
                 return;
             }
-            if (strcmp(path, "/api/v1/approvals") == 0) {
-                const jval_t *sv = jobj_get(body, "serial");
-                char approver[65], reason[161];
-                jobj_copy_str(body, "approver", "", approver, sizeof(approver));
-                jobj_copy_str(body, "reason", "", reason, sizeof(reason));
-                if (!sv || sv->type != J_INT || sv->ival < 1 || !approver[0]) {
+            if (strcmp(path, "/api/v1/devices/enroll") == 0) {
+                char dev_id[65], pk_hex[80];
+                jobj_copy_str(body, "device_id", "", dev_id, sizeof(dev_id));
+                jobj_copy_str(body, "pubkey", "", pk_hex, sizeof(pk_hex));
+                for (char *p = pk_hex; *p; p++) *p = (char)tolower((unsigned char)*p);
+                uint8_t pk_raw[32];
+                if (!dev_id[0] || strlen(pk_hex) != 64 || hex_decode_lower(pk_hex, pk_raw, 32) != 0) {
                     jval_free(body); free(raw_body);
-                    send_json(cfd, 400, "{\"ok\":false,\"error\":\"serial (int>=1) and approver required\"}");
+                    send_json(cfd, 400, "{\"ok\":false,\"error\":\"device_id and 64-hex Ed25519 pubkey required\"}");
                     return;
                 }
-                int64_t serial = sv->ival;
-                int thr = 2;
                 char utc[32];
                 utc_now(utc);
                 pthread_mutex_lock(&st->mu);
                 sqlite3_stmt *stmt = NULL;
                 if (sqlite3_prepare_v2(
                         st->db,
-                        "INSERT OR REPLACE INTO approvals(serial,approver,approved_utc,reason,threshold) "
-                        "VALUES(?,?,?,?,?);", -1, &stmt, NULL) == SQLITE_OK) {
-                    sqlite3_bind_int64(stmt, 1, serial);
-                    sqlite3_bind_text(stmt, 2, approver, -1, SQLITE_TRANSIENT);
+                        "INSERT INTO enrolled_devices(device_id,pubkey,last_seq,enrolled_utc) VALUES(?,?,0,?) "
+                        "ON CONFLICT(device_id) DO UPDATE SET pubkey=excluded.pubkey, last_seq=0, enrolled_utc=excluded.enrolled_utc;",
+                        -1, &stmt, NULL) == SQLITE_OK) {
+                    sqlite3_bind_text(stmt, 1, dev_id, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 2, pk_hex, -1, SQLITE_TRANSIENT);
                     sqlite3_bind_text(stmt, 3, utc, -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(stmt, 4, reason, -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_int(stmt, 5, thr);
+                    (void)sqlite3_step(stmt);
+                    sqlite3_finalize(stmt);
+                }
+                char det[256];
+                snprintf(det, sizeof(det), "Enrolled Ed25519 pubkey %.16s... for %s", pk_hex, dev_id);
+                db_append_audit(st->db, dev_id, "admin", "enrollment", "DEVICE_ENROLLED", 0, det, 1, utc);
+                pthread_mutex_unlock(&st->mu);
+                sbuf_t resp;
+                sb_init(&resp, 192);
+                sb_puts(&resp, "{\"ok\":true,\"device_id\":");
+                sb_json_str(&resp, dev_id);
+                sb_puts(&resp, ",\"pubkey\":");
+                sb_json_str(&resp, pk_hex);
+                sb_putc(&resp, '}');
+                send_json(cfd, 200, resp.data);
+                sb_free(&resp);
+                jval_free(body); free(raw_body);
+                return;
+            }
+            if (strcmp(path, "/api/v1/approvers") == 0) {
+                char approver[65], pk_hex[80];
+                jobj_copy_str(body, "approver", "", approver, sizeof(approver));
+                jobj_copy_str(body, "pubkey", "", pk_hex, sizeof(pk_hex));
+                for (char *p = pk_hex; *p; p++) *p = (char)tolower((unsigned char)*p);
+                uint8_t pk_raw[32];
+                if (!approver[0] || strlen(pk_hex) != 64 || hex_decode_lower(pk_hex, pk_raw, 32) != 0) {
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 400, "{\"ok\":false,\"error\":\"approver and 64-hex Ed25519 pubkey required\"}");
+                    return;
+                }
+                char utc[32];
+                utc_now(utc);
+                pthread_mutex_lock(&st->mu);
+                sqlite3_stmt *stmt = NULL;
+                if (sqlite3_prepare_v2(
+                        st->db,
+                        "INSERT INTO approvers(approver,pubkey,added_utc) VALUES(?,?,?) "
+                        "ON CONFLICT(approver) DO UPDATE SET pubkey=excluded.pubkey, added_utc=excluded.added_utc;",
+                        -1, &stmt, NULL) == SQLITE_OK) {
+                    sqlite3_bind_text(stmt, 1, approver, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 2, pk_hex, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 3, utc, -1, SQLITE_TRANSIENT);
+                    (void)sqlite3_step(stmt);
+                    sqlite3_finalize(stmt);
+                }
+                char det[256];
+                snprintf(det, sizeof(det), "Registered Ed25519 approver %s (%.16s...)", approver, pk_hex);
+                db_append_audit(st->db, "CONTROL_PLANE", "admin", "governance", "APPROVER_ADDED", 0, det, 1, utc);
+                pthread_mutex_unlock(&st->mu);
+                sbuf_t resp;
+                sb_init(&resp, 192);
+                sb_puts(&resp, "{\"ok\":true,\"approver\":");
+                sb_json_str(&resp, approver);
+                sb_puts(&resp, ",\"pubkey\":");
+                sb_json_str(&resp, pk_hex);
+                sb_putc(&resp, '}');
+                send_json(cfd, 200, resp.data);
+                sb_free(&resp);
+                jval_free(body); free(raw_body);
+                return;
+            }
+            if (strcmp(path, "/api/v1/approvals") == 0) {
+                const jval_t *sv = jobj_get(body, "serial");
+                char ch[64], approver[65], reason[161], sig_hex[160];
+                jobj_copy_str(body, "channel", "stable", ch, sizeof(ch));
+                jobj_copy_str(body, "approver", "", approver, sizeof(approver));
+                jobj_copy_str(body, "reason", "", reason, sizeof(reason));
+                jobj_copy_str(body, "signature", "", sig_hex, sizeof(sig_hex));
+                for (char *p = sig_hex; *p; p++) *p = (char)tolower((unsigned char)*p);
+                if (!sv || sv->type != J_INT || sv->ival < 1 || !approver[0] || !is_valid_channel(ch)) {
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 400, "{\"ok\":false,\"error\":\"serial (int>=1), valid channel, and approver required\"}");
+                    return;
+                }
+                int64_t serial = sv->ival;
+                char ev_path[PATH_MAX], ev_hash_hex[65];
+                fp_event_t ev;
+                if (snprintf(ev_path, sizeof(ev_path), "%s/%lld.ev", st->ev_dir, (long long)serial) >= (int)sizeof(ev_path) ||
+                    cp_load_event_file(ev_path, &ev, ev_hash_hex) != 0) {
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 404, "{\"ok\":false,\"error\":\"target event file not found or invalid\"}");
+                    return;
+                }
+                /* Verify approver is registered & Ed25519 signature matches canonical approval payload */
+                pthread_mutex_lock(&st->mu);
+                char app_pk_hex[65];
+                app_pk_hex[0] = '\0';
+                sqlite3_stmt *stmt = NULL;
+                if (sqlite3_prepare_v2(st->db, "SELECT pubkey FROM approvers WHERE approver=?;",
+                                       -1, &stmt, NULL) == SQLITE_OK) {
+                    sqlite3_bind_text(stmt, 1, approver, -1, SQLITE_TRANSIENT);
+                    if (sqlite3_step(stmt) == SQLITE_ROW) {
+                        const char *pkc = (const char *)sqlite3_column_text(stmt, 0);
+                        snprintf(app_pk_hex, sizeof(app_pk_hex), "%.64s", pkc ? pkc : "");
+                    }
+                    sqlite3_finalize(stmt);
+                }
+                if (strlen(app_pk_hex) != 64) {
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 403, "{\"ok\":false,\"error\":\"approver not registered in /api/v1/approvers\"}");
+                    return;
+                }
+                uint8_t pk_raw[32], sig_raw[64];
+                char canonical[256];
+                int cl = snprintf(canonical, sizeof(canonical), "SF_APPROVAL_V1|%s|%lld|%s",
+                                  ch, (long long)serial, ev_hash_hex);
+                if (cl <= 0 || (size_t)cl >= sizeof(canonical) ||
+                    strlen(sig_hex) != 128 ||
+                    hex_decode_lower(app_pk_hex, pk_raw, 32) != 0 ||
+                    hex_decode_lower(sig_hex, sig_raw, 64) != 0 ||
+                    crypto_sign_ed25519_verify_detached(sig_raw, (const uint8_t *)canonical,
+                                                        (unsigned long long)cl, pk_raw) != 0) {
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 401, "{\"ok\":false,\"error\":\"invalid Ed25519 approver signature\"}");
+                    return;
+                }
+
+                int thr = 2;
+                char utc[32];
+                utc_now(utc);
+                if (sqlite3_prepare_v2(
+                        st->db,
+                        "INSERT OR REPLACE INTO approvals(channel,serial,approver,event_hash,signature,approved_utc,reason,threshold) "
+                        "VALUES(?,?,?,?,?,?,?,?);", -1, &stmt, NULL) == SQLITE_OK) {
+                    sqlite3_bind_text(stmt, 1, ch, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int64(stmt, 2, serial);
+                    sqlite3_bind_text(stmt, 3, approver, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 4, ev_hash_hex, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 5, sig_hex, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 6, utc, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 7, reason, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int(stmt, 8, thr);
                     (void)sqlite3_step(stmt);
                     sqlite3_finalize(stmt);
                 }
                 int cnt = 0;
-                if (sqlite3_prepare_v2(st->db, "SELECT COUNT(*) FROM approvals WHERE serial=?;",
-                                       -1, &stmt, NULL) == SQLITE_OK) {
-                    sqlite3_bind_int64(stmt, 1, serial);
+                if (sqlite3_prepare_v2(
+                        st->db,
+                        "SELECT COUNT(DISTINCT approver) FROM approvals WHERE channel=? AND serial=? AND event_hash=?;",
+                        -1, &stmt, NULL) == SQLITE_OK) {
+                    sqlite3_bind_text(stmt, 1, ch, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int64(stmt, 2, serial);
+                    sqlite3_bind_text(stmt, 3, ev_hash_hex, -1, SQLITE_TRANSIENT);
                     if (sqlite3_step(stmt) == SQLITE_ROW) cnt = sqlite3_column_int(stmt, 0);
                     sqlite3_finalize(stmt);
                 }
-                char dev_tag[96], det[256];
+                char dev_tag[96], det[320];
                 snprintf(dev_tag, sizeof(dev_tag), "APPROVER:%s", approver);
-                snprintf(det, sizeof(det), "Approval %d/%d for serial #%lld: %s",
-                         cnt, thr, (long long)serial, reason);
-                db_append_audit(st->db, dev_tag, "admin", "governance",
+                snprintf(det, sizeof(det), "Ed25519-verified approval %d/%d for %s#%lld: %s",
+                         cnt, thr, ch, (long long)serial, reason);
+                db_append_audit(st->db, dev_tag, "admin", ch,
                                 (cnt >= thr) ? "QUORUM_MET" : "APPROVED_PARTIAL",
                                 serial, det, 1, utc);
                 sbuf_t resp;
@@ -1939,13 +2307,15 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                     return;
                 }
                 char msg[256];
-                int ok = (cp_set_channel_serial(st, ch, sv->ival, "EMERGENCY_ROLLBACK", msg, sizeof(msg)) == 0);
+                int http_rc = 400;
+                int ok = (cp_set_channel_serial(st, ch, sv->ival, "EMERGENCY_ROLLBACK", 1,
+                                                msg, sizeof(msg), &http_rc) == 0);
                 sbuf_t resp;
                 sb_init(&resp, 256);
                 sb_printf(&resp, "{\"ok\":%s,\"message\":", ok ? "true" : "false");
                 sb_json_str(&resp, msg);
                 sb_putc(&resp, '}');
-                send_json(cfd, ok ? 200 : 404, resp.data);
+                send_json(cfd, http_rc, resp.data);
                 sb_free(&resp);
                 jval_free(body); free(raw_body);
                 return;
@@ -1959,13 +2329,15 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 return;
             }
             char msg[256];
-            int ok = (cp_set_channel_serial(st, ch, sv->ival, "PROMOTION", msg, sizeof(msg)) == 0);
+            int http_rc = 400;
+            int ok = (cp_set_channel_serial(st, ch, sv->ival, "PROMOTION", 0,
+                                            msg, sizeof(msg), &http_rc) == 0);
             sbuf_t resp;
             sb_init(&resp, 256);
             sb_printf(&resp, "{\"ok\":%s,\"message\":", ok ? "true" : "false");
             sb_json_str(&resp, msg);
             sb_putc(&resp, '}');
-            send_json(cfd, ok ? 200 : 404, resp.data);
+            send_json(cfd, http_rc, resp.data);
             sb_free(&resp);
             jval_free(body); free(raw_body);
             return;
@@ -1994,7 +2366,8 @@ static void *worker_thread(void *arg) {
 static void usage(void) {
     fprintf(stderr,
             "Usage: sf-cp --data-dir <dir> [--bind 0.0.0.0] [--port 8080] "
-            "[--sbom <sbom.json>] [--admin-token <tok>] [--require-signed-heartbeat]\n");
+            "[--sbom <sbom.json>] [--admin-token <tok>] [--require-signed-heartbeat] "
+            "[--require-enrolled] [--require-quorum]\n");
 }
 
 int main(int argc, char **argv) {
@@ -2013,6 +2386,8 @@ int main(int argc, char **argv) {
     const char *sbom_path = NULL;
     const char *admin_tok = NULL;
     int require_signed_hb = 0;
+    int require_enrolled = 0;
+    int require_quorum = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
@@ -2031,6 +2406,11 @@ int main(int argc, char **argv) {
             admin_tok = argv[++i];
         } else if (strcmp(argv[i], "--require-signed-heartbeat") == 0) {
             require_signed_hb = 1;
+        } else if (strcmp(argv[i], "--require-enrolled") == 0) {
+            require_enrolled = 1;
+            require_signed_hb = 1;
+        } else if (strcmp(argv[i], "--require-quorum") == 0) {
+            require_quorum = 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage();
             return 0;
@@ -2047,7 +2427,8 @@ int main(int argc, char **argv) {
     }
 
     cp_state_t st;
-    if (cp_state_init(&st, data_dir, sbom_path, admin_tok, require_signed_hb) != 0) {
+    if (cp_state_init(&st, data_dir, sbom_path, admin_tok, require_signed_hb,
+                      require_enrolled, require_quorum) != 0) {
         fprintf(stderr, "sf-cp: failed to initialize state in %s\n", data_dir);
         return 1;
     }

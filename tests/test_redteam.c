@@ -342,6 +342,178 @@ static void test_control_plane(const char *work) {
     else
         record_ok("CP-AUTH", "Valid Ed25519 heartbeat verified and 1-bit forged signature rejected (401)");
 
+    /* 1g2. P0-04 Device Enrollment/Key-Pinning + Anti-Replay hb_seq */
+    {
+        uint8_t pk2[32], sk2[64], sig2[64];
+        crypto_sign_ed25519_keypair(pk2, sk2);
+        char pk2_hex[65], sig2_hex[129];
+        to_hex(pk2, 32, pk2_hex);
+        const char *spoof_body = "{\"device_id\":\"ed-node-1\",\"outcome\":\"UPDATED\",\"active_serial\":99}";
+        crypto_sign_ed25519_detached(sig2, NULL, (const uint8_t *)spoof_body, strlen(spoof_body), sk2);
+        to_hex(sig2, 64, sig2_hex);
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/heartbeat HTTP/1.1\r\nHost: x\r\n"
+                 "X-SF-Device-PubKey: %s\r\nX-SF-Signature: %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s",
+                 pk2_hex, sig2_hex, strlen(spoof_body), spoof_body);
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 401", 12) != 0)
+            record_finding("CRITICAL", "CP-P0-04", "Key-swap impersonation of pinned device was NOT rejected with 401");
+
+        /* Enroll a dedicated device with monotonic hb_seq replay test */
+        char enroll_body[256];
+        snprintf(enroll_body, sizeof(enroll_body), "{\"device_id\":\"enrolled-01\",\"pubkey\":\"%s\"}", pk2_hex);
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/devices/enroll HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s",
+                 tok, strlen(enroll_body), enroll_body);
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 200 OK", 15) != 0)
+            record_finding("HIGH", "CP-P0-04", "Device enrollment endpoint failed");
+
+        const char *seq1_body = "{\"device_id\":\"enrolled-01\",\"hb_seq\":1,\"outcome\":\"UPDATED\",\"active_serial\":1}";
+        crypto_sign_ed25519_detached(sig2, NULL, (const uint8_t *)seq1_body, strlen(seq1_body), sk2);
+        to_hex(sig2, 64, sig2_hex);
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/heartbeat HTTP/1.1\r\nHost: x\r\n"
+                 "X-SF-Device-PubKey: %s\r\nX-SF-Signature: %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s",
+                 pk2_hex, sig2_hex, strlen(seq1_body), seq1_body);
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 200 OK", 15) != 0)
+            record_finding("HIGH", "CP-P0-04", "Valid enrolled heartbeat hb_seq=1 failed");
+
+        /* Replaying exact same signed hb_seq=1 MUST be rejected with 409 Conflict! */
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 409", 12) != 0)
+            record_finding("CRITICAL", "CP-P0-04", "Replayed heartbeat hb_seq=1 was NOT rejected with 409");
+        else
+            record_ok("CP-P0-04", "Device key-pinning (401 on spoofed key) + monotonic hb_seq replay defense (409) verified");
+    }
+
+    /* 1g3. P0-03 Cryptographic 2-of-N Quorum Enforcement + P0-06 Monotonic Emergency Rollback */
+    {
+        fp_keypair_t rel_kp, app1_kp, app2_kp;
+        assert(fp_keygen(&rel_kp) == FP_OK && fp_keygen(&app1_kp) == FP_OK && fp_keygen(&app2_kp) == FP_OK);
+        fp_dna_t rid, b1_dna, b2_dna;
+        assert(fp_random_id(&rid) == FP_OK && fp_random_id(&b1_dna) == FP_OK && fp_random_id(&b2_dna) == FP_OK);
+        uint64_t now_u = (uint64_t)time(NULL);
+
+        fp_event_t ev1, ev2;
+        memset(&ev1, 0, sizeof(ev1));
+        ev1.action = FP_ACTION_INSTALL; ev1.repo_id = rid; ev1.serial = 1;
+        ev1.timestamp_unix = now_u; ev1.expires_unix = now_u + 3600;
+        ev1.target_dna = b1_dna; ev1.target_size = 100;
+        assert(fp_event_sign(&ev1, &rel_kp) == FP_OK);
+
+        memset(&ev2, 0, sizeof(ev2));
+        ev2.action = FP_ACTION_INSTALL; ev2.repo_id = rid; ev2.serial = 2;
+        ev2.prev_event_hash = ev1.event_hash;
+        ev2.timestamp_unix = now_u; ev2.expires_unix = now_u + 3600;
+        ev2.target_dna = b2_dna; ev2.target_size = 100;
+        assert(fp_event_sign(&ev2, &rel_kp) == FP_OK);
+
+        uint8_t *eb = NULL; size_t el = 0;
+        char evp[640];
+        assert(fp_event_encode(&ev1, &eb, &el) == FP_OK);
+        snprintf(evp, sizeof(evp), "%s/repo/events/1.ev", cp_dir);
+        FILE *ef = fopen(evp, "wb"); assert(ef && fwrite(eb, 1, el, ef) == el); fclose(ef); free(eb);
+        assert(fp_event_encode(&ev2, &eb, &el) == FP_OK);
+        snprintf(evp, sizeof(evp), "%s/repo/events/2.ev", cp_dir);
+        ef = fopen(evp, "wb"); assert(ef && fwrite(eb, 1, el, ef) == el); fclose(ef); free(eb);
+
+        /* Register 2 Ed25519 approvers */
+        char a1_pk[65], a2_pk[65], abody[256];
+        to_hex(app1_kp.pk, 32, a1_pk);
+        to_hex(app2_kp.pk, 32, a2_pk);
+        snprintf(abody, sizeof(abody), "{\"approver\":\"cto@corp\",\"pubkey\":\"%s\"}", a1_pk);
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/approvers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s", tok, strlen(abody), abody);
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 200 OK", 15) != 0) record_finding("HIGH", "CP-P0-03", "Approver 1 register failed");
+        snprintf(abody, sizeof(abody), "{\"approver\":\"ciso@corp\",\"pubkey\":\"%s\"}", a2_pk);
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/approvers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s", tok, strlen(abody), abody);
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 200 OK", 15) != 0) record_finding("HIGH", "CP-P0-03", "Approver 2 register failed");
+
+        /* Promotion with 0/2 approvals MUST fail with 403 */
+        const char *prom1 = "{\"serial\":1}";
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/channels/stable HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s", tok, strlen(prom1), prom1);
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 403", 12) != 0)
+            record_finding("CRITICAL", "CP-P0-03", "Promotion without quorum was NOT blocked with 403");
+
+        /* Unsigned / forged approver signature MUST fail with 401 */
+        char ev1_hex[65], canon[256], sig_h[129];
+        to_hex(ev1.event_hash.bytes, 32, ev1_hex);
+        int cl = snprintf(canon, sizeof(canon), "SF_APPROVAL_V1|stable|1|%s", ev1_hex);
+        uint8_t asig[64];
+        crypto_sign_ed25519_detached(asig, NULL, (const uint8_t *)canon, (unsigned long long)cl, app1_kp.sk);
+        asig[0] ^= 0xFFu; /* forge! */
+        to_hex(asig, 64, sig_h);
+        char app_body[512];
+        snprintf(app_body, sizeof(app_body),
+                 "{\"channel\":\"stable\",\"serial\":1,\"approver\":\"cto@corp\",\"signature\":\"%s\"}", sig_h);
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/approvals HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s", tok, strlen(app_body), app_body);
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 401", 12) != 0)
+            record_finding("CRITICAL", "CP-P0-03", "Forged approver Ed25519 signature was NOT rejected with 401");
+
+        /* Valid approval 1/2 -> promotion STILL blocked with 403 */
+        asig[0] ^= 0xFFu;
+        to_hex(asig, 64, sig_h);
+        snprintf(app_body, sizeof(app_body),
+                 "{\"channel\":\"stable\",\"serial\":1,\"approver\":\"cto@corp\",\"signature\":\"%s\"}", sig_h);
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/approvals HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s", tok, strlen(app_body), app_body);
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 200 OK", 15) != 0) record_finding("HIGH", "CP-P0-03", "Valid approval 1/2 failed");
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/channels/stable HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s", tok, strlen(prom1), prom1);
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 403", 12) != 0)
+            record_finding("CRITICAL", "CP-P0-03", "Promotion with only 1/2 approvals was NOT blocked with 403");
+
+        /* Valid approval 2/2 -> promotion succeeds (200 OK)! */
+        crypto_sign_ed25519_detached(asig, NULL, (const uint8_t *)canon, (unsigned long long)cl, app2_kp.sk);
+        to_hex(asig, 64, sig_h);
+        snprintf(app_body, sizeof(app_body),
+                 "{\"channel\":\"stable\",\"serial\":1,\"approver\":\"ciso@corp\",\"signature\":\"%s\"}", sig_h);
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/approvals HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s", tok, strlen(app_body), app_body);
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 200 OK", 15) != 0) record_finding("HIGH", "CP-P0-03", "Valid approval 2/2 failed");
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/channels/stable HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s", tok, strlen(prom1), prom1);
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 200 OK", 15) != 0)
+            record_finding("HIGH", "CP-P0-03", "Promotion with valid 2/2 Ed25519 quorum failed");
+        else
+            record_ok("CP-P0-03", "Cryptographic 2-of-N Ed25519 quorum enforced (0/2->403, forged->401, 1/2->403, 2/2->200)");
+
+        /* P0-06: Republishing old/equal serial via /api/v1/emergency/rollback MUST be rejected with 400/409! */
+        const char *rb_old = "{\"channel\":\"stable\",\"serial\":1}";
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/emergency/rollback HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s", tok, strlen(rb_old), rb_old);
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 400", 12) != 0 && strncmp(resp, "HTTP/1.1 409", 12) != 0)
+            record_finding("CRITICAL", "CP-P0-06", "Non-monotonic/non-ROLLBACK emergency rollback was NOT rejected");
+        else
+            record_ok("CP-P0-06", "Non-monotonic emergency rollback rejected cleanly (requires new signed FP_ACTION_ROLLBACK)");
+    }
+
     /* 1h. HTTP 206 Partial Content Range + 416 + CRA Audit JSON/HTML */
     char obj_path[640];
     const char *obj_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

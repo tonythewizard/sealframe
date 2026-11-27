@@ -445,9 +445,20 @@ fp_err_t fp_bundle_encode(const fp_bundle_t *b, uint8_t **out_buf, size_t *out_l
 fp_err_t fp_bundle_decode(const uint8_t *buf, size_t len, fp_bundle_t *out_b);
 fp_err_t fp_bundle_pack(const char *store_dir, const fp_bundle_t *b, fp_dna_t *out_bundle_dna);
 
+/* Fault-injection modes for fp_bundle_apply():
+ *   0 = normal operation
+ *   1 = SIGKILL before SQLite COMMIT
+ *   2 = SIGKILL after SQLite COMMIT and before atomic `current` symlink flip
+ *   3 = SIGKILL after `current` flip and before journal COMMITTED seal */
 fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
                          const char *target_dir, fp_sql_ctx_t *sql_ctx,
-                         uint64_t expected_seq, int fault_sigkill_before_commit);
+                         uint64_t expected_seq, int fault_mode);
+
+/* Deterministic crash-recovery for any incomplete composite bundle transaction
+ * recorded in `<target_dir>/.sf_tx_journal`. Reconciles forward if SQLite already
+ * committed, or cleans up safely if interrupted prior to commit. */
+fp_err_t fp_bundle_recover(const char *store_dir, const char *target_dir,
+                           fp_sql_ctx_t *sql_ctx);
 
 fp_err_t fp_bundle_rollback(const char *store_dir,
                             const fp_dna_t *current_bundle_dna,

@@ -1119,6 +1119,56 @@ static int cmd_udp_pull(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_sign_approval(int argc, char **argv) {
+    const char *key_path = NULL, *channel = "stable", *ev_path = NULL;
+    uint64_t serial = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) key_path = argv[++i];
+        else if (strcmp(argv[i], "--channel") == 0 && i + 1 < argc) channel = argv[++i];
+        else if (strcmp(argv[i], "--serial") == 0 && i + 1 < argc) {
+            if (parse_u64_strict(argv[++i], &serial) != 0 || serial == 0) return 1;
+        } else if (strcmp(argv[i], "--event") == 0 && i + 1 < argc) ev_path = argv[++i];
+        else { usage(); return 1; }
+    }
+    if (!key_path || !ev_path || serial == 0) { usage(); return 1; }
+    uint8_t *sk = NULL, *evb = NULL;
+    size_t sklen = 0, evlen = 0;
+    if (read_entire_file(key_path, &sk, &sklen) != 0 || sklen != FP_SK_LEN) {
+        if (sk) sodium_memzero(sk, sklen);
+        free(sk);
+        return 1;
+    }
+    if (read_entire_file(ev_path, &evb, &evlen) != 0) {
+        sodium_memzero(sk, sklen); free(sk);
+        return 1;
+    }
+    fp_event_t ev;
+    fp_err_t err = fp_event_decode(evb, evlen, &ev);
+    free(evb);
+    if (err != FP_OK || ev.serial != serial) {
+        sodium_memzero(sk, sklen); free(sk);
+        fprintf(stderr, "sf sign-approval: invalid event or serial mismatch\n");
+        return 1;
+    }
+    char ev_hex[65], canonical[256];
+    fp_hex_encode(ev.event_hash.bytes, FP_DNA_LEN, ev_hex);
+    int cl = snprintf(canonical, sizeof(canonical), "SF_APPROVAL_V1|%s|%llu|%s",
+                      channel, (unsigned long long)serial, ev_hex);
+    if (cl <= 0 || (size_t)cl >= sizeof(canonical)) {
+        sodium_memzero(sk, sklen); free(sk);
+        return 1;
+    }
+    uint8_t sig[FP_SIG_LEN];
+    crypto_sign_ed25519_detached(sig, NULL, (const uint8_t *)canonical, (unsigned long long)cl, sk);
+    char pk_hex[65], sig_hex[129];
+    fp_hex_encode(sk + 32, FP_PK_LEN, pk_hex);
+    fp_hex_encode(sig, FP_SIG_LEN, sig_hex);
+    sodium_memzero(sk, sklen);
+    free(sk);
+    printf("pubkey=%s signature=%s event_hash=%s\n", pk_hex, sig_hex, ev_hex);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGXFSZ, SIG_IGN);
@@ -1153,6 +1203,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "swarm-pull") == 0)      return cmd_swarm_pull(argc - 2, argv + 2);
     if (strcmp(cmd, "udp-serve") == 0)       return cmd_udp_serve(argc - 2, argv + 2);
     if (strcmp(cmd, "udp-pull") == 0)        return cmd_udp_pull(argc - 2, argv + 2);
+    if (strcmp(cmd, "sign-approval") == 0)   return cmd_sign_approval(argc - 2, argv + 2);
 
     usage();
     return 1;

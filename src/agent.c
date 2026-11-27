@@ -27,12 +27,35 @@ static uint64_t now_mono_ns(void) {
 
 const char *fp_agent_outcome_name(fp_agent_outcome_t o) {
     switch (o) {
-        case FP_AGENT_UP_TO_DATE:  return "UP_TO_DATE";
-        case FP_AGENT_UPDATED:     return "UPDATED";
-        case FP_AGENT_ROLLED_BACK: return "ROLLED_BACK";
-        case FP_AGENT_REVOKED:     return "REVOKED";
-        case FP_AGENT_REJECTED:    return "REJECTED";
-        default:                   return "UNKNOWN";
+        case FP_AGENT_UP_TO_DATE:             return "UP_TO_DATE";
+        case FP_AGENT_UPDATED:                return "UPDATED";
+        case FP_AGENT_ROLLED_BACK:            return "ROLLED_BACK";
+        case FP_AGENT_REVOKED:                return "REVOKED";
+        case FP_AGENT_REJECTED:               return "REJECTED";
+        case FP_AGENT_ROLLBACK_FAILED:        return "ROLLBACK_FAILED";
+        case FP_AGENT_INITIAL_INSTALL_FAILED: return "INITIAL_INSTALL_FAILED";
+        default:                              return "UNKNOWN";
+    }
+}
+
+static void sync_parent_dir(const char *path) {
+    if (!path || !path[0]) return;
+    char dir[PATH_MAX];
+    const char *slash = strrchr(path, '/');
+    if (!slash) {
+        snprintf(dir, sizeof(dir), ".");
+    } else if (slash == path) {
+        snprintf(dir, sizeof(dir), "/");
+    } else {
+        size_t dlen = (size_t)(slash - path);
+        if (dlen >= sizeof(dir)) return;
+        memcpy(dir, path, dlen);
+        dir[dlen] = '\0';
+    }
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (dfd >= 0) {
+        (void)fsync(dfd);
+        close(dfd);
     }
 }
 
@@ -75,7 +98,53 @@ static fp_err_t write_file_atomic(const char *path, const uint8_t *buf, size_t l
     if (fsync(fd) != 0) { close(fd); unlink(tmp); return FP_ERR_IO; }
     close(fd);
     if (rename(tmp, path) != 0) { unlink(tmp); return FP_ERR_IO; }
+    sync_parent_dir(path);
     return FP_OK;
+}
+
+static fp_err_t deactivate_live_target(const char *target_dir, const char *marker_name,
+                                       const char *marker_text) {
+    if (!target_dir || !target_dir[0]) return FP_ERR_INVALID;
+    char cur[PATH_MAX];
+    int n = snprintf(cur, sizeof(cur), "%s/current", target_dir);
+    if (n < 0 || (size_t)n >= sizeof(cur)) return FP_ERR_BOUNDS;
+    if (unlink(cur) != 0 && errno != ENOENT) return FP_ERR_IO;
+    sync_parent_dir(cur);
+    if (marker_name && marker_name[0]) {
+        char mpath[PATH_MAX];
+        n = snprintf(mpath, sizeof(mpath), "%s/%s", target_dir, marker_name);
+        if (n < 0 || (size_t)n >= sizeof(mpath)) return FP_ERR_BOUNDS;
+        const char *body = marker_text ? marker_text : "deactivated\n";
+        (void)write_file_atomic(mpath, (const uint8_t *)body, strlen(body));
+    }
+    return FP_OK;
+}
+
+static void clear_revoked_marker(const char *target_dir) {
+    if (!target_dir || !target_dir[0]) return;
+    char mpath[PATH_MAX];
+    int n = snprintf(mpath, sizeof(mpath), "%s/.sf_revoked", target_dir);
+    if (n > 0 && (size_t)n < sizeof(mpath)) {
+        if (unlink(mpath) == 0) sync_parent_dir(mpath);
+    }
+}
+
+static uint64_t next_heartbeat_seq(const char *store_dir) {
+    if (!store_dir || !store_dir[0]) return 1;
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/agent_hb_seq", store_dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return 1;
+    unsigned long long seq = 0;
+    FILE *f = fopen(path, "r");
+    if (f) {
+        if (fscanf(f, "%llu", &seq) != 1) seq = 0;
+        fclose(f);
+    }
+    seq++;
+    char buf[32];
+    int bl = snprintf(buf, sizeof(buf), "%llu\n", seq);
+    if (bl > 0) (void)write_file_atomic(path, (const uint8_t *)buf, (size_t)bl);
+    return (uint64_t)seq;
 }
 
 static uint64_t load_failed_serial(const char *store_dir) {
@@ -252,9 +321,12 @@ static void send_heartbeat_best_effort(const fp_agent_cfg_t *cfg, const fp_agent
     json_sanitize_str(cfg->channel ? cfg->channel : "stable", clean_ch, sizeof(clean_ch));
     json_sanitize_str(rep->detail, clean_detail, sizeof(clean_detail));
 
+    uint64_t hb_seq = next_heartbeat_seq(cfg->store_dir);
+
     char body[1536];
     int bl = snprintf(body, sizeof(body),
                       "{\"device_id\":\"%s\",\"channel\":\"%s\",\"outcome\":\"%s\","
+                      "\"hb_seq\":%llu,"
                       "\"active_serial\":%llu,\"active_dna\":\"%s\","
                       "\"attempted_serial\":%llu,\"attempted_dna\":\"%s\","
                       "\"root_version\":%llu,\"health_exit\":%d,"
@@ -262,6 +334,7 @@ static void send_heartbeat_best_effort(const fp_agent_cfg_t *cfg, const fp_agent
                       "\"elapsed_ms\":%.2f,\"detail\":\"%s\"}",
                       clean_dev, clean_ch,
                       fp_agent_outcome_name(rep->outcome),
+                      (unsigned long long)hb_seq,
                       (unsigned long long)rep->active_serial, act_hex,
                       (unsigned long long)rep->attempted_serial, att_hex,
                       (unsigned long long)rep->root_version, rep->health_exit_code,
@@ -338,7 +411,20 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         }
     }
 
-    /* 3. Load current local Store state */
+    /* 3. Load current local Store state + reconcile any crash-interrupted bundle journal */
+    {
+        fp_sql_ctx_t *rec_sql = NULL;
+        if (cfg->db_path && cfg->db_path[0]) {
+            (void)fp_sql_open(cfg->db_path, &rec_sql);
+        }
+        fp_err_t rerr = fp_bundle_recover(cfg->store_dir, cfg->target_dir, rec_sql);
+        fp_sql_close(rec_sql);
+        if (rerr != FP_OK) {
+            err = rerr;
+            snprintf(rep.detail, sizeof(rep.detail), "bundle journal recovery failed (%s)", fp_strerror(err));
+            goto done;
+        }
+    }
     fp_store_state_t st;
     err = fp_store_load_state(cfg->store_dir, &st);
     if (err != FP_OK) {
@@ -439,7 +525,7 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         expected_prev = chain[i].event_hash;
     }
 
-    /* 6. Handle REVOKE action immediately */
+    /* 6. Handle REVOKE action immediately (store state + physical target deactivation) */
     if (latest_ev.action == FP_ACTION_REVOKE) {
         for (uint64_t i = 0; i < chain_len; i++) {
             if (chain[i].action != FP_ACTION_REVOKE) {
@@ -454,11 +540,19 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
             if (err != FP_OK) { free(chain); snprintf(rep.detail, sizeof(rep.detail), "revoke apply failed"); goto done; }
         }
         free(chain);
+        char rev_marker[128];
+        snprintf(rev_marker, sizeof(rev_marker), "REVOKED_SERIAL=%llu\n", (unsigned long long)latest_ev.serial);
+        err = deactivate_live_target(cfg->target_dir, ".sf_revoked", rev_marker);
+        if (err != FP_OK) {
+            snprintf(rep.detail, sizeof(rep.detail), "revoke failed to deactivate live target (%s)", fp_strerror(err));
+            goto done;
+        }
         save_failed_serial(cfg->store_dir, 0);
         rep.outcome = FP_AGENT_REVOKED;
         rep.active_serial = latest_ev.serial;
         memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
-        snprintf(rep.detail, sizeof(rep.detail), "revoked DNA per serial %llu", (unsigned long long)latest_ev.serial);
+        snprintf(rep.detail, sizeof(rep.detail), "revoked DNA & deactivated live target per serial %llu",
+                 (unsigned long long)latest_ev.serial);
         err = FP_OK;
         goto done;
     }
@@ -491,7 +585,7 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         }
     }
 
-    /* 8. Open optional SQLite DB & apply Particle Bundle atomically */
+    /* 8. Open optional SQLite DB & apply Particle Bundle (INSTALL or monotonic ROLLBACK) atomically */
     fp_sql_ctx_t *sql = NULL;
     if (cfg->db_path && cfg->db_path[0]) {
         err = fp_sql_open(cfg->db_path, &sql);
@@ -502,12 +596,25 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         }
     }
 
-    err = fp_bundle_apply(cfg->store_dir, &latest_ev.target_dna, cfg->target_dir,
-                          sql, latest_ev.serial, 0);
+    int is_explicit_rollback = (latest_ev.action == FP_ACTION_ROLLBACK);
+    if (is_explicit_rollback) {
+        if (st.has_current && !fp_dna_equal(&st.current_dna, &latest_ev.target_dna)) {
+            err = fp_bundle_rollback(cfg->store_dir, &st.current_dna, &latest_ev.target_dna,
+                                     cfg->target_dir, sql);
+        } else if (!st.has_current) {
+            err = FP_ERR_POLICY;
+        } else {
+            err = FP_OK;
+        }
+    } else {
+        err = fp_bundle_apply(cfg->store_dir, &latest_ev.target_dna, cfg->target_dir,
+                              sql, latest_ev.serial, 0);
+    }
     if (err != FP_OK) {
         fp_sql_close(sql);
         free(chain);
-        snprintf(rep.detail, sizeof(rep.detail), "bundle apply failed (%s)", fp_strerror(err));
+        snprintf(rep.detail, sizeof(rep.detail), "bundle %s failed (%s)",
+                 is_explicit_rollback ? "rollback" : "apply", fp_strerror(err));
         goto done;
     }
 
@@ -515,32 +622,56 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     int hrc = fp_agent_run_health_check(cfg->health_cmd, cfg->health_timeout_sec);
     rep.health_exit_code = hrc;
     if (hrc != 0) {
-        if (st.has_current) {
+        if (st.has_current && !is_explicit_rollback) {
             fp_err_t rerr = fp_bundle_rollback(cfg->store_dir, &latest_ev.target_dna,
                                                &st.current_dna, cfg->target_dir, sql);
+            fp_sql_close(sql);
+            free(chain);
             if (rerr == FP_OK) {
+                save_failed_serial(cfg->store_dir, latest_ev.serial);
+                rep.outcome = FP_AGENT_ROLLED_BACK;
+                rep.active_serial = st.serial;
+                rep.active_bundle_dna = st.current_dna;
                 snprintf(rep.detail, sizeof(rep.detail),
                          "health-check failed (exit=%d) on serial %llu -> auto-rolled back to serial %llu",
                          hrc, (unsigned long long)latest_ev.serial, (unsigned long long)st.serial);
+                err = FP_OK;
             } else {
+                rep.outcome = FP_AGENT_ROLLBACK_FAILED;
+                rep.active_serial = 0;
+                memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
                 snprintf(rep.detail, sizeof(rep.detail),
-                         "health-check failed (exit=%d), rollback error (%s)", hrc, fp_strerror(rerr));
+                         "CRITICAL: health-check failed (exit=%d) AND rollback failed (%s)",
+                         hrc, fp_strerror(rerr));
+                err = rerr;
             }
-        } else {
-            snprintf(rep.detail, sizeof(rep.detail),
-                     "initial health-check failed (exit=%d) on serial %llu",
-                     hrc, (unsigned long long)latest_ev.serial);
+            goto done;
         }
         fp_sql_close(sql);
         free(chain);
-        save_failed_serial(cfg->store_dir, latest_ev.serial);
-        rep.outcome = FP_AGENT_ROLLED_BACK;
-        rep.active_serial = st.serial;
-        rep.active_bundle_dna = st.current_dna;
-        err = FP_OK;
+        if (!st.has_current) {
+            (void)deactivate_live_target(cfg->target_dir, NULL, NULL);
+            save_failed_serial(cfg->store_dir, latest_ev.serial);
+            rep.outcome = FP_AGENT_INITIAL_INSTALL_FAILED;
+            rep.active_serial = 0;
+            memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
+            snprintf(rep.detail, sizeof(rep.detail),
+                     "initial install health-check failed (exit=%d) on serial %llu; target deactivated",
+                     hrc, (unsigned long long)latest_ev.serial);
+            err = FP_ERR_POLICY;
+        } else {
+            rep.outcome = FP_AGENT_ROLLBACK_FAILED;
+            rep.active_serial = 0;
+            memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
+            snprintf(rep.detail, sizeof(rep.detail),
+                     "explicit rollback health-check failed (exit=%d) on serial %llu",
+                     hrc, (unsigned long long)latest_ev.serial);
+            err = FP_ERR_POLICY;
+        }
         goto done;
     }
     fp_sql_close(sql);
+    clear_revoked_marker(cfg->target_dir);
 
     /* 10. Health-check PASSED -> commit full verified event chain atomically to Store */
     for (uint64_t i = 0; i < chain_len; i++) {
@@ -556,11 +687,12 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     free(chain);
     save_failed_serial(cfg->store_dir, 0);
 
-    rep.outcome = FP_AGENT_UPDATED;
+    rep.outcome = is_explicit_rollback ? FP_AGENT_ROLLED_BACK : FP_AGENT_UPDATED;
     rep.active_serial = latest_ev.serial;
     rep.active_bundle_dna = latest_ev.target_dna;
     snprintf(rep.detail, sizeof(rep.detail),
-             "updated cleanly to serial %llu (health=0, root_v=%llu)",
+             "%s cleanly to serial %llu (health=0, root_v=%llu)",
+             is_explicit_rollback ? "rolled back" : "updated",
              (unsigned long long)latest_ev.serial, (unsigned long long)root.root_version);
     err = FP_OK;
 

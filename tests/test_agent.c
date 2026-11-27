@@ -468,6 +468,104 @@ int main(void) {
     assert(fp_agent_run_health_check("sleep 10", 1) == -1);
     printf("[PASS] Health-check watchdog cleanly terminated hung process after 1s timeout\n");
 
+    /* Test G (P0-06): Explicit monotonic signed FP_ACTION_ROLLBACK event (serial=4 -> back to v1!) */
+    fp_event_t e4_rb;
+    memset(&e4_rb, 0, sizeof(e4_rb));
+    e4_rb.action = FP_ACTION_ROLLBACK; e4_rb.repo_id = repo_id; e4_rb.serial = 4;
+    e4_rb.prev_event_hash = e3.event_hash;
+    e4_rb.timestamp_unix = now; e4_rb.expires_unix = now + 3600;
+    e4_rb.target_dna = b1_dna; e4_rb.target_size = b1_sz;
+    snprintf(e4_rb.reason, sizeof(e4_rb.reason), "emergency fleet rollback to v1");
+    assert(fp_event_sign(&e4_rb, &rel_kp) == FP_OK);
+    assert(fp_event_encode(&e4_rb, &eb, &el) == FP_OK);
+    snprintf(p1, sizeof(p1), "%s/4.ev", ev_dir);
+    write_bytes_file(p1, eb, el);
+    write_bytes_file(p_lat, eb, el);
+    free(eb);
+
+    assert(fp_agent_sync_once(&acfg, &rep) == FP_OK);
+    assert(rep.outcome == FP_AGENT_ROLLED_BACK && rep.active_serial == 4 && rep.health_exit_code == 0);
+    assert(fp_sql_open(edge_db_p, &edb) == FP_OK);
+    assert(fp_sql_state_digest(edb, "settings", &live_dig) == FP_OK);
+    fp_sql_close(edb);
+    assert(fp_dna_equal(&live_dig, &db_dig_v1));
+    printf("[PASS] P0-06 monotonic FP_ACTION_ROLLBACK (serial=4 -> v1): files + SQLite rolled back bit-exact\n");
+
+    /* Test H (P0-05): FP_ACTION_REVOKE physically deactivates <target_dir>/current & writes .sf_revoked */
+    fp_event_t e5_rev;
+    memset(&e5_rev, 0, sizeof(e5_rev));
+    e5_rev.action = FP_ACTION_REVOKE; e5_rev.repo_id = repo_id; e5_rev.serial = 5;
+    e5_rev.prev_event_hash = e4_rb.event_hash;
+    e5_rev.timestamp_unix = now; e5_rev.expires_unix = now + 3600;
+    e5_rev.target_dna = b1_dna; e5_rev.target_size = 0;
+    snprintf(e5_rev.reason, sizeof(e5_rev.reason), "CVE emergency revoke");
+    assert(fp_event_sign(&e5_rev, &rel_kp) == FP_OK);
+    assert(fp_event_encode(&e5_rev, &eb, &el) == FP_OK);
+    snprintf(p1, sizeof(p1), "%s/5.ev", ev_dir);
+    write_bytes_file(p1, eb, el);
+    write_bytes_file(p_lat, eb, el);
+    free(eb);
+
+    assert(fp_agent_sync_once(&acfg, &rep) == FP_OK);
+    assert(rep.outcome == FP_AGENT_REVOKED && rep.active_serial == 5);
+    char cur_link[600], rev_marker[600];
+    snprintf(cur_link, sizeof(cur_link), "%s/current", edge_target);
+    snprintf(rev_marker, sizeof(rev_marker), "%s/.sf_revoked", edge_target);
+    struct stat st_chk;
+    assert(lstat(cur_link, &st_chk) != 0); /* current symlink MUST be removed! */
+    assert(lstat(rev_marker, &st_chk) == 0);
+    printf("[PASS] P0-05 FP_ACTION_REVOKE physically removed live target symlink & created .sf_revoked\n");
+
+    /* Test I (P0-02): Initial install health-check failure MUST return non-OK & deactivate target */
+    {
+        char etmpl2[] = "/tmp/fp-ag-edge2-XXXXXX";
+        char *edge2 = mkdtemp(etmpl2);
+        assert(edge2 != NULL);
+        char e2_store[512], e2_target[512], e2_db[512], e2_hcmd[768];
+        snprintf(e2_store, sizeof(e2_store), "%s/store", edge2);
+        snprintf(e2_target, sizeof(e2_target), "%s/live", edge2);
+        snprintf(e2_db, sizeof(e2_db), "%s/app.db", edge2);
+        snprintf(e2_hcmd, sizeof(e2_hcmd), "grep -q 'STATUS=OK' '%s/current/app.cfg'", e2_target);
+
+        /* Put broken v2 as serial 1 on a fresh channel 'badinit' */
+        char ch_bad[512], p_bad_lat[600];
+        snprintf(ch_bad, sizeof(ch_bad), "%s/channels/badinit", repo);
+        assert(mkdir(ch_bad, 0700) == 0);
+        fp_sql_ctx_t *edb2 = NULL;
+        assert(fp_sql_open(e2_db, &edb2) == FP_OK);
+        assert(fp_sql_exec(edb2, schema) == FP_OK);
+        assert(fp_sql_exec(edb2, "INSERT INTO settings(id,val) VALUES(1,'v1-healthy');") == FP_OK);
+        fp_sql_close(edb2);
+
+        fp_event_t e_bad1;
+        memset(&e_bad1, 0, sizeof(e_bad1));
+        e_bad1.action = FP_ACTION_INSTALL; e_bad1.repo_id = repo_id; e_bad1.serial = 1;
+        e_bad1.timestamp_unix = now; e_bad1.expires_unix = now + 3600;
+        e_bad1.target_dna = b2_dna; e_bad1.target_size = b2_sz;
+        assert(fp_event_sign(&e_bad1, &rel_kp) == FP_OK);
+        assert(fp_event_encode(&e_bad1, &eb, &el) == FP_OK);
+        snprintf(p_bad_lat, sizeof(p_bad_lat), "%s/latest.ev", ch_bad);
+        write_bytes_file(p_bad_lat, eb, el);
+        free(eb);
+
+        fp_agent_cfg_t acfg2 = acfg;
+        acfg2.device_id = "edge-init-fail";
+        acfg2.channel = "badinit";
+        acfg2.store_dir = e2_store;
+        acfg2.target_dir = e2_target;
+        acfg2.db_path = e2_db;
+        acfg2.health_cmd = e2_hcmd;
+        acfg2.lan_peer_host = NULL;
+        acfg2.lan_peer_port = 0;
+
+        fp_err_t ierr = fp_agent_sync_once(&acfg2, &rep);
+        assert(ierr != FP_OK);
+        assert(rep.outcome == FP_AGENT_INITIAL_INSTALL_FAILED && rep.active_serial == 0);
+        snprintf(cur_link, sizeof(cur_link), "%s/current", e2_target);
+        assert(lstat(cur_link, &st_chk) != 0);
+        printf("[PASS] P0-02 initial install health failure returns error + INITIAL_INSTALL_FAILED + removes current\n");
+    }
+
     srv.stop = 1;
     shutdown(lfd, SHUT_RDWR);
     close(lfd);
