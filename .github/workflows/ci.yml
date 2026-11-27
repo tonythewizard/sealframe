@@ -9,6 +9,7 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
         compiler: [ gcc, clang ]
@@ -25,7 +26,9 @@ jobs:
 
       - name: Build, run all 11 test suites, ELF hardening & SBOM (${{ matrix.compiler }})
         run: |
-          make CC=${{ matrix.compiler }} clean all test security-check sbom
+          make CC=${{ matrix.compiler }} clean
+          make CC=${{ matrix.compiler }} -j$(nproc) all
+          make CC=${{ matrix.compiler }} test security-check sbom
 
       - name: Run sf-llama-bridge multi-profile selftest
         run: |
@@ -36,7 +39,7 @@ jobs:
         if: matrix.compiler == 'gcc'
         run: |
           make clean
-          make CC=gcc CFLAGS="-std=c11 -O1 -g -fPIC -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Werror -pedantic -Iinclude -Ithird_party/blake3 -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0" \
+          make -j$(nproc) CC=gcc CFLAGS="-std=c11 -O1 -g -fPIC -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Werror -pedantic -Iinclude -Ithird_party/blake3 -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0" \
                LDFLAGS="-fsanitize=address,undefined -lsodium -lzstd -lsqlite3 -lpthread -lm" \
                all build/test_particle build/test_net build/test_cdc build/test_bundle build/test_trust build/test_swarm build/test_agent build/test_chaos build/test_chain_adapters build/test_split_shim build/test_redteam
           for t in build/test_particle build/test_net build/test_cdc build/test_bundle build/test_trust build/test_swarm build/test_agent build/test_chaos build/test_chain_adapters build/test_split_shim build/test_redteam; do

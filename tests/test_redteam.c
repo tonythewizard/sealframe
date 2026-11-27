@@ -942,24 +942,28 @@ static void test_live_tcp_udp_fuzz(const char *work) {
                         "--bind", "127.0.0.1", "--port", "18922", "--max", "41", NULL };
     pid_t tpid = spawn_bg(tcp_srv);
     assert(tpid > 0);
-    msleep(250);
-    for (int i = 0; i < 40; i++) {
+    int tcp_sent = 0;
+    for (int attempt = 0; tcp_sent < 40 && attempt < 200; attempt++) {
         int fd = tcp_connect_local(18922, 1000);
-        if (fd >= 0) {
-            uint8_t junk[512];
-            randombytes_buf(junk, sizeof(junk));
-            if (i % 4 == 0) {
-                memcpy(junk, "FPN1", 4);
-                (void)send(fd, junk, 148, MSG_NOSIGNAL);
-            } else if (i % 4 == 1) {
-                memcpy(junk, "FPN1", 4);
-                (void)send(fd, junk, 14, MSG_NOSIGNAL);
-            } else if (i % 4 == 2) {
-                (void)send(fd, junk, 512, MSG_NOSIGNAL);
-            }
-            close(fd);
+        if (fd < 0) {
+            msleep(25);
+            continue;
         }
+        uint8_t junk[512];
+        randombytes_buf(junk, sizeof(junk));
+        if (tcp_sent % 4 == 0) {
+            memcpy(junk, "FPN1", 4);
+            (void)send(fd, junk, 148, MSG_NOSIGNAL);
+        } else if (tcp_sent % 4 == 1) {
+            memcpy(junk, "FPN1", 4);
+            (void)send(fd, junk, 14, MSG_NOSIGNAL);
+        } else if (tcp_sent % 4 == 2) {
+            (void)send(fd, junk, 512, MSG_NOSIGNAL);
+        }
+        close(fd);
+        tcp_sent++;
     }
+    assert(tcp_sent == 40);
     int st = 0;
     assert(waitpid(tpid, &st, WNOHANG) == 0);
     char cli_tcp[512];
@@ -976,7 +980,7 @@ static void test_live_tcp_udp_fuzz(const char *work) {
                         "--bind", "127.0.0.1", "--port", "18923", "--max", "1", NULL };
     pid_t upid = spawn_bg(udp_srv);
     assert(upid > 0);
-    msleep(250);
+    msleep(400);
     int ufd = socket(AF_INET, SOCK_DGRAM, 0);
     assert(ufd >= 0);
     struct sockaddr_in usa;
