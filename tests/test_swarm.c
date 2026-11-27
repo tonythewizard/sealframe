@@ -199,10 +199,91 @@ static void test_udp_loss_and_connection_migration(void) {
            (double)ures.srtt_us / 1000.0, (double)ures.elapsed_ns / 1e6);
 }
 
+typedef struct {
+    fp_udp_pull_cfg_t cfg;
+    fp_err_t          err;
+} udp_cli_thr_t;
+
+static void *udp_cli_worker(void *arg) {
+    udp_cli_thr_t *c = (udp_cli_thr_t *)arg;
+    fp_udp_stats_t st;
+    c->err = fp_udp_pull(&c->cfg, &st);
+    return NULL;
+}
+
+static void test_udp_antidos_acl_and_concurrent_sessions(void) {
+    char st[] = "/tmp/fp-udp-acl-s-XXXXXX";
+    char c1[] = "/tmp/fp-udp-acl-c1-XXXXXX";
+    char c2[] = "/tmp/fp-udp-acl-c2-XXXXXX";
+    char c3[] = "/tmp/fp-udp-acl-c3-XXXXXX";
+    char *sdir = mkdtemp(st), *cd1 = mkdtemp(c1), *cd2 = mkdtemp(c2), *cd3 = mkdtemp(c3);
+    assert(sdir && cd1 && cd2 && cd3);
+
+    const size_t N = 256u << 10;
+    uint8_t *data = malloc(N);
+    assert(data != NULL);
+    fill_prng(data, N, 0xAC1D0555u);
+    fp_dna_t dna;
+    assert(fp_store_put_object(sdir, data, N, &dna) == FP_OK);
+    free(data);
+
+    fp_keypair_t skp, kp1, kp2, evil_kp;
+    assert(fp_keygen(&skp) == FP_OK && fp_keygen(&kp1) == FP_OK &&
+           fp_keygen(&kp2) == FP_OK && fp_keygen(&evil_kp) == FP_OK);
+
+    uint8_t acl[2][FP_PK_LEN];
+    memcpy(acl[0], kp1.pk, FP_PK_LEN);
+    memcpy(acl[1], kp2.pk, FP_PK_LEN);
+
+    uint16_t port = 0;
+    udp_srv_t us;
+    memset(&us, 0, sizeof(us));
+    us.fd = fp_udp_bind("127.0.0.1", 0, &port);
+    assert(us.fd >= 0);
+    us.cfg.bind_addr = "127.0.0.1";
+    us.cfg.port = port;
+    us.cfg.store_dir = sdir;
+    us.cfg.server_kp = &skp;
+    us.cfg.allowed_peer_pks = &acl[0][0];
+    us.cfg.allowed_peer_count = 2;
+    us.cfg.max_sessions = 2;
+    us.cfg.io_timeout_ms = 2000;
+
+    pthread_t sth, t1, t2;
+    assert(pthread_create(&sth, NULL, run_udp, &us) == 0);
+
+    /* Concurrent authorized pulls + unauthorized client MUST NOT evict active sessions */
+    udp_cli_thr_t cli1, cli2;
+    memset(&cli1, 0, sizeof(cli1));
+    memset(&cli2, 0, sizeof(cli2));
+    cli1.cfg.host = "127.0.0.1"; cli1.cfg.port = port; cli1.cfg.store_dir = cd1;
+    cli1.cfg.client_kp = &kp1; cli1.cfg.expected_srv_pk = skp.pk; cli1.cfg.target_dna = dna;
+    cli1.cfg.test_migrate_at_chunk = 6;
+    cli2.cfg.host = "127.0.0.1"; cli2.cfg.port = port; cli2.cfg.store_dir = cd2;
+    cli2.cfg.client_kp = &kp2; cli2.cfg.expected_srv_pk = skp.pk; cli2.cfg.target_dna = dna;
+
+    /* Unauthorized evil client sends raw U_HELLO -> ignored before disk/slot allocation */
+    fp_udp_pull_cfg_t evil_cfg;
+    memset(&evil_cfg, 0, sizeof(evil_cfg));
+    evil_cfg.host = "127.0.0.1"; evil_cfg.port = port; evil_cfg.store_dir = cd3;
+    evil_cfg.client_kp = &evil_kp; evil_cfg.expected_srv_pk = skp.pk; evil_cfg.target_dna = dna;
+
+    assert(pthread_create(&t1, NULL, udp_cli_worker, &cli1) == 0);
+    assert(pthread_create(&t2, NULL, udp_cli_worker, &cli2) == 0);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    pthread_join(sth, NULL);
+
+    assert(cli1.err == FP_OK && cli2.err == FP_OK);
+    assert(fp_store_has_object(cd1, &dna, NULL) && fp_store_has_object(cd2, &dna, NULL));
+    printf("[PASS] UDP multi-session anti-eviction + multi-key ACL + AEAD PATH_CHALLENGE migration verified\n");
+}
+
 int main(void) {
     assert(fp_init() == FP_OK);
     test_multipeer_swarm_with_poisoned_peer();
     test_udp_loss_and_connection_migration();
+    test_udp_antidos_acl_and_concurrent_sessions();
     printf("ALL M5 SWARM & ENCRYPTED UDP TESTS PASSED.\n");
     return 0;
 }

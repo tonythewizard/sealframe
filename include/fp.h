@@ -558,10 +558,12 @@ typedef struct {
     uint16_t            port;
     const char         *store_dir;
     const fp_keypair_t *server_kp;
-    const uint8_t      *allowed_peer_pk; /* Optional 32B client Ed25519 pin (checked BEFORE disk I/O) */
-    uint32_t            max_sessions;    /* 0 = serve forever */
+    const uint8_t      *allowed_peer_pk;     /* Optional single 32B client Ed25519 pin */
+    const uint8_t      *allowed_peer_pks;    /* Optional flat multi-key ACL (allowed_peer_count * 32 B) */
+    size_t              allowed_peer_count;  /* Number of 32B keys in allowed_peer_pks */
+    uint32_t            max_sessions;        /* 0 = serve forever */
     int                 io_timeout_ms;
-    uint32_t            fault_drop_pct;  /* Test hook: drop N% of outgoing UDP packets */
+    uint32_t            fault_drop_pct;      /* Test hook: drop N% of outgoing UDP packets */
 } fp_udp_server_cfg_t;
 
 typedef struct {

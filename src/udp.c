@@ -29,17 +29,23 @@
 #define UDP_AEAD_ABYTES    crypto_aead_xchacha20poly1305_ietf_ABYTES
 #define UDP_MAX_DATAGRAM   1400u
 #define UDP_DEFAULT_MAXOUT (128u << 20)
-#define UDP_HELLO_LEN      (4u + 32u + 32u + 16u + 32u + 64u)     /* 180 B */
-#define UDP_WELCOME_LEN    (4u + 8u + 32u + 32u + 16u + 8u + 8u + 64u) /* 172 B */
-#define UDP_MAX_WINDOW     32u   /* Max AIMD congestion window (chunks in flight) */
-#define UDP_INIT_CWND      8u    /* Initial congestion window */
+#define UDP_HELLO_LEN        (4u + 32u + 32u + 16u + 32u + 64u)     /* 180 B */
+#define UDP_HELLO_COOKIE_LEN (UDP_HELLO_LEN + 16u)                  /* 196 B (with stateless retry cookie) */
+#define UDP_RETRY_LEN        (4u + 4u + 16u + 16u)                  /* 40 B ("FPU1"|U_RETRY|0,0,0|cookie|c_nonce) */
+#define UDP_WELCOME_LEN      (4u + 8u + 32u + 32u + 16u + 8u + 8u + 64u) /* 172 B */
+#define UDP_MAX_WINDOW       32u   /* Max AIMD congestion window (chunks in flight) */
+#define UDP_INIT_CWND        8u    /* Initial congestion window */
+#define UDP_MAX_SESSIONS     16u   /* Concurrent session table (prevents single-packet DoS eviction) */
 
 enum {
-    U_HELLO     = 1,
-    U_WELCOME   = 2,
-    U_REQ_FRAGS = 3,
-    U_FRAG      = 4,
-    U_BYE       = 5
+    U_HELLO          = 1,
+    U_WELCOME        = 2,
+    U_REQ_FRAGS      = 3,
+    U_FRAG           = 4,
+    U_BYE            = 5,
+    U_RETRY          = 6,
+    U_PATH_CHALLENGE = 7,
+    U_PATH_RESPONSE  = 8
 };
 
 static uint64_t now_ns(void) {
@@ -227,24 +233,62 @@ int fp_udp_bind(const char *bind_addr, uint16_t port, uint16_t *out_port) {
     return fd;
 }
 
-/* --- UDP Server (supports connection migration by session_id + packet loss fault hook) --- */
+/* --- UDP Server (multi-session anti-DoS, stateless retry cookie, AEAD path validation) --- */
 
 typedef struct {
-    int               active;
-    uint64_t          sid;
-    uint8_t           c_eph[32];
-    uint8_t           c_nonce[16];
-    uint8_t           welcome_pkt[UDP_WELCOME_LEN];
-    uint8_t           tx_key[32];
-    uint8_t           rx_key[32];
-    uint64_t          tx_seq;
-    uint64_t          rx_max_seq;
-    uint64_t          rx_bitmap; /* 64-packet anti-replay sliding window */
-    int               obj_fd;
-    uint64_t          obj_len;
-    uint64_t          total_chunks;
-    fp_merkle_tree_t *tree;
+    int                active;
+    uint64_t           sid;
+    uint8_t            c_eph[32];
+    uint8_t            c_nonce[16];
+    uint8_t            welcome_pkt[UDP_WELCOME_LEN];
+    uint8_t            tx_key[32];
+    uint8_t            rx_key[32];
+    uint64_t           tx_seq;
+    uint64_t           rx_max_seq;
+    uint64_t           rx_bitmap; /* 64-packet anti-replay sliding window */
+    int                obj_fd;
+    uint64_t           obj_len;
+    uint64_t           total_chunks;
+    fp_merkle_tree_t  *tree;
+    struct sockaddr_in validated_peer;
+    int                path_pending;
+    struct sockaddr_in pending_peer;
+    uint8_t            path_challenge[16];
+    uint64_t           last_active_ns;
 } udp_sess_t;
+
+static int peer_equal(const struct sockaddr_in *a, const struct sockaddr_in *b) {
+    return a->sin_addr.s_addr == b->sin_addr.s_addr && a->sin_port == b->sin_port;
+}
+
+static int udp_peer_allowed(const fp_udp_server_cfg_t *cfg, const uint8_t pk[FP_PK_LEN]) {
+    if (!cfg->allowed_peer_pk && cfg->allowed_peer_count == 0) return 1;
+    if (cfg->allowed_peer_pk && sodium_memcmp(pk, cfg->allowed_peer_pk, FP_PK_LEN) == 0) return 1;
+    for (size_t i = 0; i < cfg->allowed_peer_count; i++) {
+        if (cfg->allowed_peer_pks &&
+            sodium_memcmp(pk, cfg->allowed_peer_pks + i * FP_PK_LEN, FP_PK_LEN) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void udp_compute_retry_cookie(const uint8_t secret[32],
+                                     const struct sockaddr_in *peer,
+                                     const uint8_t c_nonce[16],
+                                     const fp_dna_t *target_dna,
+                                     uint8_t out_cookie[16]) {
+    static const uint8_t tag[12] = "FPU1/COOKIE";
+    blake3_hasher h;
+    blake3_hasher_init(&h);
+    blake3_hasher_update(&h, tag, sizeof(tag));
+    blake3_hasher_update(&h, secret, 32);
+    blake3_hasher_update(&h, &peer->sin_addr.s_addr, sizeof(peer->sin_addr.s_addr));
+    blake3_hasher_update(&h, &peer->sin_port, sizeof(peer->sin_port));
+    blake3_hasher_update(&h, c_nonce, 16);
+    blake3_hasher_update(&h, target_dna->bytes, FP_DNA_LEN);
+    blake3_hasher_finalize(&h, out_cookie, 16);
+}
 
 /* RFC 6479-style 64-bit sliding anti-replay check (blocks UDP amplification replay DoS) */
 static int udp_replay_accept(uint64_t seq, uint64_t *max_seq, uint64_t *bitmap) {
@@ -288,12 +332,19 @@ static fp_err_t udp_pread_exact(int fd, uint8_t *buf, size_t len, off_t off) {
 fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
     if (udp_fd < 0 || !cfg || !cfg->store_dir || !cfg->server_kp) return FP_ERR_INVALID;
 
-    udp_sess_t sess;
-    memset(&sess, 0, sizeof(sess));
-    sess.obj_fd = -1;
+    udp_sess_t sessions[UDP_MAX_SESSIONS];
+    memset(sessions, 0, sizeof(sessions));
+    for (size_t i = 0; i < UDP_MAX_SESSIONS; i++) sessions[i].obj_fd = -1;
+
+    uint8_t cookie_secret[32];
+    randombytes_buf(cookie_secret, sizeof(cookie_secret));
+    uint64_t retry_window_ns = now_ns();
+    uint32_t retry_sent_in_sec = 0;
+
     uint32_t completed = 0;
     uint64_t drop_rng = UINT64_C(0xD00D1E55A11CE001);
     int timeout_ms = cfg->io_timeout_ms > 0 ? cfg->io_timeout_ms : 5000;
+    uint64_t idle_expire_ns = (uint64_t)timeout_ms * 1000000ull;
 
     uint8_t pkt[UDP_MAX_DATAGRAM];
     uint8_t chunk_blob[FP_CHUNK_SIZE + 4096u];
@@ -303,11 +354,18 @@ fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
         int prc = poll(&pfd, 1, timeout_ms);
         if (prc < 0) {
             if (errno == EINTR) continue;
-            udp_sess_free(&sess);
+            for (size_t i = 0; i < UDP_MAX_SESSIONS; i++) udp_sess_free(&sessions[i]);
+            sodium_memzero(cookie_secret, sizeof(cookie_secret));
             return FP_ERR_IO;
         }
+        uint64_t tnow = now_ns();
         if (prc == 0) {
-            if (sess.active) { udp_sess_free(&sess); completed++; }
+            for (size_t i = 0; i < UDP_MAX_SESSIONS; i++) {
+                if (sessions[i].active && (tnow - sessions[i].last_active_ns) >= idle_expire_ns) {
+                    udp_sess_free(&sessions[i]);
+                    completed++;
+                }
+            }
             continue;
         }
 
@@ -316,14 +374,79 @@ fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
         ssize_t n = recvfrom(udp_fd, pkt, sizeof(pkt), 0, (struct sockaddr *)&peer, &plen);
         if (n <= 4 || memcmp(pkt, "FPU1", 4) != 0) continue;
 
-        /* 1. Unencrypted U_HELLO handshake (180 B; U_REQ_FRAGS is 52 B, U_BYE is 40 B) */
-        if ((size_t)n == UDP_HELLO_LEN) {
+        /* 1. Unencrypted U_HELLO (180 B) or U_HELLO_COOKIE (196 B) handshake */
+        if ((size_t)n == UDP_HELLO_LEN || (size_t)n == UDP_HELLO_COOKIE_LEN) {
             const uint8_t *c_pk = pkt + 4;
             const uint8_t *c_eph = pkt + 36;
             const uint8_t *c_nonce = pkt + 68;
             fp_dna_t target_dna;
             memcpy(target_dna.bytes, pkt + 84, FP_DNA_LEN);
             const uint8_t *c_sig = pkt + 116;
+
+            /* Fast ACL check BEFORE any cookie/crypto/disk work! */
+            if (!udp_peer_allowed(cfg, c_pk)) {
+                continue;
+            }
+
+            /* Idempotent U_HELLO deduplication across active sessions */
+            int dup_found = 0;
+            for (size_t i = 0; i < UDP_MAX_SESSIONS; i++) {
+                if (sessions[i].active &&
+                    memcmp(sessions[i].c_eph, c_eph, 32) == 0 &&
+                    memcmp(sessions[i].c_nonce, c_nonce, 16) == 0 &&
+                    peer_equal(&sessions[i].validated_peer, &peer)) {
+                    (void)sendto(udp_fd, sessions[i].welcome_pkt, sizeof(sessions[i].welcome_pkt), 0,
+                                 (struct sockaddr *)&peer, plen);
+                    sessions[i].last_active_ns = tnow;
+                    dup_found = 1;
+                    break;
+                }
+            }
+            if (dup_found) continue;
+
+            /* Stateless address-reachability verification via BLAKE3 retry cookie:
+             * Required whenever server has no explicit peer ACL (open/swarm mode),
+             * preventing spoofed-IP CPU/disk DoS and amplification (< 1x 40B reply). */
+            int need_cookie = (!cfg->allowed_peer_pk && cfg->allowed_peer_count == 0);
+            uint8_t expect_cookie[16];
+            udp_compute_retry_cookie(cookie_secret, &peer, c_nonce, &target_dna, expect_cookie);
+            if (need_cookie) {
+                if ((size_t)n == UDP_HELLO_LEN) {
+                    if (tnow - retry_window_ns >= 1000000000ull) {
+                        retry_window_ns = tnow;
+                        retry_sent_in_sec = 0;
+                    }
+                    if (retry_sent_in_sec < 128u) {
+                        uint8_t rty[UDP_RETRY_LEN];
+                        memcpy(rty, "FPU1", 4);
+                        rty[4] = U_RETRY; rty[5] = 0; rty[6] = 0; rty[7] = 0;
+                        memcpy(rty + 8, expect_cookie, 16);
+                        memcpy(rty + 24, c_nonce, 16);
+                        (void)sendto(udp_fd, rty, sizeof(rty), 0, (struct sockaddr *)&peer, plen);
+                        retry_sent_in_sec++;
+                    }
+                    continue;
+                }
+                if (sodium_memcmp(pkt + UDP_HELLO_LEN, expect_cookie, 16) != 0) {
+                    continue;
+                }
+            }
+
+            /* Find free session slot (or reclaim an expired idle slot; NEVER evict active clients!) */
+            int slot = -1;
+            for (size_t i = 0; i < UDP_MAX_SESSIONS; i++) {
+                if (!sessions[i].active) { slot = (int)i; break; }
+            }
+            if (slot < 0) {
+                for (size_t i = 0; i < UDP_MAX_SESSIONS; i++) {
+                    if (sessions[i].active && (tnow - sessions[i].last_active_ns) >= idle_expire_ns) {
+                        udp_sess_free(&sessions[i]);
+                        slot = (int)i;
+                        break;
+                    }
+                }
+            }
+            if (slot < 0) continue; /* All active sessions busy: refuse without evicting! */
 
             uint8_t cmsg[13 + 32 + 32 + 16 + 32];
             memcpy(cmsg, "FPU1/C_HELLO", 13);
@@ -332,21 +455,6 @@ fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
             memcpy(cmsg + 77, c_nonce, 16);
             memcpy(cmsg + 93, target_dna.bytes, 32);
             if (crypto_sign_ed25519_verify_detached(c_sig, cmsg, sizeof(cmsg), c_pk) != 0) {
-                continue;
-            }
-            /* Reject unauthorized peer BEFORE any disk I/O or Merkle index access! */
-            if (cfg->allowed_peer_pk && sodium_memcmp(c_pk, cfg->allowed_peer_pk, FP_PK_LEN) != 0) {
-                continue;
-            }
-
-            /* Idempotent U_HELLO deduplication: if the client retransmitted U_HELLO while
-             * the server was building the Merkle tree on a slow HDD/WAN, resend the cached
-             * U_WELCOME instead of destroying the active session! */
-            if (sess.active &&
-                memcmp(sess.c_eph, c_eph, 32) == 0 &&
-                memcmp(sess.c_nonce, c_nonce, 16) == 0) {
-                (void)sendto(udp_fd, sess.welcome_pkt, sizeof(sess.welcome_pkt), 0,
-                             (struct sockaddr *)&peer, plen);
                 continue;
             }
 
@@ -368,7 +476,6 @@ fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
                 }
             }
 
-            udp_sess_free(&sess);
             uint8_t s_eph_pk[32], s_eph_sk[32], s_nonce[16], shared[32];
             randombytes_buf(s_eph_sk, sizeof(s_eph_sk));
             crypto_scalarmult_base(s_eph_pk, s_eph_sk);
@@ -389,17 +496,21 @@ fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
                             &target_dna, shared, th, k_c2s, k_s2c);
             sodium_memzero(shared, sizeof(shared));
 
-            sess.active = 1;
-            sess.sid = sid;
-            memcpy(sess.c_eph, c_eph, 32);
-            memcpy(sess.c_nonce, c_nonce, 16);
-            memcpy(sess.tx_key, k_s2c, 32);
-            memcpy(sess.rx_key, k_c2s, 32);
-            sess.tx_seq = 1;
-            sess.obj_fd = obj_fd;
-            sess.obj_len = obj_len;
-            sess.total_chunks = total_chunks;
-            sess.tree = tree;
+            udp_sess_t *s = &sessions[slot];
+            s->active = 1;
+            s->sid = sid;
+            memcpy(s->c_eph, c_eph, 32);
+            memcpy(s->c_nonce, c_nonce, 16);
+            memcpy(s->tx_key, k_s2c, 32);
+            memcpy(s->rx_key, k_c2s, 32);
+            s->tx_seq = 1;
+            s->obj_fd = obj_fd;
+            s->obj_len = obj_len;
+            s->total_chunks = total_chunks;
+            s->tree = tree;
+            s->validated_peer = peer;
+            s->path_pending = 0;
+            s->last_active_ns = tnow;
             sodium_memzero(k_c2s, sizeof(k_c2s));
             sodium_memzero(k_s2c, sizeof(k_s2c));
 
@@ -419,38 +530,75 @@ fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
             put_be64(wel + 100, total_chunks);
             unsigned long long siglen = 0;
             crypto_sign_ed25519_detached(wel + 108, &siglen, smsg, sizeof(smsg), cfg->server_kp->sk);
-            memcpy(sess.welcome_pkt, wel, sizeof(wel));
+            memcpy(s->welcome_pkt, wel, sizeof(wel));
             (void)sendto(udp_fd, wel, sizeof(wel), 0, (struct sockaddr *)&peer, plen);
             continue;
         }
 
-        /* 2. Authenticated Encrypted Session Packets (connection-migration safe!) */
-        if (!sess.active) continue;
+        /* 2. Authenticated Encrypted Session Packets (lookup by 64-bit sid) */
+        if ((size_t)n < UDP_HDR_LEN + UDP_AEAD_ABYTES) continue;
+        uint64_t pkt_sid = get_be64(pkt + 8);
+        udp_sess_t *s = NULL;
+        for (size_t i = 0; i < UDP_MAX_SESSIONS; i++) {
+            if (sessions[i].active && sessions[i].sid == pkt_sid) { s = &sessions[i]; break; }
+        }
+        if (!s) continue;
+
         uint8_t ptype = 0;
         uint64_t pseq = 0;
         uint8_t pt[UDP_MAX_DATAGRAM];
         size_t pt_len = 0;
-        if (open_udp_packet(pkt, (size_t)n, sess.sid, sess.rx_key, &ptype, &pseq, pt, &pt_len) != 0) {
+        if (open_udp_packet(pkt, (size_t)n, s->sid, s->rx_key, &ptype, &pseq, pt, &pt_len) != 0) {
             continue;
         }
-        if (!udp_replay_accept(pseq, &sess.rx_max_seq, &sess.rx_bitmap)) {
+        if (!udp_replay_accept(pseq, &s->rx_max_seq, &s->rx_bitmap)) {
+            continue;
+        }
+        s->last_active_ns = tnow;
+
+        /* QUIC-style Path Validation on IP/port migration:
+         * Fast path (peer == validated_peer): 0 overhead!
+         * Unvalidated migrated peer: NEVER emit 24-fragment burst (~500x amplification);
+         * emit a single 56 B AEAD U_PATH_CHALLENGE (~1x) and switch only after U_PATH_RESPONSE. */
+        if (!peer_equal(&peer, &s->validated_peer)) {
+            if (ptype == U_PATH_RESPONSE && pt_len == 16u && s->path_pending &&
+                peer_equal(&peer, &s->pending_peer) &&
+                sodium_memcmp(pt, s->path_challenge, 16u) == 0) {
+                s->validated_peer = peer;
+                s->path_pending = 0;
+                continue;
+            }
+            if (ptype == U_BYE) {
+                udp_sess_free(s);
+                completed++;
+                continue;
+            }
+            if (!s->path_pending || !peer_equal(&peer, &s->pending_peer)) {
+                randombytes_buf(s->path_challenge, sizeof(s->path_challenge));
+                s->pending_peer = peer;
+                s->path_pending = 1;
+            }
+            uint8_t ch_pkt[UDP_MAX_DATAGRAM];
+            size_t ch_len = seal_udp_packet(ch_pkt, U_PATH_CHALLENGE, s->sid, s->tx_seq++,
+                                            s->tx_key, s->path_challenge, 16u);
+            (void)sendto(udp_fd, ch_pkt, ch_len, 0, (struct sockaddr *)&peer, plen);
             continue;
         }
 
         if (ptype == U_BYE) {
-            udp_sess_free(&sess);
+            udp_sess_free(s);
             completed++;
             continue;
         }
         if (ptype == U_REQ_FRAGS && pt_len == 12u) {
             uint64_t ci = get_be64(pt);
             uint32_t mask = get_be32(pt + 8);
-            if (ci >= sess.total_chunks) continue;
+            if (ci >= s->total_chunks) continue;
 
             fp_merkle_proof_t proof;
-            if (fp_merkle_tree_prove(sess.tree, ci, &proof) != FP_OK) continue;
+            if (fp_merkle_tree_prove(s->tree, ci, &proof) != FP_OK) continue;
             uint8_t raw_chunk[FP_CHUNK_SIZE];
-            if (udp_pread_exact(sess.obj_fd, raw_chunk, proof.chunk_len,
+            if (udp_pread_exact(s->obj_fd, raw_chunk, proof.chunk_len,
                                 (off_t)(ci * FP_CHUNK_SIZE)) != FP_OK) {
                 continue;
             }
@@ -483,15 +631,16 @@ fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
                 memcpy(fpt + 12, chunk_blob + foff, flen);
 
                 uint8_t out_pkt[UDP_MAX_DATAGRAM];
-                size_t out_len = seal_udp_packet(out_pkt, U_FRAG, sess.sid, sess.tx_seq++,
-                                                 sess.tx_key, fpt, 12u + flen);
-                /* Reply directly to `peer` (even if client migrated to a new IP:port!) */
-                (void)sendto(udp_fd, out_pkt, out_len, 0, (struct sockaddr *)&peer, plen);
+                size_t out_len = seal_udp_packet(out_pkt, U_FRAG, s->sid, s->tx_seq++,
+                                                 s->tx_key, fpt, 12u + flen);
+                (void)sendto(udp_fd, out_pkt, out_len, 0,
+                             (struct sockaddr *)&s->validated_peer, sizeof(s->validated_peer));
             }
         }
     }
 
-    udp_sess_free(&sess);
+    for (size_t i = 0; i < UDP_MAX_SESSIONS; i++) udp_sess_free(&sessions[i]);
+    sodium_memzero(cookie_secret, sizeof(cookie_secret));
     return FP_OK;
 }
 
@@ -541,7 +690,8 @@ fp_err_t fp_udp_pull(const fp_udp_pull_cfg_t *cfg, fp_udp_stats_t *out_stats) {
     memcpy(cmsg + 77, c_nonce, 16);
     memcpy(cmsg + 93, cfg->target_dna.bytes, 32);
 
-    uint8_t hello[UDP_HELLO_LEN];
+    uint8_t hello[UDP_HELLO_COOKIE_LEN];
+    size_t hello_len = UDP_HELLO_LEN;
     memcpy(hello, "FPU1", 4);
     memcpy(hello + 4, cfg->client_kp->pk, 32);
     memcpy(hello + 36, c_eph_pk, 32);
@@ -556,13 +706,22 @@ fp_err_t fp_udp_pull(const fp_udp_pull_cfg_t *cfg, fp_udp_stats_t *out_stats) {
     uint32_t migrations = 0;
 
     uint64_t hs_t0 = now_ns();
-    for (int attempt = 0; attempt < 10 && !got_welcome; attempt++) {
+    for (int attempt = 0; attempt < 12 && !got_welcome; attempt++) {
         hs_t0 = now_ns();
-        (void)sendto(fd, hello, sizeof(hello), 0, (struct sockaddr *)&srv, sizeof(srv));
+        (void)sendto(fd, hello, hello_len, 0, (struct sockaddr *)&srv, sizeof(srv));
         pkts_sent++;
         struct pollfd pfd = { fd, POLLIN, 0 };
         if (poll(&pfd, 1, 500) > 0) {
             ssize_t n = recvfrom(fd, wel, sizeof(wel), 0, NULL, NULL);
+            if (n > 0 && (size_t)n == UDP_RETRY_LEN &&
+                memcmp(wel, "FPU1", 4) == 0 && wel[4] == U_RETRY &&
+                memcmp(wel + 24, c_nonce, 16) == 0) {
+                /* Server requested stateless reachability cookie: append & resend immediately */
+                pkts_recv++;
+                memcpy(hello + UDP_HELLO_LEN, wel + 8, 16);
+                hello_len = UDP_HELLO_COOKIE_LEN;
+                continue;
+            }
             if (n > 0 && (size_t)n == UDP_WELCOME_LEN && memcmp(wel, "FPU1", 4) == 0) {
                 pkts_recv++;
                 got_welcome = 1;
@@ -758,6 +917,15 @@ fp_err_t fp_udp_pull(const fp_udp_pull_cfg_t *cfg, fp_udp_stats_t *out_stats) {
                 continue;
             }
             pkts_recv++;
+            if (ptype == U_PATH_CHALLENGE && pt_len == 16u) {
+                /* Respond immediately to server's AEAD path-validation challenge after migration */
+                uint8_t rpkt[UDP_MAX_DATAGRAM];
+                size_t rlen = seal_udp_packet(rpkt, U_PATH_RESPONSE, sid, tx_seq++, tx_key, pt, 16u);
+                (void)sendto(fd, rpkt, rlen, 0, (struct sockaddr *)&srv, sizeof(srv));
+                pkts_sent++;
+                progressed = 1;
+                continue;
+            }
             if (ptype != U_FRAG || pt_len < 12u) continue;
 
             uint64_t ci = get_be64(pt);
