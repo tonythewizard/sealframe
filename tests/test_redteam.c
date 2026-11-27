@@ -841,6 +841,38 @@ static void test_control_plane(const char *work) {
             } else {
                 record_ok("CP-R5", "audit_log.category isolates device telemetry ('heartbeat') from admin/partial-approval records ('admin')");
             }
+
+            /* F6 + F7: (a) Unpromoted filesystem mirror blocked (404) in default secure mode;
+             * (b) Range request served from verified in-memory event buffer (206);
+             * (c) Tampered committed event file rejected with 503 (never falls back to mirror!) */
+            char unp_dir[600], unp_ev[640];
+            snprintf(unp_dir, sizeof(unp_dir), "%s/repo/channels/unpromoted", sec_dir);
+            snprintf(unp_ev, sizeof(unp_ev), "%s/latest.ev", unp_dir);
+            mkdir(unp_dir, 0755);
+            FILE *uf = fopen(unp_ev, "wb"); assert(uf && fwrite("FAKE", 1, 4, uf) == 4); fclose(uf);
+            snprintf(req, sizeof(req), "GET /repo/channels/unpromoted/latest.ev HTTP/1.1\r\nHost: x\r\n\r\n");
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            if (strncmp(resp, "HTTP/1.1 404", 12) != 0) {
+                record_finding("MEDIUM", "CP-F6", "Default secure sf-cp served unpromoted filesystem latest.ev file");
+            } else {
+                record_ok("CP-F6", "Default secure sf-cp rejects unpromoted filesystem latest.ev with 404");
+            }
+
+            snprintf(req, sizeof(req), "GET /repo/channels/stable/latest.ev HTTP/1.1\r\nHost: x\r\nRange: bytes=0-15\r\n\r\n");
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            if (strncmp(resp, "HTTP/1.1 206", 12) != 0 || strstr(resp, "Content-Range: bytes 0-15/") == NULL) {
+                record_finding("MEDIUM", "CP-F7", "Verified in-memory event buffer failed HTTP 206 Range request");
+            } else {
+                /* Corrupt committed events/1.ev on disk -> MUST return 503 fail-closed (zero TOCTOU / zero mirror fallback) */
+                FILE *cf = fopen(evp, "wb"); assert(cf && fwrite("CORRUPT_EVENT", 1, 13, cf) == 13); fclose(cf);
+                snprintf(req, sizeof(req), "GET /repo/channels/stable/latest.ev HTTP/1.1\r\nHost: x\r\n\r\n");
+                raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+                if (strncmp(resp, "HTTP/1.1 503", 12) != 0) {
+                    record_finding("HIGH", "CP-F6/F7", "Tampered committed event did not fail closed with 503");
+                } else {
+                    record_ok("CP-F7", "Single-read verified buffer serves Range (206) and fails closed (503) on event tamper");
+                }
+            }
         }
 
         /* SEC-07: sf-llama-bridge --role server without --peer-pk or --allow-any-peer MUST fail closed */
