@@ -1,14 +1,32 @@
 <p align="center">
-  <img src="assets/sealframe-logo.jpg" alt="SealFrame™ Logo" width="260" />
+  <img src="assets/sealframe-logo.jpg" alt="SealFrame™ Logo" width="240" />
 </p>
 
 <h1 align="center">SealFrame™ (<code>sf</code>) — v0.6.0</h1>
 
 <p align="center">
-  <strong>100% Pure ISO C11 verified content, Edge OTA, distributed split-model WAN acceleration, and EU CRA Control Plane engine.</strong>
+  <strong>Zero-Brick Verified File/OTA Delivery &amp; Distributed AI WAN Acceleration — 100% Pure ISO C11.</strong>
 </p>
 
-Zero Python runtime dependencies. Zero C++. Zero OpenSSL. Zero `libcurl`. Vendored pure-C BLAKE3 + permissive runtime libraries (`libsodium`, `libzstd`, `libsqlite3`).
+<p align="center">
+  <a href="https://github.com/tonythewizard/sealframe/actions/workflows/ci.yml"><img src="https://github.com/tonythewizard/sealframe/actions/workflows/ci.yml/badge.svg" alt="CI Status" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0%20%2F%20Commercial-blue.svg" alt="Dual License" /></a>
+  <img src="https://img.shields.io/badge/ISO-C11%20Pure-00599C.svg" alt="Pure ISO C11" />
+  <img src="https://img.shields.io/badge/EU%20CRA-Ready-2ea44f.svg" alt="EU CRA Ready" />
+</p>
+
+---
+
+### Why SealFrame™?
+
+#### 1. Unbrickable, Crash-Safe & Zero-Trust File / OTA Delivery
+- **Anti-Brick & Anti-Shutdown (`SIGKILL` / Power-Loss Resilient):** Atomic commits across **Files + AI Models + SQLite WAL** (`flock` + `fsync` + atomic `rename`), exact Merkle chunk resume after abrupt shutdowns, and automatic health-watchdog rollback that bit-exact inverts both files and SQLite rows (`0` corrupt states across 10 consecutive OS `SIGKILL` chaos tests).
+- **Cryptographic Zero-Trust & Anti-Byzantine:** Every 16 KiB chunk is verified inline with **BLAKE3 Merkle proofs** (1-bit in-flight tamper or silent disk bit-rot rejected fail-closed), protected by **2-of-3 Ed25519 Root Multi-Sig** with monotonic revocation, over **1-RTT X25519 + XChaCha20-Poly1305** encrypted TCP/UDP (`FP-UDP1` survives **25% packet loss + live IP/NAT migration**; poisoned swarm peers are banned on the first bad chunk).
+- **Extreme Efficiency & Tiny Footprint:** Pure ISO C11 (zero Python, zero C++, zero OpenSSL, zero `libcurl`; ~150–210 KB binaries, **5.86 MiB RSS** serving 512 MiB on 256 MiB RAM hardware), `-99.8%` FastCDC/delta patches (**22× faster & 147× fewer bytes** than `rsync`).
+
+#### 2. Distributed Split-Model AI Inference over WAN (Drop-In)
+- **`sf-llama-bridge`** transparently accelerates `llama.cpp` (`ggml-rpc`) across slow, lossy residential/cross-country links: **up to `-97.5%` wire reduction**, encrypted `FP-UDP1` + adaptive 0-RTT XOR FEC, outlier-safe wire codecs (`BF16`/`INT8*`/`INT4+Outlier`), exact FP32 Top-K logits, and 0-RTT control pipelining.
+- **6-Shard / 6-Country WAN-Emulated A/B (`570 ms` cumulative RTT):** **`4.2×`** serial speedup on `Qwen3.5-9B` (`0.33 → 1.38 tok/s`), up to **`10.4×–13.2×`** with a local coordinator draft on `Qwen3-8B` (**`2.73–3.45 tok/s`** median, peak **`9.41 tok/s`**), cutting per-request prompt overhead from `~55 s` down to **`3–5 s`**.
 
 > **Dual-Licensed:** Open-source under **GNU AGPL-3.0** ([`LICENSE`](LICENSE)) and available under a **Commercial License** ([`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md)) for proprietary/OEM embedding, SaaS/cloud deployments, and EU CRA LTS support. Contact: **`tonyswagcard@gmail.com`**.
 
