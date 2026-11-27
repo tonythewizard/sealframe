@@ -87,16 +87,16 @@ enum {
     BR_TAG_CLOSE     = 99
 };
 
-#define BR_PROTO_VER     4u
+#define BR_PROTO_VER     5u
 #define BR_GGML_CMD_MAX  16u
 #define BR_CAP_ALL       0x000000FFu /* SFT1|TOPK|ZSTD|DEDUP|ZERO|PIPE0RTT|ALLOC_CACHE|OUTLIER_GUARD */
 #define BR_HELLO_LEN     34u
 #define BR_ABI_DIGEST_LEN 16u
 
-/* AI-02: Full 128-bit normative ABI schema digest (BLAKE3 over protocol ver, tensor layout, command table, dtypes) */
+/* AI-02 + R6: Full 128-bit normative ABI schema digest (v5 = 34 B HELLO with 128-bit BLAKE3 ABI digest) */
 static void br_abi_digest(uint8_t out[BR_ABI_DIGEST_LEN]) {
     static const char schema[] =
-        "SFLB_ABI_V4|TENSOR_LEN=296|NAME_OFF=228|NAME_LEN=64|CMD_MAX=16|"
+        "SFLB_ABI_V5|TENSOR_LEN=296|NAME_OFF=228|NAME_LEN=64|CMD_MAX=16|"
         "CMDS=ALLOC0:ALIGN1:MAX2:BASE3:FREE4:CLR5:SET6:SETH7:GET8:CPY9:CMP10:MEM11:INIT12:ASZ13:HLO14:CNT15:RCMP16|"
         "F32=0|CAPS=000000FF";
     blake3_hasher h;
@@ -986,6 +986,8 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
         if (tag == BR_TAG_CLOSE) { free(msg); return FP_OK; }
         if (tag == BR_TAG_HELLO) {
             if (hello_done || mlen != BR_HELLO_LEN || memcmp(msg, "SFLB", 4) != 0) {
+                fprintf(stderr, "[sf-llama-bridge] incompatible HELLO frame: expected proto v%u (%u B), got %zu B\n",
+                        (unsigned)BR_PROTO_VER, (unsigned)BR_HELLO_LEN, mlen);
                 free(msg);
                 return FP_ERR_POLICY;
             }
@@ -996,6 +998,8 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
             br_abi_digest(exp_abi);
             if (pver != BR_PROTO_VER || hlen != (uint16_t)st->rpc_tensor_hdr_len ||
                 cmax > BR_GGML_CMD_MAX || sodium_memcmp(msg + 18, exp_abi, BR_ABI_DIGEST_LEN) != 0) {
+                fprintf(stderr, "[sf-llama-bridge] incompatible HELLO ABI: expected v%u/hdr=%zu, got v%u/hdr=%u\n",
+                        (unsigned)BR_PROTO_VER, st->rpc_tensor_hdr_len, (unsigned)pver, (unsigned)hlen);
                 free(msg);
                 return FP_ERR_POLICY;
             }

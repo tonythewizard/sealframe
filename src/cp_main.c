@@ -829,7 +829,7 @@ static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_
         sqlite3_finalize(vs);
         if (rc != SQLITE_ROW) return -1;
     }
-    if (user_ver < 0 || user_ver > 2) {
+    if (user_ver < 0 || user_ver > 3) {
         fprintf(stderr, "sf-cp: unsupported control_plane.db schema version %d\n", user_ver);
         return -1;
     }
@@ -869,6 +869,24 @@ static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_
         }
     }
 
+    if (user_ver < 3) {
+        int has_audit_tbl = db_table_exists(st->db, "audit_log");
+        if (has_audit_tbl < 0) { (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL); return -1; }
+        if (has_audit_tbl == 1) {
+            int has_cat = db_table_has_col(st->db, "audit_log", "category");
+            if (has_cat < 0) { (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL); return -1; }
+            if (has_cat == 0) {
+                /* R5: Conservative migration — pre-existing rows marked 'legacy' so they are never mis-pruned */
+                if (sqlite3_exec(st->db,
+                                 "ALTER TABLE audit_log ADD COLUMN category TEXT NOT NULL DEFAULT 'legacy';",
+                                 NULL, NULL, NULL) != SQLITE_OK) {
+                    (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+                    return -1;
+                }
+            }
+        }
+    }
+
     const char *schema =
         "CREATE TABLE IF NOT EXISTS devices ("
         "  device_id TEXT PRIMARY KEY,"
@@ -892,6 +910,7 @@ static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_
         ");"
         "CREATE TABLE IF NOT EXISTS audit_log ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  category TEXT NOT NULL DEFAULT 'heartbeat',"
         "  device_id TEXT NOT NULL,"
         "  ip TEXT NOT NULL,"
         "  channel TEXT NOT NULL,"
@@ -900,6 +919,12 @@ static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_
         "  detail TEXT NOT NULL,"
         "  auth_verified INTEGER NOT NULL,"
         "  last_seen_utc TEXT NOT NULL"
+        ");"
+        "CREATE TABLE IF NOT EXISTS channels ("
+        "  channel TEXT PRIMARY KEY,"
+        "  serial INTEGER NOT NULL,"
+        "  event_hash TEXT NOT NULL,"
+        "  updated_utc TEXT NOT NULL"
         ");"
         "CREATE TABLE IF NOT EXISTS enrolled_devices ("
         "  device_id TEXT PRIMARY KEY,"
@@ -925,11 +950,30 @@ static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_
         "  threshold INTEGER NOT NULL,"
         "  PRIMARY KEY (channel, serial, approver)"
         ");"
-        "PRAGMA user_version = 2;";
+        "PRAGMA user_version = 3;";
     if (sqlite3_exec(st->db, schema, NULL, NULL, NULL) != SQLITE_OK ||
         sqlite3_exec(st->db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
         (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
         return -1;
+    }
+    /* R4: Idempotent startup reconciliation of legacy latest.ev files from committed SQLite channels table */
+    {
+        sqlite3_stmt *cs = NULL;
+        if (sqlite3_prepare_v2(st->db, "SELECT channel, serial FROM channels;", -1, &cs, NULL) == SQLITE_OK) {
+            while (sqlite3_step(cs) == SQLITE_ROW) {
+                const char *ch = (const char *)sqlite3_column_text(cs, 0);
+                int64_t ser = sqlite3_column_int64(cs, 1);
+                if (ch && is_valid_channel(ch) && ser > 0) {
+                    char src[PATH_MAX], cdir[PATH_MAX], dst[PATH_MAX];
+                    if (snprintf(src, sizeof(src), "%s/%lld.ev", st->ev_dir, (long long)ser) < (int)sizeof(src) &&
+                        snprintf(cdir, sizeof(cdir), "%s/%s", st->chan_dir, ch) < (int)sizeof(cdir) &&
+                        snprintf(dst, sizeof(dst), "%s/latest.ev", cdir) < (int)sizeof(dst)) {
+                        if (mkdir_p(cdir) == 0) (void)copy_file_atomic(src, dst);
+                    }
+                }
+            }
+            sqlite3_finalize(cs);
+        }
     }
     return 0;
 }
@@ -953,36 +997,37 @@ static int check_admin_bearer(const cp_state_t *st, const char *auth) {
     return sodium_memcmp(s, st->admin_token, tlen) == 0;
 }
 
-/* SEC-03/SEC-04: Propagate audit write errors fail-closed + retain 50,000 events */
-static int db_append_audit(sqlite3 *db, const char *dev_id, const char *ip, const char *ch,
-                           const char *outcome, int64_t active_serial, const char *detail,
-                           int auth_verified, const char *utc) {
+/* SEC-03/SEC-04/R5: Server-assigned audit category ('heartbeat' vs 'admin'); prune ONLY 'heartbeat' rows! */
+static int db_append_audit(sqlite3 *db, const char *category, const char *dev_id, const char *ip,
+                           const char *ch, const char *outcome, int64_t active_serial,
+                           const char *detail, int auth_verified, const char *utc) {
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(
             db,
-            "INSERT INTO audit_log(device_id,ip,channel,outcome,active_serial,detail,auth_verified,last_seen_utc) "
-            "VALUES(?,?,?,?,?,?,?,?);",
+            "INSERT INTO audit_log(category,device_id,ip,channel,outcome,active_serial,detail,auth_verified,last_seen_utc) "
+            "VALUES(?,?,?,?,?,?,?,?,?);",
             -1, &stmt, NULL);
     if (rc != SQLITE_OK) return -1;
-    sqlite3_bind_text(stmt, 1, dev_id, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, ip, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, ch, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, outcome, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 5, active_serial);
-    sqlite3_bind_text(stmt, 6, detail, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 7, auth_verified ? 1 : 0);
-    sqlite3_bind_text(stmt, 8, utc, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 1, category, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, dev_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, ip, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, ch, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, outcome, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 6, active_serial);
+    sqlite3_bind_text(stmt, 7, detail, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 8, auth_verified ? 1 : 0);
+    sqlite3_bind_text(stmt, 9, utc, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) return -1;
-    /* CP-01: Never prune governance/promotion/enrollment audit records during heartbeat rotation */
-    (void)sqlite3_exec(
-        db,
-        "DELETE FROM audit_log "
-        "WHERE channel NOT IN ('governance','enrollment') "
-        "AND outcome NOT IN ('CHANNEL_SET','EMERGENCY_ROLLBACK','QUORUM_MET','DEVICE_ENROLLED','APPROVER_ADDED') "
-        "AND id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT 50000);",
-        NULL, NULL, NULL);
+    if (strcmp(category, "heartbeat") == 0) {
+        (void)sqlite3_exec(
+            db,
+            "DELETE FROM audit_log "
+            "WHERE category = 'heartbeat' "
+            "AND id NOT IN (SELECT id FROM audit_log WHERE category = 'heartbeat' ORDER BY id DESC LIMIT 50000);",
+            NULL, NULL, NULL);
+    }
     return 0;
 }
 
@@ -1197,7 +1242,7 @@ static int cp_record_heartbeat(cp_state_t *st, const char *ip, const jval_t *bod
         snprintf(err_msg, err_cap, "database heartbeat write failed");
         return -1;
     }
-    if (db_append_audit(st->db, dev_id, ip, channel, outcome, active_serial, detail, auth_ok, utc) != 0) {
+    if (db_append_audit(st->db, "heartbeat", dev_id, ip, channel, outcome, active_serial, detail, auth_ok, utc) != 0) {
         (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
         pthread_mutex_unlock(&st->mu);
         *out_http_status = 500;
@@ -1257,16 +1302,31 @@ static int cp_set_channel_serial(cp_state_t *st, const char *ch, int64_t serial,
     /* Serialize monotonicity check, quorum verification, atomic file write, and audit log (SEC-03, P0-05) */
     pthread_mutex_lock(&st->mu);
 
-    /* Enforce strict monotonicity on channel serial (agents ignore serial <= current!) */
-    fp_event_t cur_ev;
-    if (cp_load_event_file(dst, &cur_ev, NULL) == 0 && (uint64_t)serial <= cur_ev.serial) {
+    /* Enforce strict monotonicity on channel serial (check committed SQLite channels table first, fallback to file!) */
+    uint64_t cur_ser = 0;
+    {
+        sqlite3_stmt *ms = NULL;
+        if (sqlite3_prepare_v2(st->db, "SELECT serial FROM channels WHERE channel=?;", -1, &ms, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(ms, 1, ch, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(ms) == SQLITE_ROW) {
+                int64_t s = sqlite3_column_int64(ms, 0);
+                if (s > 0) cur_ser = (uint64_t)s;
+            }
+            sqlite3_finalize(ms);
+        }
+        fp_event_t cur_ev;
+        if (cp_load_event_file(dst, &cur_ev, NULL) == 0 && cur_ev.serial > cur_ser) {
+            cur_ser = cur_ev.serial;
+        }
+    }
+    if (cur_ser > 0 && (uint64_t)serial <= cur_ser) {
         pthread_mutex_unlock(&st->mu);
         *out_http_status = 409;
         snprintf(msg, msg_cap,
                  "monotonic violation: serial %lld <= active channel '%s' serial %llu "
                  "(emit a new signed event with serial > %llu)",
-                 (long long)serial, ch, (unsigned long long)cur_ev.serial,
-                 (unsigned long long)cur_ev.serial);
+                 (long long)serial, ch, (unsigned long long)cur_ser,
+                 (unsigned long long)cur_ser);
         return -1;
     }
 
@@ -1323,8 +1383,8 @@ static int cp_set_channel_serial(cp_state_t *st, const char *ch, int64_t serial,
         }
     }
 
-    /* SEC-05 + CP-02: Stage audit record inside SQLite transaction BEFORE flipping latest.ev;
-     * if audit write fails, never publish latest.ev; if file write fails, rollback audit! */
+    /* R4: Commit BOTH authoritative channel pointer (`channels` table) AND durable audit record inside ONE SQLite
+     * transaction BEFORE syncing compatibility file `latest.ev`! No device can observe a channel before audit COMMIT. */
     char utc[32], detail[256];
     utc_now(utc);
     snprintf(detail, sizeof(detail), "%s: channel '%s' -> serial #%lld", reason, ch, (long long)serial);
@@ -1334,7 +1394,31 @@ static int cp_set_channel_serial(cp_state_t *st, const char *ch, int64_t serial,
         snprintf(msg, msg_cap, "database transaction begin failed");
         return -1;
     }
-    if (db_append_audit(st->db, "CONTROL_PLANE", "admin", ch,
+    {
+        sqlite3_stmt *ps = NULL;
+        int prc = sqlite3_prepare_v2(
+            st->db,
+            "INSERT INTO channels(channel,serial,event_hash,updated_utc) VALUES(?,?,?,?) "
+            "ON CONFLICT(channel) DO UPDATE SET "
+            "serial=excluded.serial, event_hash=excluded.event_hash, updated_utc=excluded.updated_utc;",
+            -1, &ps, NULL);
+        if (prc == SQLITE_OK) {
+            sqlite3_bind_text(ps, 1, ch, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(ps, 2, serial);
+            sqlite3_bind_text(ps, 3, ev_hash_hex, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ps, 4, utc, -1, SQLITE_TRANSIENT);
+            prc = sqlite3_step(ps);
+            sqlite3_finalize(ps);
+        }
+        if (prc != SQLITE_DONE) {
+            (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+            pthread_mutex_unlock(&st->mu);
+            *out_http_status = 500;
+            snprintf(msg, msg_cap, "database channel pointer write failed");
+            return -1;
+        }
+    }
+    if (db_append_audit(st->db, "admin", "CONTROL_PLANE", "admin", ch,
                         is_emergency_rollback ? "EMERGENCY_ROLLBACK" : "CHANNEL_SET",
                         serial, detail, 1, utc) != 0) {
         (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
@@ -1343,19 +1427,16 @@ static int cp_set_channel_serial(cp_state_t *st, const char *ch, int64_t serial,
         snprintf(msg, msg_cap, "audit log write failed; channel not modified");
         return -1;
     }
-    if (mkdir_p(cdir) != 0 || copy_file_atomic(src, dst) != 0) {
-        (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
-        pthread_mutex_unlock(&st->mu);
-        *out_http_status = 500;
-        snprintf(msg, msg_cap, "failed to write channel latest.ev");
-        return -1;
-    }
     if (sqlite3_exec(st->db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
         (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
         pthread_mutex_unlock(&st->mu);
         *out_http_status = 500;
-        snprintf(msg, msg_cap, "channel updated but audit log commit failed");
+        snprintf(msg, msg_cap, "channel/audit transaction commit failed");
         return -1;
+    }
+    /* Post-commit best-effort mirror to legacy filesystem pointer (reconciled on restart too) */
+    if (mkdir_p(cdir) == 0) {
+        (void)copy_file_atomic(src, dst);
     }
     pthread_mutex_unlock(&st->mu);
     snprintf(msg, msg_cap, "%s: channel '%s' promoted to serial %lld", reason, ch, (long long)serial);
@@ -1958,6 +2039,49 @@ static void send_json(int fd, int code, const char *json) {
     send_resp(fd, code, "application/json", json, strlen(json), NULL);
 }
 
+/* R4: Resolve authoritative channel event path from committed SQLite `channels` table (fallback to pre-existing file) */
+static int cp_resolve_channel_ev_path(cp_state_t *st, const char *ch, char out_path[PATH_MAX]) {
+    int64_t ser = 0;
+    char exp_hash[65];
+    exp_hash[0] = '\0';
+    pthread_mutex_lock(&st->mu);
+    sqlite3_stmt *cs = NULL;
+    if (sqlite3_prepare_v2(st->db, "SELECT serial, event_hash FROM channels WHERE channel=?;", -1, &cs, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(cs, 1, ch, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(cs) == SQLITE_ROW) {
+            ser = sqlite3_column_int64(cs, 0);
+            const char *eh = (const char *)sqlite3_column_text(cs, 1);
+            if (eh) snprintf(exp_hash, sizeof(exp_hash), "%.64s", eh);
+        }
+        sqlite3_finalize(cs);
+    }
+    pthread_mutex_unlock(&st->mu);
+    if (ser > 0) {
+        if (snprintf(out_path, PATH_MAX, "%s/%lld.ev", st->ev_dir, (long long)ser) >= PATH_MAX) {
+            return -1;
+        }
+        fp_event_t ev;
+        char actual_hash[65];
+        if (cp_load_event_file(out_path, &ev, actual_hash) != 0 ||
+            (exp_hash[0] && strcmp(actual_hash, exp_hash) != 0)) {
+            return -1;
+        }
+        return 0;
+    }
+    if (snprintf(out_path, PATH_MAX, "%s/%s/latest.ev", st->chan_dir, ch) >= PATH_MAX) {
+        return -1;
+    }
+    struct stat lsb;
+    if (stat(out_path, &lsb) == 0 && S_ISREG(lsb.st_mode)) return 0;
+    if (strcmp(ch, "stable") == 0) {
+        if (snprintf(out_path, PATH_MAX, "%s/latest.ev", st->repo_dir) < PATH_MAX &&
+            stat(out_path, &lsb) == 0 && S_ISREG(lsb.st_mode)) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static void serve_file_with_range(int fd, const char *path, const char *range_hdr) {
     int ffd = open(path, O_RDONLY | O_NOFOLLOW);
     if (ffd < 0) { send_text(fd, 404, "not found"); return; }
@@ -2244,15 +2368,9 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
             }
         }
         if (strcmp(path, "/repo/latest.ev") == 0) {
-            /* SEC-05: Serve single authoritative stable channel pointer directly (zero dual-write split-brain) */
-            if (snprintf(fpath, sizeof(fpath), "%s/stable/latest.ev", st->chan_dir) >= (int)sizeof(fpath)) {
+            /* SEC-05 + R4: Serve committed authoritative stable channel pointer directly */
+            if (cp_resolve_channel_ev_path(st, "stable", fpath) != 0) {
                 send_text(cfd, 404, "not found"); return;
-            }
-            struct stat lsb;
-            if (stat(fpath, &lsb) != 0) {
-                if (snprintf(fpath, sizeof(fpath), "%s/latest.ev", st->repo_dir) >= (int)sizeof(fpath)) {
-                    send_text(cfd, 404, "not found"); return;
-                }
             }
             serve_file_with_range(cfd, fpath, hdr_range);
             return;
@@ -2266,7 +2384,7 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 if (cl == 0 || cl >= sizeof(ch)) { send_text(cfd, 400, "bad channel"); return; }
                 memcpy(ch, rest, cl); ch[cl] = '\0';
                 if (!is_valid_channel(ch)) { send_text(cfd, 400, "bad channel"); return; }
-                if (snprintf(fpath, sizeof(fpath), "%s/%s/latest.ev", st->chan_dir, ch) >= (int)sizeof(fpath)) {
+                if (cp_resolve_channel_ev_path(st, ch, fpath) != 0) {
                     send_text(cfd, 404, "not found"); return;
                 }
                 serve_file_with_range(cfd, fpath, hdr_range);
@@ -2438,7 +2556,7 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 }
                 char det[256];
                 snprintf(det, sizeof(det), "Enrolled Ed25519 pubkey %.16s... for %s", pk_hex, dev_id);
-                if (db_append_audit(st->db, dev_id, "admin", "enrollment", "DEVICE_ENROLLED", 0, det, 1, utc) != 0) {
+                if (db_append_audit(st->db, "admin", dev_id, "admin", "enrollment", "DEVICE_ENROLLED", 0, det, 1, utc) != 0) {
                     pthread_mutex_unlock(&st->mu);
                     jval_free(body); free(raw_body);
                     send_json(cfd, 500, "{\"ok\":false,\"error\":\"database audit write failed\"}");
@@ -2498,7 +2616,7 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 }
                 char det[256];
                 snprintf(det, sizeof(det), "Registered Ed25519 approver %s (%.16s...)", approver, pk_hex);
-                if (db_append_audit(st->db, "CONTROL_PLANE", "admin", "governance", "APPROVER_ADDED", 0, det, 1, utc) != 0) {
+                if (db_append_audit(st->db, "admin", "CONTROL_PLANE", "admin", "governance", "APPROVER_ADDED", 0, det, 1, utc) != 0) {
                     pthread_mutex_unlock(&st->mu);
                     jval_free(body); free(raw_body);
                     send_json(cfd, 500, "{\"ok\":false,\"error\":\"database audit write failed\"}");
@@ -2627,7 +2745,7 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 snprintf(dev_tag, sizeof(dev_tag), "APPROVER:%s", approver);
                 snprintf(det, sizeof(det), "Ed25519-verified approval %d/%d for %s#%lld: %s",
                          cnt, thr, ch, (long long)serial, reason);
-                if (db_append_audit(st->db, dev_tag, "admin", ch,
+                if (db_append_audit(st->db, "admin", dev_tag, "admin", ch,
                                     (cnt >= thr) ? "QUORUM_MET" : "APPROVED_PARTIAL",
                                     serial, det, 1, utc) != 0) {
                     pthread_mutex_unlock(&st->mu);
