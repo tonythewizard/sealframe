@@ -4,6 +4,7 @@
 #include "fp.h"
 
 #include <blake3.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -19,7 +20,9 @@
 #define PATH_MAX 4096
 #endif
 
-#define BUNDLE_MAX_OBJECT (64u << 20)
+/* SQLite changesets are bounded to 64 MiB; FP_ROLE_FILE entries stream in O(1) RAM (no 64 MiB cap!) */
+#define BUNDLE_MAX_CHANGESET (64u << 20)
+#define BUNDLE_STREAM_BUF    65536u
 
 struct fp_sql_ctx {
     sqlite3      *db;
@@ -381,34 +384,148 @@ static fp_err_t sync_dir_path(const char *dir) {
     return rc == 0 ? FP_OK : FP_ERR_IO;
 }
 
-static fp_err_t write_staged_file(const char *full_path, uint32_t mode,
-                                  const uint8_t *data, size_t len) {
-    char parent[PATH_MAX];
-    int n = snprintf(parent, sizeof(parent), "%s", full_path);
-    if (n < 0 || (size_t)n >= sizeof(parent)) return FP_ERR_BOUNDS;
-    char *slash = strrchr(parent, '/');
-    if (slash && slash != parent) {
-        *slash = '\0';
-        if (mkdir_p(parent) != FP_OK) return FP_ERR_IO;
-    }
+/* Hardened openat() component-by-component directory traversal (immune to intermediate symlinks / TOCTOU). */
+static fp_err_t open_stage_parent_dirfd(int stage_root_fd, const char *rel_path,
+                                        int *out_parent_fd, char out_base[FP_BUNDLE_MAX_PATH]) {
+    if (!safe_rel_path(rel_path)) return FP_ERR_POLICY;
+    int cur = dup(stage_root_fd);
+    if (cur < 0) return FP_ERR_IO;
 
-    unlink(full_path);
-    int fd = open(full_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
-                  (mode_t)(mode ? (mode & 0777u) : 0644u));
-    if (fd < 0) return FP_ERR_IO;
+    const char *p = rel_path;
+    for (;;) {
+        const char *slash = strchr(p, '/');
+        if (!slash) {
+            size_t blen = strlen(p);
+            if (blen == 0 || blen >= FP_BUNDLE_MAX_PATH) { close(cur); return FP_ERR_BOUNDS; }
+            memcpy(out_base, p, blen + 1u);
+            *out_parent_fd = cur;
+            return FP_OK;
+        }
+        size_t clen = (size_t)(slash - p);
+        if (clen == 0 || clen >= FP_BUNDLE_MAX_PATH) { close(cur); return FP_ERR_BOUNDS; }
+        char comp[FP_BUNDLE_MAX_PATH];
+        memcpy(comp, p, clen);
+        comp[clen] = '\0';
+        if (mkdirat(cur, comp, 0755) != 0 && errno != EEXIST) {
+            close(cur);
+            return FP_ERR_IO;
+        }
+        int next = openat(cur, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        if (next < 0) {
+            close(cur);
+            return FP_ERR_POLICY;
+        }
+        (void)fsync(cur);
+        close(cur);
+        cur = next;
+        p = slash + 1;
+    }
+}
+
+static fp_err_t write_staged_bytes_at(int stage_root_fd, const char *rel_path, uint32_t mode,
+                                      const uint8_t *data, size_t len) {
+    int pfd = -1;
+    char base[FP_BUNDLE_MAX_PATH];
+    fp_err_t err = open_stage_parent_dirfd(stage_root_fd, rel_path, &pfd, base);
+    if (err != FP_OK) return err;
+
+    int fd = openat(pfd, base, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+                    (mode_t)(mode ? (mode & 0777u) : 0644u));
+    if (fd < 0) { close(pfd); return FP_ERR_IO; }
     size_t pos = 0;
     while (pos < len) {
         ssize_t wr = write(fd, data + pos, len - pos);
         if (wr < 0) {
             if (errno == EINTR) continue;
-            close(fd);
+            close(fd); (void)unlinkat(pfd, base, 0); close(pfd);
             return FP_ERR_IO;
         }
         pos += (size_t)wr;
     }
-    if (fsync(fd) != 0) { close(fd); return FP_ERR_IO; }
+    int sync_ok = (fsync(fd) == 0);
     close(fd);
-    return sync_dir_path(parent);
+    if (!sync_ok) { (void)unlinkat(pfd, base, 0); close(pfd); return FP_ERR_IO; }
+    sync_ok = (fsync(pfd) == 0);
+    close(pfd);
+    return sync_ok ? FP_OK : FP_ERR_IO;
+}
+
+/* O(1)-RAM multi-GB streaming staging: reads directly from CAS object fd in 64 KiB chunks,
+ * computes BLAKE3 Content DNA inline, writes via openat(O_NOFOLLOW), and fails closed on bit-rot. */
+static fp_err_t stream_stage_object_at(int stage_root_fd, const char *store_dir,
+                                       const fp_bundle_entry_t *e) {
+    char obj_path[PATH_MAX];
+    uint64_t obj_sz = 0;
+    int sfd = fp_store_open_object_fd(store_dir, &e->dna, obj_path, sizeof(obj_path), &obj_sz);
+    if (sfd < 0) return FP_ERR_NOT_FOUND;
+    if (obj_sz != e->size) {
+        close(sfd);
+        return FP_ERR_INTEGRITY;
+    }
+
+    int pfd = -1;
+    char base[FP_BUNDLE_MAX_PATH];
+    fp_err_t err = open_stage_parent_dirfd(stage_root_fd, e->path, &pfd, base);
+    if (err != FP_OK) { close(sfd); return err; }
+
+    int dfd = openat(pfd, base, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+                     (mode_t)(e->mode ? (e->mode & 0777u) : 0644u));
+    if (dfd < 0) { close(sfd); close(pfd); return FP_ERR_IO; }
+
+    uint8_t *buf = malloc(BUNDLE_STREAM_BUF);
+    if (!buf) {
+        close(sfd); close(dfd); (void)unlinkat(pfd, base, 0); close(pfd);
+        return FP_ERR_NOMEM;
+    }
+
+    fp_dna_stream_t ds;
+    fp_dna_stream_init(&ds);
+    uint64_t copied = 0;
+    err = FP_OK;
+    for (;;) {
+        ssize_t r = read(sfd, buf, BUNDLE_STREAM_BUF);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            err = FP_ERR_IO;
+            break;
+        }
+        if (r == 0) break;
+        err = fp_dna_stream_update(&ds, buf, (size_t)r);
+        if (err != FP_OK) break;
+        size_t pos = 0;
+        while (pos < (size_t)r) {
+            ssize_t w = write(dfd, buf + pos, (size_t)r - pos);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                err = FP_ERR_IO;
+                break;
+            }
+            pos += (size_t)w;
+        }
+        if (err != FP_OK) break;
+        copied += (uint64_t)r;
+    }
+    free(buf);
+    close(sfd);
+
+    if (err == FP_OK) {
+        fp_dna_t actual;
+        uint64_t verified_sz = 0;
+        err = fp_dna_stream_finish(&ds, &actual, &verified_sz);
+        if (err == FP_OK && (copied != e->size || verified_sz != e->size || !fp_dna_equal(&actual, &e->dna))) {
+            err = FP_ERR_INTEGRITY;
+        }
+    }
+    if (err == FP_OK && fsync(dfd) != 0) err = FP_ERR_IO;
+    close(dfd);
+    if (err != FP_OK) {
+        (void)unlinkat(pfd, base, 0);
+        close(pfd);
+        return err;
+    }
+    if (fsync(pfd) != 0) { close(pfd); return FP_ERR_IO; }
+    close(pfd);
+    return FP_OK;
 }
 
 static fp_err_t atomic_flip_current(const char *target_dir, const char *gen_rel) {
@@ -568,31 +685,24 @@ static fp_err_t stage_bundle_files(const char *store_dir, const fp_bundle_t *b,
     }
 
     if (mkdir_p(stage_dir) != FP_OK) return FP_ERR_IO;
+    int stage_fd = open(stage_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (stage_fd < 0) return FP_ERR_IO;
 
     for (uint16_t i = 0; i < b->entry_count; i++) {
         if (b->entries[i].role != FP_ROLE_FILE) continue;
-        uint8_t *data = NULL;
-        size_t len = 0;
-        fp_err_t err = fp_store_get_object(store_dir, &b->entries[i].dna, BUNDLE_MAX_OBJECT,
-                                           &data, &len);
-        if (err != FP_OK) return err;
-        if (len != b->entries[i].size) { free(data); return FP_ERR_INTEGRITY; }
-
-        char fpath[PATH_MAX];
-        int fn = snprintf(fpath, sizeof(fpath), "%s/%s", stage_dir, b->entries[i].path);
-        if (fn < 0 || (size_t)fn >= sizeof(fpath)) { free(data); return FP_ERR_BOUNDS; }
-        err = write_staged_file(fpath, b->entries[i].mode, data, len);
-        free(data);
-        if (err != FP_OK) return err;
+        fp_err_t err = stream_stage_object_at(stage_fd, store_dir, &b->entries[i]);
+        if (err != FP_OK) {
+            close(stage_fd);
+            return err;
+        }
     }
 
     /* Write generation seal marker before atomic publication */
-    char seal_path[PATH_MAX];
-    int sn = snprintf(seal_path, sizeof(seal_path), "%s/.sf_gen_sealed", stage_dir);
-    if (sn < 0 || (size_t)sn >= sizeof(seal_path)) return FP_ERR_BOUNDS;
-    fp_err_t serr = write_staged_file(seal_path, 0644, (const uint8_t *)dna_hex, strlen(dna_hex));
-    if (serr != FP_OK) return serr;
-    if (sync_dir_path(stage_dir) != FP_OK) return FP_ERR_IO;
+    fp_err_t serr = write_staged_bytes_at(stage_fd, ".sf_gen_sealed", 0644,
+                                          (const uint8_t *)dna_hex, strlen(dna_hex));
+    int sync_ok = (serr == FP_OK && fsync(stage_fd) == 0);
+    close(stage_fd);
+    if (!sync_ok) return serr != FP_OK ? serr : FP_ERR_IO;
 
     /* Publish generation directory atomically; if a concurrent/prior partial dir exists,
      * only replace if unsealed (never overwrite a sealed generation). */
@@ -696,7 +806,7 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
     for (uint16_t i = 0; i < b.entry_count; i++) {
         if (b.entries[i].role == FP_ROLE_SQLITE_CHANGESET) {
             has_sql = 1;
-            err = fp_store_get_object(store_dir, &b.entries[i].dna, BUNDLE_MAX_OBJECT,
+            err = fp_store_get_object(store_dir, &b.entries[i].dna, BUNDLE_MAX_CHANGESET,
                                       &cs_blobs[i], &cs_lens[i]);
             if (err != FP_OK || cs_lens[i] != b.entries[i].size) {
                 err = err != FP_OK ? err : FP_ERR_INTEGRITY;
@@ -844,7 +954,7 @@ fp_err_t fp_bundle_rollback(const char *store_dir,
             if (cur_b.entries[i].role != FP_ROLE_SQLITE_CHANGESET) continue;
             uint8_t *cs = NULL;
             size_t cs_len = 0;
-            err = fp_store_get_object(store_dir, &cur_b.entries[i].dna, BUNDLE_MAX_OBJECT,
+            err = fp_store_get_object(store_dir, &cur_b.entries[i].dna, BUNDLE_MAX_CHANGESET,
                                       &cs, &cs_len);
             if (err != FP_OK) break;
 
@@ -885,4 +995,107 @@ fp_err_t fp_bundle_rollback(const char *store_dir,
         err = tx_journal_write(target_dir, "COMMITTED", done_seq, prev_hex, has_sql);
     }
     return err;
+}
+
+/* Safe recursive directory removal via openat(O_NOFOLLOW) — never follows symlinks */
+static int rm_rf_at(int parent_fd, const char *name, int depth) {
+    if (depth > 32) return -1;
+    struct stat sb;
+    if (fstatat(parent_fd, name, &sb, AT_SYMLINK_NOFOLLOW) != 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    if (!S_ISDIR(sb.st_mode)) {
+        return unlinkat(parent_fd, name, 0);
+    }
+    int dfd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dfd < 0) return -1;
+    DIR *dir = fdopendir(dfd);
+    if (!dir) { close(dfd); return -1; }
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        (void)rm_rf_at(dfd, de->d_name, depth + 1);
+    }
+    closedir(dir); /* closes dfd */
+    return unlinkat(parent_fd, name, AT_REMOVEDIR);
+}
+
+typedef struct {
+    char   name[128];
+    time_t mtime;
+} gc_gen_entry_t;
+
+static int cmp_gc_gen_desc(const void *a, const void *b) {
+    const gc_gen_entry_t *ga = (const gc_gen_entry_t *)a;
+    const gc_gen_entry_t *gb = (const gc_gen_entry_t *)b;
+    if (gb->mtime > ga->mtime) return 1;
+    if (gb->mtime < ga->mtime) return -1;
+    return strcmp(gb->name, ga->name);
+}
+
+fp_err_t fp_bundle_gc(const char *target_dir, uint32_t keep_last, uint32_t *out_removed) {
+    if (out_removed) *out_removed = 0;
+    if (!target_dir || !target_dir[0]) return FP_ERR_INVALID;
+
+    /* Read active generation from <target_dir>/current symlink so it is NEVER removed */
+    char cur_link[PATH_MAX], active_target[PATH_MAX], active_gen[128];
+    active_gen[0] = '\0';
+    int n = snprintf(cur_link, sizeof(cur_link), "%s/current", target_dir);
+    if (n < 0 || (size_t)n >= sizeof(cur_link)) return FP_ERR_BOUNDS;
+    ssize_t rl = readlink(cur_link, active_target, sizeof(active_target) - 1u);
+    if (rl > 0) {
+        active_target[rl] = '\0';
+        const char *slash = strrchr(active_target, '/');
+        snprintf(active_gen, sizeof(active_gen), "%.127s", slash ? slash + 1 : active_target);
+    }
+
+    char gen_root[PATH_MAX];
+    n = snprintf(gen_root, sizeof(gen_root), "%s/gen", target_dir);
+    if (n < 0 || (size_t)n >= sizeof(gen_root)) return FP_ERR_BOUNDS;
+    int gfd = open(gen_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (gfd < 0) return errno == ENOENT ? FP_OK : FP_ERR_IO;
+
+    DIR *dir = fdopendir(gfd);
+    if (!dir) { close(gfd); return FP_ERR_IO; }
+
+    gc_gen_entry_t *gens = NULL;
+    size_t gcnt = 0, gcap = 0;
+    uint32_t removed = 0;
+
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        const char *nm = de->d_name;
+        if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0) continue;
+        if (strncmp(nm, ".stage-", 7) == 0 || strncmp(nm, ".stale-", 7) == 0) {
+            if (rm_rf_at(gfd, nm, 0) == 0) removed++;
+            continue;
+        }
+        if (active_gen[0] && strcmp(nm, active_gen) == 0) continue;
+        if (strlen(nm) == 64u) {
+            struct stat sb;
+            if (fstatat(gfd, nm, &sb, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(sb.st_mode)) {
+                if (gcnt == gcap) {
+                    size_t ncap = gcap ? gcap * 2u : 16u;
+                    gc_gen_entry_t *ng = realloc(gens, ncap * sizeof(*ng));
+                    if (!ng) { free(gens); closedir(dir); return FP_ERR_NOMEM; }
+                    gens = ng; gcap = ncap;
+                }
+                snprintf(gens[gcnt].name, sizeof(gens[gcnt].name), "%.127s", nm);
+                gens[gcnt].mtime = sb.st_mtime;
+                gcnt++;
+            }
+        }
+    }
+
+    if (gcnt > (size_t)keep_last) {
+        qsort(gens, gcnt, sizeof(*gens), cmp_gc_gen_desc);
+        for (size_t i = (size_t)keep_last; i < gcnt; i++) {
+            if (rm_rf_at(gfd, gens[i].name, 0) == 0) removed++;
+        }
+    }
+    free(gens);
+    (void)fsync(gfd);
+    closedir(dir);
+    if (out_removed) *out_removed = removed;
+    return FP_OK;
 }

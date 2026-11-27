@@ -523,7 +523,8 @@ static fp_err_t handle_client(int cfd, const fp_net_server_cfg_t *cfg, fp_morph_
             return FP_ERR_NOT_FOUND;
         }
         uint64_t stotal = sobj_len > 0 ? (sobj_len + FP_CHUNK_SIZE - 1u) / FP_CHUNK_SIZE : 0;
-        fp_merkle_tree_t *stree = stotal > 0 ? fp_merkle_tree_build_file(spath, NULL) : NULL;
+        fp_merkle_tree_t *stree = stotal > 0
+            ? fp_merkle_tree_build_file_cached(spath, &s_dna, NULL) : NULL;
         if (stotal > 0) {
             if (!stree) {
                 close(sfd); send_error(&ch, FP_ERR_NOMEM); chan_wipe(&ch); return FP_ERR_NOMEM;
@@ -717,8 +718,8 @@ static fp_err_t handle_client(int cfd, const fp_net_server_cfg_t *cfg, fp_morph_
             pos += take;
         }
     } else if (err == FP_OK && mode == FP_NET_MODE_MERKLE_STREAM && total_chunks > 0) {
-        /* Multi-GB streaming server path: zero file-size malloc(), reads 16 KiB via pread() */
-        fp_merkle_tree_t *tree = fp_merkle_tree_build_file(obj_path, NULL);
+        /* Multi-GB streaming server path: zero file-size malloc(), cached FPM1 Merkle index, pread() */
+        fp_merkle_tree_t *tree = fp_merkle_tree_build_file_cached(obj_path, &target_dna, NULL);
         if (!tree) {
             err = FP_ERR_NOMEM;
         } else {

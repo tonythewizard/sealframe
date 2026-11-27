@@ -365,7 +365,9 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     memset(&rep, 0, sizeof(rep));
     rep.outcome = FP_AGENT_REJECTED;
 
-    /* 1. Load & verify pinned local Root Multi-Sig (FPR1) */
+    /* 1. Load pinned local Root Multi-Sig (FPR1).
+     * Verify cryptographic quorum with now_unix=0 first so an offline device with an expired
+     * pinned root can still walk the dual-quorum historical rotation chain vN -> vN+1 -> ...! */
     uint8_t *rbuf = NULL;
     size_t rlen = 0;
     fp_err_t err = read_file_small(cfg->root_path, (1u << 20), &rbuf, &rlen);
@@ -377,38 +379,77 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     err = fp_root_decode(rbuf, rlen, &root);
     free(rbuf);
     uint64_t now_unix = (uint64_t)time(NULL);
-    if (err == FP_OK) err = fp_root_verify_self(&root, now_unix);
+    if (err == FP_OK) err = fp_root_verify_self(&root, 0);
     if (err != FP_OK) {
         snprintf(rep.detail, sizeof(rep.detail), "pinned root.fpr invalid (%s)", fp_strerror(err));
         goto done;
     }
+
+    /* Retain verified historical roots along the rotation chain (supports offline catch-up) */
+    fp_root_doc_t hist_roots[32];
+    size_t hist_root_count = 0;
+    hist_roots[hist_root_count++] = root;
     rep.root_version = root.root_version;
 
-    /* 2. Check remote root.fpr for verified Multi-Sig Root rotation */
-    {
+    /* 2. Walk verified Multi-Sig Root rotation chain (v -> v+1 -> ...) via /repo/roots/<N>.fpr
+     * with fallback to /repo/root.fpr. Rejects any invalid or non-contiguous jump fail-closed. */
+    for (int step = 0; step < 31; step++) {
+        uint64_t next_ver = root.root_version + 1u;
         char rurl[1536];
-        snprintf(rurl, sizeof(rurl), "%s/repo/root.fpr", cfg->repo_url);
         fp_http_resp_t hresp;
-        if (fp_http_get(rurl, (1u << 20), timeout_ms, &hresp) == FP_OK) {
-            if (hresp.status_code == 200 && hresp.body_len > 0) {
-                fp_root_doc_t remote_root;
-                if (fp_root_decode(hresp.body, hresp.body_len, &remote_root) == FP_OK &&
-                    remote_root.root_version > root.root_version) {
-                    if (fp_root_verify_rotation(&root, &remote_root, now_unix) == FP_OK) {
-                        if (write_file_atomic(cfg->root_path, hresp.body, hresp.body_len) == FP_OK) {
-                            root = remote_root;
-                            rep.root_version = root.root_version;
-                        }
-                    } else {
-                        fp_http_resp_free(&hresp);
-                        err = FP_ERR_SIGNATURE;
-                        snprintf(rep.detail, sizeof(rep.detail), "rejected untrusted remote root rotation");
-                        goto done;
-                    }
-                }
-            }
+        snprintf(rurl, sizeof(rurl), "%s/repo/roots/%llu.fpr",
+                 cfg->repo_url, (unsigned long long)next_ver);
+        int got_step = (fp_http_get(rurl, (1u << 20), timeout_ms, &hresp) == FP_OK &&
+                        hresp.status_code == 200 && hresp.body_len > 0);
+        if (!got_step) {
             fp_http_resp_free(&hresp);
+            snprintf(rurl, sizeof(rurl), "%s/repo/root.fpr", cfg->repo_url);
+            if (fp_http_get(rurl, (1u << 20), timeout_ms, &hresp) != FP_OK ||
+                hresp.status_code != 200 || hresp.body_len == 0) {
+                fp_http_resp_free(&hresp);
+                break;
+            }
         }
+        fp_root_doc_t remote_root;
+        fp_err_t derr = fp_root_decode(hresp.body, hresp.body_len, &remote_root);
+        if (derr != FP_OK) {
+            fp_http_resp_free(&hresp);
+            break;
+        }
+        if (remote_root.root_version <= root.root_version) {
+            fp_http_resp_free(&hresp);
+            break;
+        }
+        if (remote_root.root_version != next_ver) {
+            fp_http_resp_free(&hresp);
+            err = FP_ERR_CHAIN;
+            snprintf(rep.detail, sizeof(rep.detail),
+                     "non-contiguous root jump v%llu -> v%llu (missing /repo/roots/%llu.fpr)",
+                     (unsigned long long)root.root_version,
+                     (unsigned long long)remote_root.root_version,
+                     (unsigned long long)next_ver);
+            goto done;
+        }
+        if (fp_root_verify_rotation(&root, &remote_root, 0) != FP_OK) {
+            fp_http_resp_free(&hresp);
+            err = FP_ERR_SIGNATURE;
+            snprintf(rep.detail, sizeof(rep.detail), "rejected untrusted remote root rotation v%llu",
+                     (unsigned long long)next_ver);
+            goto done;
+        }
+        if (write_file_atomic(cfg->root_path, hresp.body, hresp.body_len) == FP_OK) {
+            root = remote_root;
+            rep.root_version = root.root_version;
+            if (hist_root_count < 32u) hist_roots[hist_root_count++] = root;
+        }
+        fp_http_resp_free(&hresp);
+    }
+
+    /* Enforce strict wall-clock freshness on the final active Root Trust Document */
+    err = fp_root_verify_self(&root, now_unix);
+    if (err != FP_OK) {
+        snprintf(rep.detail, sizeof(rep.detail), "active root.fpr expired/invalid (%s)", fp_strerror(err));
+        goto done;
     }
 
     /* 3. Load current local Store state + reconcile any crash-interrupted bundle journal */
@@ -479,21 +520,26 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         goto done;
     }
 
-    /* 5. Build & verify full signed event chain from (st.serial + 1) .. latest_ev.serial */
+    /* 5. Build & verify full signed event chain from (st.serial + 1) .. latest_ev.serial.
+     * Supports offline catch-up up to 4096 events across historical verified root rotations;
+     * intermediate historical events are verified cryptographically (now_unix=0) against the
+     * active or historical root chain, while latest_ev enforces live freshness against active root. */
     uint64_t chain_len = latest_ev.serial - st.serial;
-    if (chain_len > 64u) {
+    if (chain_len > 4096u) {
         err = FP_ERR_BOUNDS;
         snprintf(rep.detail, sizeof(rep.detail), "event chain gap too large (%llu)", (unsigned long long)chain_len);
         goto done;
     }
     fp_event_t *chain = calloc((size_t)chain_len, sizeof(fp_event_t));
-    if (!chain) { err = FP_ERR_NOMEM; goto done; }
+    size_t *chain_ridx = calloc((size_t)chain_len, sizeof(size_t));
+    if (!chain || !chain_ridx) { free(chain); free(chain_ridx); err = FP_ERR_NOMEM; goto done; }
 
     fp_dna_t expected_prev = st.last_event_hash;
     for (uint64_t i = 0; i < chain_len; i++) {
         uint64_t s = st.serial + 1u + i;
         if (s == latest_ev.serial) {
             chain[i] = latest_ev;
+            chain_ridx[i] = hist_root_count - 1u;
         } else {
             char curl[1536];
             snprintf(curl, sizeof(curl), "%s/repo/events/%llu.ev", cfg->repo_url, (unsigned long long)s);
@@ -501,23 +547,33 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
             err = fp_http_get(curl, (1u << 20), timeout_ms, &cr);
             if (err != FP_OK || cr.status_code != 200) {
                 fp_http_resp_free(&cr);
-                free(chain);
+                free(chain); free(chain_ridx);
                 err = FP_ERR_CHAIN;
                 snprintf(rep.detail, sizeof(rep.detail), "missing intermediate event %llu", (unsigned long long)s);
                 goto done;
             }
             err = fp_event_decode(cr.body, cr.body_len, &chain[i]);
             fp_http_resp_free(&cr);
-            if (err == FP_OK) err = fp_event_verify_with_root(&chain[i], &root, now_unix);
+            if (err == FP_OK) {
+                /* Try active root first, then verified historical roots from rotation chain */
+                err = FP_ERR_SIGNATURE;
+                for (size_t ri = hist_root_count; ri > 0; ri--) {
+                    if (fp_event_verify_with_root(&chain[i], &hist_roots[ri - 1u], 0) == FP_OK) {
+                        chain_ridx[i] = ri - 1u;
+                        err = FP_OK;
+                        break;
+                    }
+                }
+            }
             if (err != FP_OK) {
-                free(chain);
+                free(chain); free(chain_ridx);
                 snprintf(rep.detail, sizeof(rep.detail), "invalid intermediate event %llu (%s)",
                          (unsigned long long)s, fp_strerror(err));
                 goto done;
             }
         }
         if (chain[i].serial != s || !fp_dna_equal(&chain[i].prev_event_hash, &expected_prev)) {
-            free(chain);
+            free(chain); free(chain_ridx);
             err = FP_ERR_CHAIN;
             snprintf(rep.detail, sizeof(rep.detail), "broken hash chain at serial %llu", (unsigned long long)s);
             goto done;
@@ -536,10 +592,12 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
                 uint64_t r = 0;
                 (void)fp_http_pull_object(u, cfg->store_dir, &chain[i].target_dna, chain[i].target_size, timeout_ms, &r);
             }
-            err = fp_store_apply_event_with_root(cfg->store_dir, &chain[i], &root, now_unix, NULL, 0);
-            if (err != FP_OK) { free(chain); snprintf(rep.detail, sizeof(rep.detail), "revoke apply failed"); goto done; }
+            uint64_t ev_now = (i + 1u == chain_len) ? now_unix : 0;
+            err = fp_store_apply_event_with_root(cfg->store_dir, &chain[i],
+                                                 &hist_roots[chain_ridx[i]], ev_now, NULL, 0);
+            if (err != FP_OK) { free(chain); free(chain_ridx); snprintf(rep.detail, sizeof(rep.detail), "revoke apply failed"); goto done; }
         }
-        free(chain);
+        free(chain); free(chain_ridx);
         char rev_marker[128];
         snprintf(rev_marker, sizeof(rev_marker), "REVOKED_SERIAL=%llu\n", (unsigned long long)latest_ev.serial);
         err = deactivate_live_target(cfg->target_dir, ".sf_revoked", rev_marker);
@@ -562,7 +620,7 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
                                       timeout_ms, &rep.bytes_downloaded, &rep.bytes_from_lan,
                                       &rep.bytes_resumed);
     if (err != FP_OK) {
-        free(chain);
+        free(chain); free(chain_ridx);
         snprintf(rep.detail, sizeof(rep.detail), "artifact download/verify failed (%s)", fp_strerror(err));
         goto done;
     }
@@ -578,7 +636,7 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
             err = fp_http_pull_object(u, cfg->store_dir, &chain[i].target_dna,
                                       chain[i].target_size, timeout_ms, &r);
             if (err != FP_OK) {
-                free(chain);
+                free(chain); free(chain_ridx);
                 snprintf(rep.detail, sizeof(rep.detail), "intermediate manifest fetch failed");
                 goto done;
             }
@@ -590,7 +648,7 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     if (cfg->db_path && cfg->db_path[0]) {
         err = fp_sql_open(cfg->db_path, &sql);
         if (err != FP_OK) {
-            free(chain);
+            free(chain); free(chain_ridx);
             snprintf(rep.detail, sizeof(rep.detail), "cannot open SQLite DB (%s)", fp_strerror(err));
             goto done;
         }
@@ -612,7 +670,7 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     }
     if (err != FP_OK) {
         fp_sql_close(sql);
-        free(chain);
+        free(chain); free(chain_ridx);
         snprintf(rep.detail, sizeof(rep.detail), "bundle %s failed (%s)",
                  is_explicit_rollback ? "rollback" : "apply", fp_strerror(err));
         goto done;
@@ -626,7 +684,7 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
             fp_err_t rerr = fp_bundle_rollback(cfg->store_dir, &latest_ev.target_dna,
                                                &st.current_dna, cfg->target_dir, sql);
             fp_sql_close(sql);
-            free(chain);
+            free(chain); free(chain_ridx);
             if (rerr == FP_OK) {
                 save_failed_serial(cfg->store_dir, latest_ev.serial);
                 rep.outcome = FP_AGENT_ROLLED_BACK;
@@ -648,7 +706,7 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
             goto done;
         }
         fp_sql_close(sql);
-        free(chain);
+        free(chain); free(chain_ridx);
         if (!st.has_current) {
             (void)deactivate_live_target(cfg->target_dir, NULL, NULL);
             save_failed_serial(cfg->store_dir, latest_ev.serial);
@@ -675,16 +733,18 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
 
     /* 10. Health-check PASSED -> commit full verified event chain atomically to Store */
     for (uint64_t i = 0; i < chain_len; i++) {
-        err = fp_store_apply_event_with_root(cfg->store_dir, &chain[i], &root, now_unix, NULL, 0);
+        uint64_t ev_now = (i + 1u == chain_len) ? now_unix : 0;
+        err = fp_store_apply_event_with_root(cfg->store_dir, &chain[i],
+                                             &hist_roots[chain_ridx[i]], ev_now, NULL, 0);
         if (err != FP_OK) {
             uint64_t bad_s = chain[i].serial;
-            free(chain);
+            free(chain); free(chain_ridx);
             snprintf(rep.detail, sizeof(rep.detail), "store state commit failed at serial %llu (%s)",
                      (unsigned long long)bad_s, fp_strerror(err));
             goto done;
         }
     }
-    free(chain);
+    free(chain); free(chain_ridx);
     save_failed_serial(cfg->store_dir, 0);
 
     rep.outcome = is_explicit_rollback ? FP_AGENT_ROLLED_BACK : FP_AGENT_UPDATED;

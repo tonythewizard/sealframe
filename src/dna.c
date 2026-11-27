@@ -3,11 +3,31 @@
 #include "fp.h"
 
 #include <blake3.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <sodium.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+static uint32_t get_be32(const uint8_t src[4]) {
+    return ((uint32_t)src[0] << 24) | ((uint32_t)src[1] << 16) |
+           ((uint32_t)src[2] << 8)  | ((uint32_t)src[3]);
+}
+
+static uint64_t get_be64(const uint8_t src[8]) {
+    return ((uint64_t)src[0] << 56) | ((uint64_t)src[1] << 48) |
+           ((uint64_t)src[2] << 40) | ((uint64_t)src[3] << 32) |
+           ((uint64_t)src[4] << 24) | ((uint64_t)src[5] << 16) |
+           ((uint64_t)src[6] << 8)  | ((uint64_t)src[7]);
+}
 
 static uint64_t chunks_for_size(uint64_t sz) {
     return sz == 0 ? 0u : (1u + (sz - 1u) / FP_CHUNK_SIZE);
@@ -520,6 +540,247 @@ fp_merkle_tree_t *fp_merkle_tree_build_file(const char *path, uint64_t *out_size
     hash_dna_root(t->total_size, t->nodes[0].hash, &t->dna);
     if (out_size) *out_size = total_size;
     return t;
+}
+
+/* --- Persistent On-Disk Merkle Index (FPM1) + O(1)-RAM Disk Proof Reader --- */
+
+#define FPM1_HDR_LEN  56u
+#define FPM1_NODE_LEN 40u
+
+static int write_all_fd_dna(int fd, const uint8_t *buf, size_t len) {
+    size_t pos = 0;
+    while (pos < len) {
+        ssize_t w = write(fd, buf + pos, len - pos);
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        pos += (size_t)w;
+    }
+    return 0;
+}
+
+static int pread_all_fd_dna(int fd, uint8_t *buf, size_t len, off_t off) {
+    size_t pos = 0;
+    while (pos < len) {
+        ssize_t r = pread(fd, buf + pos, len - pos, off + (off_t)pos);
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) return -1;
+        pos += (size_t)r;
+    }
+    return 0;
+}
+
+fp_err_t fp_merkle_tree_save_index(const fp_merkle_tree_t *tree, const char *idx_path) {
+    if (!tree || !idx_path || !idx_path[0] || tree->used == 0) return FP_ERR_INVALID;
+    char tmp[PATH_MAX];
+    int n = snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", idx_path, (long)getpid());
+    if (n < 0 || (size_t)n >= sizeof(tmp)) return FP_ERR_BOUNDS;
+
+    unlink(tmp);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    if (fd < 0) return FP_ERR_IO;
+
+    uint8_t hdr[FPM1_HDR_LEN];
+    memcpy(hdr, "FPM1", 4);
+    put_be64(hdr + 4, tree->total_size);
+    put_be64(hdr + 12, tree->nchunks);
+    put_be32(hdr + 20, tree->used);
+    memcpy(hdr + 24, tree->dna.bytes, FP_DNA_LEN);
+    if (write_all_fd_dna(fd, hdr, sizeof(hdr)) != 0) {
+        close(fd); unlink(tmp); return FP_ERR_IO;
+    }
+
+    uint8_t batch[102u * FPM1_NODE_LEN]; /* ~4 KiB stack buffer */
+    uint32_t i = 0;
+    while (i < tree->used) {
+        uint32_t cnt = tree->used - i;
+        if (cnt > 102u) cnt = 102u;
+        for (uint32_t k = 0; k < cnt; k++) {
+            uint8_t *p = batch + (size_t)k * FPM1_NODE_LEN;
+            memcpy(p, tree->nodes[i + k].hash, FP_DNA_LEN);
+            put_be32(p + 32, tree->nodes[i + k].left);
+            put_be32(p + 36, tree->nodes[i + k].right);
+        }
+        if (write_all_fd_dna(fd, batch, (size_t)cnt * FPM1_NODE_LEN) != 0) {
+            close(fd); unlink(tmp); return FP_ERR_IO;
+        }
+        i += cnt;
+    }
+    if (fsync(fd) != 0) { close(fd); unlink(tmp); return FP_ERR_IO; }
+    close(fd);
+    if (rename(tmp, idx_path) != 0) { unlink(tmp); return FP_ERR_IO; }
+    return FP_OK;
+}
+
+fp_merkle_tree_t *fp_merkle_tree_load_index(const char *idx_path, uint64_t expected_size,
+                                            const fp_dna_t *expected_dna) {
+    if (!idx_path || !expected_dna || expected_size == 0) return NULL;
+    int fd = open(idx_path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < (off_t)FPM1_HDR_LEN) {
+        close(fd);
+        return NULL;
+    }
+    uint8_t hdr[FPM1_HDR_LEN];
+    if (pread_all_fd_dna(fd, hdr, sizeof(hdr), 0) != 0 || memcmp(hdr, "FPM1", 4) != 0) {
+        close(fd);
+        return NULL;
+    }
+    uint64_t total_size = get_be64(hdr + 4);
+    uint64_t nchunks = get_be64(hdr + 12);
+    uint32_t used = get_be32(hdr + 20);
+    fp_dna_t file_dna;
+    memcpy(file_dna.bytes, hdr + 24, FP_DNA_LEN);
+
+    if (total_size != expected_size ||
+        nchunks != chunks_for_size(total_size) ||
+        nchunks == 0 || nchunks > (UINT32_MAX / 2u) ||
+        used != (uint32_t)(2u * nchunks - 1u) ||
+        !fp_dna_equal(&file_dna, expected_dna)) {
+        close(fd);
+        return NULL;
+    }
+    uint64_t expect_file_len = (uint64_t)FPM1_HDR_LEN + (uint64_t)used * FPM1_NODE_LEN;
+    if ((uint64_t)st.st_size != expect_file_len) {
+        close(fd);
+        return NULL;
+    }
+
+    fp_merkle_tree_t *t = calloc(1, sizeof(*t));
+    if (!t) { close(fd); return NULL; }
+    t->nodes = malloc((size_t)used * sizeof(mnode_t));
+    if (!t->nodes) { free(t); close(fd); return NULL; }
+    t->total_size = total_size;
+    t->nchunks = nchunks;
+    t->cap = used;
+    t->used = used;
+    t->dna = file_dna;
+
+    uint8_t batch[102u * FPM1_NODE_LEN];
+    uint32_t i = 0;
+    off_t off = (off_t)FPM1_HDR_LEN;
+    while (i < used) {
+        uint32_t cnt = used - i;
+        if (cnt > 102u) cnt = 102u;
+        size_t bytes = (size_t)cnt * FPM1_NODE_LEN;
+        if (pread_all_fd_dna(fd, batch, bytes, off) != 0) {
+            free(t->nodes); free(t); close(fd);
+            return NULL;
+        }
+        for (uint32_t k = 0; k < cnt; k++) {
+            const uint8_t *p = batch + (size_t)k * FPM1_NODE_LEN;
+            uint32_t l = get_be32(p + 32);
+            uint32_t r = get_be32(p + 36);
+            if ((l != UINT32_MAX && l >= used) || (r != UINT32_MAX && r >= used)) {
+                free(t->nodes); free(t); close(fd);
+                return NULL;
+            }
+            memcpy(t->nodes[i + k].hash, p, FP_DNA_LEN);
+            t->nodes[i + k].left = l;
+            t->nodes[i + k].right = r;
+        }
+        i += cnt;
+        off += (off_t)bytes;
+    }
+    close(fd);
+
+    fp_dna_t root_check;
+    hash_dna_root(t->total_size, t->nodes[0].hash, &root_check);
+    if (!fp_dna_equal(&root_check, expected_dna)) {
+        free(t->nodes); free(t);
+        return NULL;
+    }
+    return t;
+}
+
+fp_merkle_tree_t *fp_merkle_tree_build_file_cached(const char *obj_path,
+                                                   const fp_dna_t *expected_dna,
+                                                   uint64_t *out_size) {
+    if (!obj_path) return NULL;
+    struct stat st;
+    if (stat(obj_path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) return NULL;
+
+    char idx_path[PATH_MAX];
+    int has_idx = (snprintf(idx_path, sizeof(idx_path), "%s.fpm", obj_path) < (int)sizeof(idx_path));
+    if (has_idx && expected_dna) {
+        fp_merkle_tree_t *cached = fp_merkle_tree_load_index(idx_path, (uint64_t)st.st_size, expected_dna);
+        if (cached) {
+            if (out_size) *out_size = cached->total_size;
+            return cached;
+        }
+    }
+    fp_merkle_tree_t *tree = fp_merkle_tree_build_file(obj_path, out_size);
+    if (!tree) return NULL;
+    if (has_idx && (!expected_dna || fp_dna_equal(&tree->dna, expected_dna))) {
+        (void)fp_merkle_tree_save_index(tree, idx_path);
+    }
+    return tree;
+}
+
+fp_err_t fp_merkle_prove_from_index_file(const char *idx_path, uint64_t chunk_index,
+                                         fp_merkle_proof_t *out_proof) {
+    if (!idx_path || !out_proof) return FP_ERR_INVALID;
+    int fd = open(idx_path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return FP_ERR_NOT_FOUND;
+
+    uint8_t hdr[FPM1_HDR_LEN];
+    if (pread_all_fd_dna(fd, hdr, sizeof(hdr), 0) != 0 || memcmp(hdr, "FPM1", 4) != 0) {
+        close(fd);
+        return FP_ERR_INTEGRITY;
+    }
+    uint64_t total_size = get_be64(hdr + 4);
+    uint64_t nchunks = get_be64(hdr + 12);
+    uint32_t used = get_be32(hdr + 20);
+    if (total_size == 0 || nchunks != chunks_for_size(total_size) ||
+        chunk_index >= nchunks || used != (uint32_t)(2u * nchunks - 1u)) {
+        close(fd);
+        return FP_ERR_BOUNDS;
+    }
+
+    uint8_t tmp_sib[FP_MAX_PROOF_DEPTH][FP_DNA_LEN];
+    uint8_t tmp_right[FP_MAX_PROOF_DEPTH];
+    uint32_t depth = 0;
+    uint32_t cur = 0;
+    uint64_t lo = 0, hi = nchunks;
+    uint8_t nbuf[FPM1_NODE_LEN], sbuf[FPM1_NODE_LEN];
+
+    while (hi - lo > 1) {
+        if (depth >= FP_MAX_PROOF_DEPTH || cur >= used) { close(fd); return FP_ERR_BOUNDS; }
+        off_t noff = (off_t)FPM1_HDR_LEN + (off_t)cur * (off_t)FPM1_NODE_LEN;
+        if (pread_all_fd_dna(fd, nbuf, sizeof(nbuf), noff) != 0) { close(fd); return FP_ERR_IO; }
+        uint32_t l = get_be32(nbuf + 32);
+        uint32_t r = get_be32(nbuf + 36);
+        if (l >= used || r >= used) { close(fd); return FP_ERR_INTEGRITY; }
+
+        uint64_t split = lo + largest_pow2_lt(hi - lo);
+        uint32_t sib_id = (chunk_index < split) ? r : l;
+        off_t soff = (off_t)FPM1_HDR_LEN + (off_t)sib_id * (off_t)FPM1_NODE_LEN;
+        if (pread_all_fd_dna(fd, sbuf, sizeof(sbuf), soff) != 0) { close(fd); return FP_ERR_IO; }
+        memcpy(tmp_sib[depth], sbuf, FP_DNA_LEN);
+        if (chunk_index < split) {
+            tmp_right[depth] = 1;
+            cur = l;
+            hi = split;
+        } else {
+            tmp_right[depth] = 0;
+            cur = r;
+            lo = split;
+        }
+        depth++;
+    }
+    close(fd);
+
+    memset(out_proof, 0, sizeof(*out_proof));
+    out_proof->chunk_index = chunk_index;
+    out_proof->total_size = total_size;
+    uint64_t off = chunk_index * FP_CHUNK_SIZE;
+    uint64_t rem = total_size - off;
+    out_proof->chunk_len = (uint32_t)(rem > FP_CHUNK_SIZE ? FP_CHUNK_SIZE : rem);
+    out_proof->depth = depth;
+    for (uint32_t i = 0; i < depth; i++) {
+        memcpy(out_proof->siblings[i], tmp_sib[depth - 1u - i], FP_DNA_LEN);
+        out_proof->is_right[i] = tmp_right[depth - 1u - i];
+    }
+    return FP_OK;
 }
 
 fp_dna_t fp_merkle_tree_dna(const fp_merkle_tree_t *tree) {
