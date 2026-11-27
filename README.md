@@ -12,7 +12,7 @@
   <a href="https://github.com/tonythewizard/sealframe/actions/workflows/ci.yml"><img src="https://github.com/tonythewizard/sealframe/actions/workflows/ci.yml/badge.svg" alt="CI Status" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0%20%2F%20Commercial-blue.svg" alt="Dual License" /></a>
   <img src="https://img.shields.io/badge/C11-POSIX%20%2F%20Linux-00599C.svg" alt="C11 POSIX/Linux" />
-  <img src="https://img.shields.io/badge/EU%20CRA-Ready-2ea44f.svg" alt="EU CRA Ready" />
+  <img src="https://img.shields.io/badge/EU%20CRA-Audit%20Tooling-2ea44f.svg" alt="EU CRA Audit Tooling" />
 </p>
 
 ---
@@ -20,13 +20,17 @@
 ### Why SealFrame™?
 
 #### 1. Crash-Safe Atomic & Zero-Trust File / OTA Delivery
-- **Crash-Safe Atomic Commits & Auto-Rollback (`SIGKILL`-Resilient):** Transactional commits across **Files + AI Models + SQLite WAL** (`flock` + `fsync` + atomic `rename` + persistent `.sf_tx_journal` + immutable sealed generations), exact Merkle chunk resume after abrupt shutdowns, and automatic health-watchdog rollback that bit-exact inverts both files and SQLite rows (`0` split-brain or corrupt states across 12 consecutive multi-boundary OS `SIGKILL` chaos tests).
-- **Cryptographic Zero-Trust & Anti-Byzantine:** Every 16 KiB chunk is verified inline with **BLAKE3 Merkle proofs** (1-bit in-flight tamper or silent disk bit-rot rejected fail-closed), protected by **2-of-3 Ed25519 Root Multi-Sig** with monotonic revocation & target deactivation, Ed25519 device enrollment/pinning with replay protection, cryptographic 2-of-N approver quorum, over **1-RTT X25519 + XChaCha20-Poly1305** encrypted TCP/UDP (`FP-UDP1` survives **25% packet loss + live IP/NAT migration**; poisoned swarm peers are banned on the first bad chunk).
-- **Extreme Efficiency & Tiny Footprint:** C11 (POSIX/Linux) — zero Python, zero C++, zero OpenSSL, zero `libcurl`; ~150–210 KB binaries, **5.86 MiB RSS** serving 512 MiB on 256 MiB RAM hardware, `-99.8%` FastCDC/delta patches (**22× faster & 147× fewer bytes** than `rsync`).
+- **Crash-Safe Atomic Commits & Auto-Rollback (`SIGKILL`-Resilient):** Transactional commits across **Files + AI Models + SQLite WAL** (`flock` + `fsync` + atomic `rename` + persistent `.sf_tx_journal` + immutable sealed generations + `O(1)`-RAM multi-GB streaming via `openat`/`O_NOFOLLOW`), exact Merkle chunk resume after abrupt shutdowns, and automatic health-watchdog rollback that bit-exact inverts both files and SQLite rows (`0` split-brain or corrupt states across 12 consecutive multi-boundary OS `SIGKILL` chaos tests).
+- **Cryptographic Zero-Trust & Anti-Byzantine:** Every 16 KiB chunk is verified inline with **BLAKE3 Merkle proofs** (persistent `FPM1` `.fpm` index + `O(1)`-RAM disk proofs), protected by **2-of-3 Ed25519 Root Multi-Sig** with historical multi-step offline rotation and physical target revocation, Ed25519 device enrollment/pinning with replay protection, cryptographic 2-of-N approver quorum, over experimental **1-RTT X25519 + XChaCha20-Poly1305** encrypted TCP/UDP (`FP-UDP1` with stateless retry cookies, multi-session anti-DoS, and AEAD `PATH_CHALLENGE` migration validation; survives **25% packet loss + live IP/NAT migration**).
+- **Extreme Efficiency & Tiny Footprint:** C11 + POSIX/Linux (3 runtime C libs: `libsodium`, `libzstd`, `libsqlite3`, plus vendored pure-C BLAKE3 with optional `USE_SYSTEM_BLAKE3=1` SIMD; zero Python, zero C++, zero OpenSSL, zero `libcurl`; ~150–220 KB binaries, **5.86 MiB RSS** serving 512 MiB on 256 MiB RAM hardware), `-99.8%` FastCDC/delta patches (**22× faster & 147× fewer bytes** than `rsync`).
 
 #### 2. Distributed Split-Model AI Inference over WAN (Drop-In)
-- **`sf-llama-bridge`** transparently accelerates `llama.cpp` (`ggml-rpc`) across slow, lossy residential/cross-country links: **up to `-97.5%` wire reduction**, encrypted `FP-UDP1` + adaptive 0-RTT XOR FEC, outlier-safe wire codecs (`BF16`/`INT8*`/`INT4+Outlier`), sparse FP32 Top-K logits transport (exact for greedy / top-k ≤ K), and 0-RTT control pipelining.
-- **6-Shard / 6-Country WAN-Emulated A/B (`570 ms` cumulative RTT):** **`4.2×`** serial speedup on `Qwen3.5-9B` (`0.33 → 1.38 tok/s`), up to **`10.4×–13.2×`** with a local coordinator draft on `Qwen3-8B` (**`2.73–3.45 tok/s`** median, peak **`9.41 tok/s`**), cutting per-request prompt overhead from `~55 s` down to **`3–5 s`**.
+- **`sf-llama-bridge`** transparently accelerates `llama.cpp` (`ggml-rpc`) across slow, lossy residential/cross-country links: **up to `-97.5%` wire reduction**, encrypted `FP-UDP1` + adaptive 0-RTT XOR FEC, outlier-safe wire codecs (`BF16`/`INT8*`/`INT4+Outlier`), sparse FP32 Top-K logits transport (exact for greedy / top-k ≤ K), `--strict-lossless` mode, `BR_TAG_HELLO` protocol compatibility check, and 0-RTT control pipelining.
+- **6-Shard / 6-Country WAN-Emulated A/B (`570 ms` cumulative RTT, single host, N=5):**
+  - **Pure transport speedup (no draft vs no draft):** **`4.20×`** on `Qwen3.5-9B` (`0.33 → 1.38 tok/s`) and **`5.73×`** on `Qwen3-8B` (`0.26 → 1.50 tok/s`, `BF16`, `-93.1%` wire).
+  - **Combined stack (transport + local coordinator draft + lossy wire codecs):** up to **`10.42×–13.16×`** vs stock TCP no-draft on `Qwen3-8B` (**`2.73–3.45 tok/s`** median, peak **`9.41 tok/s`**; note: `Stock TCP + draft` ablation & real multi-host WAN tests are tracked in [`ROADMAP.md`](ROADMAP.md)).
+
+> **Security & Maturity Notice:** SealFrame™ has **not yet undergone an independent third-party security/cryptographic audit**. Custom transports (`FPN1`/`FPU1`) are experimental; EU CRA artifacts in [`docs/`](docs/) are documentation/audit tooling, not a formal third-party certification. See [`ROADMAP.md`](ROADMAP.md) for upcoming validation, Noise/QUIC comparison, and v1.0 milestones.
 
 > **Dual-Licensed:** Open-source under **GNU AGPL-3.0** ([`LICENSE`](LICENSE)) and available under a **Commercial License** ([`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md)) for proprietary/OEM embedding, SaaS/cloud deployments, and EU CRA LTS support. Contact: **`tonyswagcard@gmail.com`**.
 
@@ -87,7 +91,7 @@ sudo make install
 - **Delta & FastCDC:** 4 KiB patch in 32 MiB file = **56.5 KiB** (`-99.83%`); +137 B shift dedup = **99.88%** in `42 ms`; No-Op 32 MiB = **22× faster & 147× fewer bytes** than `rsync --checksum`.
 - **Encrypted `FP-NET` TCP & `FP-UDP1`:** X25519 + Ed25519 + XChaCha20-Poly1305 AEAD; **29.7 MiB/s** on physical LAN; `FP-UDP1` survives **25% packet loss + live IP/port migration**; Byzantine swarm peer banned deterministically on the first corrupted chunk.
 - **Atomic File + SQLite WAL Rollback:** verified under real `SIGKILL` and `--health-cmd` failure with bit-exact SQLite state inversion (`sqlite3changeset_invert`).
-- **Fuzzing & Red-Team:** **>10M executions** with Clang `libFuzzer + ASan + UBSan` across all 8 binary parsers (`FP01`/`FPE1`/`FPD1`/`FPB1`/`FPR1`/`FPC1`/Merkle/`SFT1`) → **0 crashes, 0 UB, 0 leaks**; 0 findings in `test_redteam.c`.
+- **Fuzzing & Red-Team:** locally executed Clang `libFuzzer + ASan + UBSan` run (>10M execs across all 8 core binary parsers; `make libfuzzer` defaults to 15 s for quick runs) → **0 crashes, 0 UB, 0 leaks**; all 11 suites pass GCC ASan + UBSan in CI with 0 findings in `test_redteam.c`.
 
 ### 2. Distributed Split-Model WAN Acceleration (`sf-llama-bridge`, Emulated 6-Country WAN)
 Measured on **1 physical host** running **6 real `llama.cpp` `ggml-rpc-server` shards** fronted by per-hop WAN shaping modeling 6 residential/intercontinental links (`DE 28 ms`, `UK 42 ms`, `PL 55 ms`, `US-East 105 ms`, `US-West 155 ms`, `SG 185 ms + P99@6%`; cumulative RTT = **`570 ms`**, `8–20 Mbps` UL, `0.5–2.0%` loss; N=5 requests, `temp=0`, `cache_prompt=false`):
@@ -103,8 +107,9 @@ Measured on **1 physical host** running **6 real `llama.cpp` `ggml-rpc-server` s
 
 ---
 
-## Documentation & Compliance
-- Wire & storage format specification: [`SPEC.md`](SPEC.md)
+## Documentation & Roadmap
+- Engineering Roadmap (v0.8 → v1.0): [`ROADMAP.md`](ROADMAP.md)
+- Normative wire & security specification (`SF-001`..`SF-010`): [`SPEC.md`](SPEC.md)
 - `llama.cpp` split-model WAN bridge guide: [`integrations/llama_cpp/README.md`](integrations/llama_cpp/README.md)
 - EU Cyber Resilience Act (CRA) Technical File, DoC, CVD & Integrator Manual: [`docs/`](docs/)
 - Physical 2-host Proxmox test report & guide: [`docs/PHYSICAL_TEST_REPORT_v0.2.md`](docs/PHYSICAL_TEST_REPORT_v0.2.md) · [`PHYSICAL_TEST_GUIDE.md`](PHYSICAL_TEST_GUIDE.md)

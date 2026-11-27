@@ -192,6 +192,7 @@ fp_err_t fp_root_verify_rotation(const fp_root_doc_t *prev, const fp_root_doc_t 
 
     if (!fp_dna_equal(&prev->repo_id, &next->repo_id)) return FP_ERR_POLICY;
     if (next->root_version != prev->root_version + 1u) return FP_ERR_CHAIN;
+    if (next->timestamp_unix < prev->timestamp_unix) return FP_ERR_POLICY;
     if (now_unix > 0 && next->expires_unix > 0 && now_unix > next->expires_unix) {
         return FP_ERR_EXPIRED;
     }

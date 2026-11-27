@@ -12,9 +12,9 @@ You may use, study, modify, and redistribute SealFrame™ free of charge under t
 
 Under the GNU AGPL-3.0, if you:
 - distribute a product or binary incorporating or linking SealFrame™, **or**
-- run a modified or unmodified version of SealFrame™ as part of a network service / SaaS / cloud / fleet control plane accessible to users over a network,
+- run a **modified** version of SealFrame™ (or a network service/SaaS incorporating or linking SealFrame™) accessible to users over a network (AGPL-3.0 §13),
 
-you **must** make the complete corresponding source code of your combined work available to all users under the GNU AGPL-3.0.
+you **must** make the complete corresponding source code of your combined work available to all users under the GNU AGPL-3.0. Running an unmodified standalone binary without modification does not by itself trigger AGPL-3.0 §13.
 
 This license is ideal for:
 - open-source projects compatible with AGPL-3.0,
