@@ -44,7 +44,7 @@
 | **`bin/sf-agent`** | Hardened Edge OTA daemon (`systemd` ready): hybrid LAN `FP-NET` + HTTP/1.1 `206` Range resume, crash-recovery journal, health watchdog, automatic File + SQLite WAL rollback (`sqlite3changeset_invert`), physical revoke deactivation, monotonic Ed25519 heartbeats. |
 | **`bin/sf-cp`** | Pure-C11 On-Prem Control Plane (~4 MiB RSS): Ed25519 device enrollment/key-pinning + anti-replay telemetry, cryptographic 2-of-N Ed25519 approval quorum enforcement, monotonic rollout/rollback, EU CRA JSON/HTML audit endpoints. |
 | **`bin/sf-llama-bridge`** | Transparent `llama.cpp` (`ggml-rpc`) WAN accelerator: `FP-UDP1` + Adaptive 0-RTT XOR FEC, `SFT1` wire quantization (`BF16`/`FP16`/outlier-safe `INT8`/`INT4+Outlier`), batched sparse FP32 Top-K logits, BLAKE3 DNA dedup, Zstd + zero-block compression, 0-RTT void-command pipelining, and pointer-independent `GET_ALLOC_SIZE` cache. |
-| **`libsealframe.a` / `.so`** | C11 SDK (`sealframe.h`, `sealframe_agent.h`, `sealframe_split.h`, `sealframe_chain.h`) + multi-chain anchoring adapters (Generic JSON-RPC 2.0, EVM Keccak-256/ABI, Solana Anchor/Borsh, Keryx OPoI Phase-2 + RFC 6455 WebSocket). |
+| **`libsealframe.a` / `.so`** | C11 SDK (`sealframe.h`, `sealframe_agent.h`, `sealframe_split.h`, `sealframe_chain.h`) + anchoring adapters (Generic JSON-RPC 2.0, Keryx OPoI Phase-2 + RFC 6455 WebSocket). |
 
 ---
 
@@ -52,10 +52,10 @@
 
 ```bash
 # 1. Build all 4 pure-C11 binaries + libsealframe.a/.so (vendored BLAKE3 by default)
-make
+make -j$(nproc)
 
 # 2. Run all 11 pure-C11 test suites (including SIGKILL chaos, 25% UDP loss, Byzantine swarm,
-#    Edge Agent, 4 blockchain adapters, Split-Model shim, and Red-Team torture suite)
+#    Edge Agent, Generic & Keryx anchor adapters, Split-Model shim, and Red-Team torture suite)
 make test
 make examples
 
@@ -113,7 +113,6 @@ Measured on **1 physical host** running **6 real `llama.cpp` `ggml-rpc-server` s
 - `llama.cpp` split-model WAN bridge guide: [`integrations/llama_cpp/README.md`](integrations/llama_cpp/README.md)
 - EU Cyber Resilience Act (CRA) Technical File, DoC, CVD & Integrator Manual: [`docs/`](docs/)
 - Physical 2-host Proxmox test report & guide: [`docs/PHYSICAL_TEST_REPORT_v0.2.md`](docs/PHYSICAL_TEST_REPORT_v0.2.md) · [`PHYSICAL_TEST_GUIDE.md`](PHYSICAL_TEST_GUIDE.md)
-- Smart contracts (EVM & Solana): [`contracts/`](contracts/)
 
 ---
 

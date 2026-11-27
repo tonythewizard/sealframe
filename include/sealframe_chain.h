@@ -1,11 +1,9 @@
 /*
- * SealFrame Blockchain Anchor & Verifiable Compute Adapters (Pure ISO C11)
+ * SealFrame Anchor & Verifiable Compute Adapters (Pure ISO C11)
  *
- * Implements the chain-agnostic fp_anchor_ops_t interface (include/fp.h) across 4 targets:
+ * Implements the chain-agnostic fp_anchor_ops_t interface (include/fp.h) across 2 targets:
  *   1. SF_CHAIN_GENERIC : Standard JSON-RPC 2.0 (any custom L1 / rollup / enterprise ledger)
- *   2. SF_CHAIN_EVM     : Ethereum / Base / Arbitrum / Polygon (real Keccak-256 ABI calldata)
- *   3. SF_CHAIN_SOLANA  : Solana (Anchor SHA-256 discriminator + Borsh + Base58/Base64 + Ed25519)
- *   4. SF_CHAIN_KERYX   : Keryx BlockDAG + OPoI Phase-2 deterministic fixed-point binding
+ *   2. SF_CHAIN_KERYX   : Keryx BlockDAG + OPoI Phase-2 deterministic fixed-point binding
  *
  * Zero Python, zero C++, zero OpenSSL, zero libcurl. Pure ISO C11 + libsodium + POSIX sockets.
  */
@@ -20,18 +18,16 @@ extern "C" {
 
 typedef enum {
     SF_CHAIN_GENERIC = 1,
-    SF_CHAIN_EVM     = 2,
-    SF_CHAIN_SOLANA  = 3,
     SF_CHAIN_KERYX   = 4
 } sf_chain_kind_t;
 
 typedef struct {
     sf_chain_kind_t     kind;
     const char         *rpc_url;        /* e.g. "http://127.0.0.1:8545" */
-    const char         *contract_addr;  /* EVM 0x..40hex, Solana base58 program/PDA, Keryx address */
-    const char         *sender_addr;    /* Optional EVM from-address or Solana fee-payer pubkey */
+    const char         *contract_addr;  /* Target Keryx / ledger anchor address */
+    const char         *sender_addr;    /* Optional sender identifier */
     const char         *bearer_token;   /* Optional HTTP Authorization Bearer token */
-    const fp_keypair_t *signer_kp;      /* Optional Ed25519 keypair (Solana / Keryx / Generic signing) */
+    const fp_keypair_t *signer_kp;      /* Optional Ed25519 keypair (Keryx / Generic signing) */
     uint64_t            keryx_nonce;    /* Keryx OPoI Phase-2 nonce (0 = auto-derive from commitment) */
     int                 io_timeout_ms;  /* Default: 10000 ms */
 } sf_chain_cfg_t;
@@ -50,20 +46,8 @@ fp_err_t sf_chain_adapter_init(sf_chain_ctx_t *ctx, const sf_chain_cfg_t *cfg,
 fp_err_t sf_chain_submit_derivation(sf_chain_ctx_t *ctx, const fp_derivation_t *drv,
                                     const fp_dna_t *expected_result_dna);
 
-/* --- Low-level cryptographic & encoding primitives (exposed for testing & integrators) --- */
+/* --- Low-level encoding & Keryx OPoI primitives --- */
 
-/* Ethereum Keccak-256 (original Keccak padding 0x01, NOT NIST SHA3-256 0x06) */
-void     sf_keccak256(const uint8_t *data, size_t len, uint8_t out[32]);
-void     sf_evm_selector(const char *signature, uint8_t out[4]);
-
-/* Build exact EVM ABI calldata for anchor(bytes32,bytes32,uint64) -> 100 bytes */
-void     sf_evm_encode_anchor(const fp_anchor_commitment_t *c, uint8_t out[100]);
-/* Build exact EVM ABI calldata for isAnchored(bytes32) -> 36 bytes */
-void     sf_evm_encode_is_anchored(const fp_dna_t *commitment, uint8_t out[36]);
-
-/* Solana Anchor 8-byte discriminator + Borsh payload (144 bytes) + Base58/Base64 helpers */
-void     sf_solana_encode_anchor_ix(const fp_anchor_commitment_t *c, uint8_t out[144]);
-size_t   sf_base58_encode(const uint8_t *in, size_t in_len, char *out, size_t out_cap);
 size_t   sf_base64_encode(const uint8_t *in, size_t in_len, char *out, size_t out_cap);
 
 /* Keryx OPoI Phase-2 bit-exact deterministic fixed-point MLP (matches keryx-node opoi.rs) */
