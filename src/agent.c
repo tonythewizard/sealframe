@@ -229,9 +229,37 @@ static void save_failed_serial(const char *store_dir, uint64_t serial, int had_p
     if (bl > 0) (void)write_file_atomic(path, (const uint8_t *)buf, (size_t)bl);
 }
 
-/* P0-03 & P0-05: Monotonic durable revocation deny-set (`<store_dir>/.revoked_dnas`).
- * Persisted BEFORE any target/DB mutation whenever signed FP_ACTION_REVOKE events are authenticated.
- * Consulted by EVERY rollback/recovery path so a revoked DNA can NEVER be reactivated offline! */
+static int is_hex64_str(const char *s) {
+    if (!s || strlen(s) != 64u) return 0;
+    for (size_t i = 0; i < 64u; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0;
+    }
+    return 1;
+}
+
+static int acquire_denyset_lock(const char *store_dir) {
+    char lpath[PATH_MAX];
+    if (snprintf(lpath, sizeof(lpath), "%s/.revoked_dnas.lock", store_dir) >= (int)sizeof(lpath)) return -1;
+    (void)mkdir(store_dir, 0700);
+    int fd = open(lpath, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    while (flock(fd, LOCK_EX) != 0) {
+        if (errno != EINTR) { close(fd); return -1; }
+    }
+    return fd;
+}
+
+static void release_denyset_lock(int fd) {
+    if (fd >= 0) {
+        (void)flock(fd, LOCK_UN);
+        close(fd);
+    }
+}
+
+/* P0-03, P0-05 & A7-P1-01: Monotonic durable revocation deny-set (`<store_dir>/.revoked_dnas`).
+ * Persisted under a dedicated store flock BEFORE any target/DB mutation whenever signed
+ * FP_ACTION_REVOKE events are authenticated; corrupt lines or read errors fail closed! */
 static int deny_set_contains(const char *store_dir, const fp_dna_t *dna) {
     if (!store_dir || !dna) return 0;
     char path[PATH_MAX], hex[65];
@@ -243,12 +271,22 @@ static int deny_set_contains(const char *store_dir, const fp_dna_t *dna) {
     int found = 0;
     while (fgets(line, sizeof(line), f)) {
         size_t l = strlen(line);
-        while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = '\0';
-        if (l == 64u && strcmp(line, hex) == 0) {
+        if (l == sizeof(line) - 1u && line[l - 1u] != '\n' && !feof(f)) {
+            found = 1; /* Oversized/corrupt line -> fail closed */
+            break;
+        }
+        while (l > 0 && (line[l - 1u] == '\n' || line[l - 1u] == '\r')) line[--l] = '\0';
+        if (l == 0) continue;
+        if (!is_hex64_str(line)) {
+            found = 1; /* Corrupt/truncated entry -> fail closed */
+            break;
+        }
+        if (strcmp(line, hex) == 0) {
             found = 1;
             break;
         }
     }
+    if (ferror(f)) found = 1;
     fclose(f);
     return found;
 }
@@ -260,11 +298,16 @@ static fp_err_t deny_set_add_dna(const char *store_dir, const fp_dna_t *dna) {
     if (snprintf(path, sizeof(path), "%s/.revoked_dnas", store_dir) >= (int)sizeof(path)) {
         return FP_ERR_BOUNDS;
     }
-    (void)mkdir(store_dir, 0700);
+    int lfd = acquire_denyset_lock(store_dir);
+    if (lfd < 0) return FP_ERR_IO;
+
     uint8_t *old_buf = NULL;
     size_t old_len = 0;
     fp_err_t rerr = read_file_small(path, (1u << 20), &old_buf, &old_len);
-    if (rerr != FP_OK && rerr != FP_ERR_NOT_FOUND) return rerr;
+    if (rerr != FP_OK && rerr != FP_ERR_NOT_FOUND) {
+        release_denyset_lock(lfd);
+        return rerr;
+    }
 
     if (old_buf && old_len > 0) {
         size_t pos = 0;
@@ -273,6 +316,7 @@ static fp_err_t deny_set_add_dna(const char *store_dir, const fp_dna_t *dna) {
             while (eol < old_len && old_buf[eol] != '\n' && old_buf[eol] != '\r') eol++;
             if (eol - pos == 64u && memcmp(old_buf + pos, hex, 64u) == 0) {
                 free(old_buf);
+                release_denyset_lock(lfd);
                 return FP_OK;
             }
             pos = eol;
@@ -282,7 +326,7 @@ static fp_err_t deny_set_add_dna(const char *store_dir, const fp_dna_t *dna) {
     size_t need_nl = (old_len > 0 && old_buf[old_len - 1] != '\n') ? 1u : 0u;
     size_t new_len = old_len + need_nl + 65u;
     uint8_t *nbuf = malloc(new_len);
-    if (!nbuf) { free(old_buf); return FP_ERR_NOMEM; }
+    if (!nbuf) { free(old_buf); release_denyset_lock(lfd); return FP_ERR_NOMEM; }
     if (old_len > 0) memcpy(nbuf, old_buf, old_len);
     if (need_nl) nbuf[old_len] = '\n';
     memcpy(nbuf + old_len + need_nl, hex, 64u);
@@ -291,6 +335,7 @@ static fp_err_t deny_set_add_dna(const char *store_dir, const fp_dna_t *dna) {
 
     fp_err_t werr = write_file_atomic(path, nbuf, new_len);
     free(nbuf);
+    release_denyset_lock(lfd);
     return werr;
 }
 
@@ -391,33 +436,26 @@ typedef enum {
 
 typedef struct {
     char     state[32];
-    uint64_t serial;
-    uint64_t start_serial;
+    uint64_t serial;        /* end_serial of pending_events range */
+    uint64_t start_serial;  /* start_serial of pending_events range */
+    uint64_t q_serial;      /* release serial to quarantine if watchdog crashes/fails (A7-P1-03) */
     char     new_hex[65];
     int      has_prev;
     char     prev_hex[65];
 } ota_lifecycle_t;
 
-static int is_hex64_str(const char *s) {
-    if (!s || strlen(s) != 64u) return 0;
-    for (size_t i = 0; i < 64u; i++) {
-        char c = s[i];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0;
-    }
-    return 1;
-}
-
 static fp_err_t write_ota_lifecycle(const char *target_dir, const char *state, uint64_t serial,
-                                    uint64_t start_serial, const fp_dna_t *new_dna,
+                                    uint64_t start_serial, uint64_t q_serial, const fp_dna_t *new_dna,
                                     int has_prev, const fp_dna_t *prev_dna) {
     (void)mkdir(target_dir, 0755);
-    char path[PATH_MAX], nh[65], ph[65], line[288];
+    char path[PATH_MAX], nh[65], ph[65], line[320];
     if (snprintf(path, sizeof(path), "%s/.sf_ota_state", target_dir) >= (int)sizeof(path)) return FP_ERR_BOUNDS;
     fp_hex_encode(new_dna->bytes, FP_DNA_LEN, nh);
     fp_hex_encode(prev_dna->bytes, FP_DNA_LEN, ph);
-    int ln = snprintf(line, sizeof(line), "SFOTA1 %s %llu %s %d %s %llu\n",
+    uint64_t eff_q = q_serial ? q_serial : serial;
+    int ln = snprintf(line, sizeof(line), "SFOTA1 %s %llu %s %d %s %llu %llu\n",
                       state, (unsigned long long)serial, nh, has_prev ? 1 : 0, ph,
-                      (unsigned long long)start_serial);
+                      (unsigned long long)start_serial, (unsigned long long)eff_q);
     if (ln <= 0 || (size_t)ln >= sizeof(line)) return FP_ERR_BOUNDS;
     return write_file_atomic(path, (const uint8_t *)line, (size_t)ln);
 }
@@ -444,11 +482,13 @@ static ota_parse_status_t parse_ota_lifecycle(const char *target_dir, ota_lifecy
     buf[n] = '\0';
 
     char magic[16], extra[16];
-    unsigned long long oseq = 0, sseq = 0;
-    int got = sscanf(buf, "%15s %31s %llu %64s %d %64s %llu %15s",
-                     magic, out->state, &oseq, out->new_hex, &out->has_prev, out->prev_hex, &sseq, extra);
-    if (got != 6 && got != 7) return OTA_ST_CORRUPTED;
+    unsigned long long oseq = 0, sseq = 0, qseq = 0;
+    int got = sscanf(buf, "%15s %31s %llu %64s %d %64s %llu %llu %15s",
+                     magic, out->state, &oseq, out->new_hex, &out->has_prev, out->prev_hex,
+                     &sseq, &qseq, extra);
+    if (got != 6 && got != 7 && got != 8) return OTA_ST_CORRUPTED;
     if (strcmp(magic, "SFOTA1") != 0 || oseq == 0) return OTA_ST_CORRUPTED;
+    if (got == 8 && qseq == 0) return OTA_ST_CORRUPTED;
     if (strcmp(out->state, "HEALTH_PENDING") != 0 &&
         strcmp(out->state, "HEALTH_RUNNING") != 0 &&
         strcmp(out->state, "ROLLBACK_HEALTH_PENDING") != 0 &&
@@ -460,7 +500,8 @@ static ota_parse_status_t parse_ota_lifecycle(const char *target_dir, ota_lifecy
         return OTA_ST_CORRUPTED;
     }
     out->serial = (uint64_t)oseq;
-    out->start_serial = (got == 7) ? (uint64_t)sseq : (uint64_t)oseq;
+    out->start_serial = (got >= 7) ? (uint64_t)sseq : (uint64_t)oseq;
+    out->q_serial = (got == 8) ? (uint64_t)qseq : (uint64_t)oseq;
     return OTA_ST_VALID;
 }
 
@@ -594,6 +635,18 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
     ota_lifecycle_t ol;
     ota_parse_status_t os = parse_ota_lifecycle(cfg->target_dir, &ol);
     if (os == OTA_ST_NONE) {
+        /* A7-P0-02: Enforce durable revocation deny-set at boot even with no active .sf_ota_state! */
+        char boot_cur[65];
+        if (read_current_gen_hex(cfg->target_dir, boot_cur)) {
+            fp_dna_t boot_dna;
+            if (fp_hex_decode(boot_cur, boot_dna.bytes, FP_DNA_LEN) == FP_OK &&
+                deny_set_contains(cfg->store_dir, &boot_dna)) {
+                fp_err_t ferr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
+                                                       "REVOKED_BOOT_FENCE=1\n");
+                fp_sql_close(rec_sql);
+                return ferr;
+            }
+        }
         fp_sql_close(rec_sql);
         return FP_OK;
     }
@@ -646,16 +699,22 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
                 /* Crashed at ANY intermediate or final step -> roll back from actual_dna all the way to prev_dna! */
                 rerr = fp_bundle_rollback(cfg->store_dir, &actual_dna, &pdna, cfg->target_dir, rec_sql);
                 if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
-                if (quarantine) save_failed_serial(cfg->store_dir, ol.serial, 1);
+                if (quarantine) save_failed_serial(cfg->store_dir, ol.q_serial, 1);
             }
             /* Else: crashed BEFORE apply OR AFTER rollback already completed -> idempotent cleanup! */
             cleanup_pending_events(cfg->store_dir, ol.start_serial, ol.serial);
             rerr = clear_ota_lifecycle(cfg->target_dir);
         } else if (prev_revoked) {
-            /* Previous DNA is revoked in durable deny-set -> deactivate live target & mark .sf_revoked! */
+            /* A7-P0-04: Previous DNA is revoked in durable deny-set -> NEVER reactivate `current` to prev,
+             * AND revert SQLite back to `pdna` checkpoint so future replacement releases do not hit FP_ERR_CHAIN! */
+            if (rec_sql && (sql_seq > 0 || sql_dna[0] != '\0') && strcmp(sql_dna, ol.prev_hex) != 0) {
+                rerr = fp_bundle_rollback_sql_only(cfg->store_dir, &actual_dna, &pdna,
+                                                   cfg->target_dir, rec_sql);
+                if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
+            }
             rerr = deactivate_live_target(cfg->target_dir, ".sf_revoked", "REVOKED_OFFLINE_RECOVERY=1\n");
             if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
-            if (quarantine) save_failed_serial(cfg->store_dir, ol.serial, 0);
+            if (quarantine) save_failed_serial(cfg->store_dir, ol.q_serial, 0);
             cleanup_pending_events(cfg->store_dir, ol.start_serial, ol.serial);
             rerr = clear_ota_lifecycle(cfg->target_dir);
         } else {
@@ -664,7 +723,7 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
                 /* R1 + P1-01: Initial install (single or multi-step) crashed after apply -> invert ALL SQLite steps & unlink current! */
                 rerr = fp_bundle_rollback(cfg->store_dir, &actual_dna, NULL, cfg->target_dir, rec_sql);
                 if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
-                if (quarantine) save_failed_serial(cfg->store_dir, ol.serial, 0);
+                if (quarantine) save_failed_serial(cfg->store_dir, ol.q_serial, 0);
             } else {
                 rerr = deactivate_live_target(cfg->target_dir, NULL, NULL);
                 if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
@@ -731,19 +790,26 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
         }
         /* F2: Health check PASSED offline -> transition durably to LEDGER_PENDING & complete local ledger commit! */
         rerr = write_ota_lifecycle(cfg->target_dir, "LEDGER_PENDING", ol.serial,
-                                   ol.start_serial, &ndna, ol.has_prev, &pdna);
+                                   ol.start_serial, ol.q_serial, &ndna, ol.has_prev, &pdna);
         if (rerr != FP_OK) return rerr;
         resume_ledger_after_rb = 1;
     }
 
-    /* P0-03 + F2: Offline idempotent completion of LEDGER_PENDING (health check already PASSED!) */
+    /* P0-03 + F2 + A7-P0-05: Offline idempotent completion of LEDGER_PENDING (health check already PASSED!).
+     * Verify material invariants AND pre-validate the ENTIRE pending_events chain BEFORE mutating state.bin! */
     if (resume_ledger_after_rb || strcmp(ol.state, "LEDGER_PENDING") == 0) {
         if (rec_sql) { fp_sql_close(rec_sql); rec_sql = NULL; }
+        rerr = verify_system_invariants(cfg, &ndna, NULL, 0, ol.serial);
+        if (rerr != FP_OK) return rerr;
+
         fp_store_state_t st;
         rerr = fp_store_load_state(cfg->store_dir, &st);
         if (rerr != FP_OK) return rerr;
 
         if (st.serial < ol.serial) {
+            uint64_t count = ol.serial - st.serial;
+            if (count > 4096u) return FP_ERR_BOUNDS;
+
             uint8_t *rbuf = NULL;
             size_t rlen = 0;
             rerr = read_file_small(cfg->root_path, (1u << 20), &rbuf, &rlen);
@@ -758,38 +824,63 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
             rerr = load_verified_hist_roots(cfg->store_dir, &pinned_root, &hroots);
             if (rerr != FP_OK) return rerr;
 
-            for (uint64_t s = st.serial + 1u; s <= ol.serial; s++) {
+            fp_event_t *evs = calloc((size_t)count, sizeof(fp_event_t));
+            size_t *ridx = calloc((size_t)count, sizeof(size_t));
+            if (!evs || !ridx) {
+                free(evs); free(ridx); root_vec_free(&hroots);
+                return FP_ERR_NOMEM;
+            }
+
+            fp_store_state_t sim_st = st;
+            fp_dna_t expected_prev = st.last_event_hash;
+            for (uint64_t i = 0; i < count; i++) {
+                uint64_t s = st.serial + 1u + i;
                 char epath[PATH_MAX];
                 if (snprintf(epath, sizeof(epath), "%s/pending_events/%llu.ev",
                              cfg->store_dir, (unsigned long long)s) >= (int)sizeof(epath)) {
-                    root_vec_free(&hroots);
-                    return FP_ERR_BOUNDS;
+                    rerr = FP_ERR_BOUNDS;
+                    break;
                 }
                 uint8_t *ebuf = NULL;
                 size_t elen = 0;
                 rerr = read_file_small(epath, (1u << 20), &ebuf, &elen);
-                if (rerr != FP_OK) { root_vec_free(&hroots); return rerr; }
-                fp_event_t ev;
-                rerr = fp_event_decode(ebuf, elen, &ev);
+                if (rerr != FP_OK) break;
+                rerr = fp_event_decode(ebuf, elen, &evs[i]);
                 free(ebuf);
-                if (rerr != FP_OK) { root_vec_free(&hroots); return rerr; }
+                if (rerr != FP_OK) break;
 
-                int applied = 0;
+                int verified = 0;
                 for (size_t ri = hroots.count; ri > 0; ri--) {
-                    if (fp_event_verify_with_root(&ev, &hroots.items[ri - 1u], 0) == FP_OK) {
-                        rerr = fp_store_apply_event_with_root(cfg->store_dir, &ev,
-                                                              &hroots.items[ri - 1u], 0, NULL, 0);
-                        applied = 1;
+                    if (fp_event_verify_with_root(&evs[i], &hroots.items[ri - 1u], 0) == FP_OK) {
+                        ridx[i] = ri - 1u;
+                        verified = 1;
                         break;
                     }
                 }
-                if (!applied) rerr = FP_ERR_SIGNATURE;
-                if (rerr != FP_OK) { root_vec_free(&hroots); return rerr; }
+                if (!verified) { rerr = FP_ERR_SIGNATURE; break; }
+                if (evs[i].serial != s || !fp_dna_equal(&evs[i].prev_event_hash, &expected_prev)) {
+                    rerr = FP_ERR_CHAIN;
+                    break;
+                }
+                rerr = fp_store_validate_transition(&sim_st, &evs[i], &sim_st);
+                if (rerr != FP_OK) break;
+                expected_prev = evs[i].event_hash;
             }
+            if (rerr == FP_OK &&
+                (sim_st.serial != ol.serial || !sim_st.has_current ||
+                 !fp_dna_equal(&sim_st.current_dna, &ndna))) {
+                rerr = FP_ERR_INTEGRITY;
+            }
+            for (uint64_t i = 0; i < count && rerr == FP_OK; i++) {
+                rerr = fp_store_apply_event_with_root(cfg->store_dir, &evs[i],
+                                                      &hroots.items[ridx[i]], 0, NULL, 0);
+            }
+            free(evs);
+            free(ridx);
             root_vec_free(&hroots);
+            if (rerr != FP_OK) return rerr;
         }
-        /* P0-06: ALWAYS verify material system invariants (symlink, generation dir, SQLite progress, ledger, deny-set)
-         * BEFORE deleting pending_events and .sf_ota_state! */
+        /* P0-06 + A7-P0-05: Verify full invariants (including ledger state) BEFORE deleting pending_events and .sf_ota_state! */
         rerr = verify_system_invariants(cfg, &ndna, NULL, 1, ol.serial);
         if (rerr != FP_OK) return rerr;
         cleanup_pending_events(cfg->store_dir, ol.start_serial, ol.serial);
@@ -1150,6 +1241,19 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     rep.attempted_bundle_dna = latest_ev.target_dna;
 
     if (latest_ev.serial <= st.serial) {
+        /* A7-P1-02: Enforce durable deny-set even when remote serial has not advanced! */
+        if (st.has_current && deny_set_contains(cfg->store_dir, &st.current_dna)) {
+            fp_err_t derr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
+                                                   "REVOKED_UP_TO_DATE=1\n");
+            rep.outcome = FP_AGENT_REVOKED;
+            rep.active_serial = 0;
+            memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
+            snprintf(rep.detail, sizeof(rep.detail),
+                     "active release at serial %llu is in revocation deny-set; target deactivated",
+                     (unsigned long long)st.serial);
+            err = (derr == FP_OK) ? FP_ERR_POLICY : derr;
+            goto done;
+        }
         rep.outcome = FP_AGENT_UP_TO_DATE;
         snprintf(rep.detail, sizeof(rep.detail), "up to date at serial %llu", (unsigned long long)st.serial);
         err = FP_OK;
@@ -1159,6 +1263,18 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     int failed_had_prev = 1;
     uint64_t failed_serial = load_failed_serial(cfg->store_dir, &failed_had_prev);
     if (latest_ev.serial == failed_serial) {
+        if (st.has_current && deny_set_contains(cfg->store_dir, &st.current_dna)) {
+            fp_err_t derr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
+                                                   "REVOKED_FAILED_SERIAL=1\n");
+            rep.outcome = FP_AGENT_REVOKED;
+            rep.active_serial = 0;
+            memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
+            snprintf(rep.detail, sizeof(rep.detail),
+                     "active release is revoked while serial %llu previously failed health-check; target deactivated",
+                     (unsigned long long)failed_serial);
+            err = (derr == FP_OK) ? FP_ERR_POLICY : derr;
+            goto done;
+        }
         if (failed_had_prev && st.has_current) {
             rep.outcome = FP_AGENT_ROLLED_BACK;
             snprintf(rep.detail, sizeof(rep.detail), "skipping previously failed serial %llu",
@@ -1262,6 +1378,30 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
                 goto done;
             }
         }
+    }
+
+    /* A7-P0-02: Immediate revocation fencing — if the currently active release is now revoked in the
+     * durable deny-set, fence/deactivate `current` IMMEDIATELY before any replacement download or early
+     * exit so a 404/network/ENOSPC/SIGKILL can NEVER leave a revoked release live! */
+    if (st.has_current && deny_set_contains(cfg->store_dir, &st.current_dna)) {
+        char rpend[PATH_MAX], rev_marker[128];
+        snprintf(rev_marker, sizeof(rev_marker), "REVOKED_SERIAL=%llu\n", (unsigned long long)latest_ev.serial);
+        if (snprintf(rpend, sizeof(rpend), "%s/.sf_revoke_pending", cfg->target_dir) >= (int)sizeof(rpend)) {
+            free(chain); free(chain_ridx); err = FP_ERR_BOUNDS; goto done;
+        }
+        (void)mkdir(cfg->target_dir, 0755);
+        err = write_file_atomic(rpend, (const uint8_t *)rev_marker, strlen(rev_marker));
+        if (err == FP_OK) {
+            err = deactivate_live_target(cfg->target_dir, ".sf_revoked", rev_marker);
+        }
+        if (err != FP_OK) {
+            free(chain); free(chain_ridx);
+            snprintf(rep.detail, sizeof(rep.detail),
+                     "active release revoked at serial %llu but immediate fencing failed (%s)",
+                     (unsigned long long)latest_ev.serial, fp_strerror(err));
+            goto done;
+        }
+        if (unlink(rpend) == 0) (void)sync_parent_dir(rpend);
     }
 
     /* 6. Handle final-state deactivation (!target_st.has_current) OR pure historical revoke (active DNA unchanged)
@@ -1498,14 +1638,15 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         }
     }
 
-    /* F2 + P0-03 + R3: Persist verified event chain AND direction-aware lifecycle marker BEFORE any mutation
+    /* F2 + P0-03 + R3 + A7-P1-03: Persist verified event chain AND direction-aware lifecycle marker BEFORE any mutation
      * so offline recovery can complete LEDGER_PENDING even when the repository is unreachable! */
     uint64_t chain_first_serial = chain[0].serial;
+    uint64_t eff_q_serial = final_target_serial ? final_target_serial : latest_ev.serial;
     err = persist_pending_events(cfg->store_dir, chain, chain_len);
     if (err == FP_OK) {
         err = write_ota_lifecycle(cfg->target_dir,
                                   is_explicit_rollback ? "ROLLBACK_HEALTH_PENDING" : "HEALTH_PENDING",
-                                  latest_ev.serial, chain_first_serial, &final_target_dna,
+                                  latest_ev.serial, chain_first_serial, eff_q_serial, &final_target_dna,
                                   st.has_current ? 1 : 0, &st.current_dna);
     }
     if (err != FP_OK) {
@@ -1515,23 +1656,41 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         goto done;
     }
 
-    /* P0-01 + P0-02: Replay ALL non-revoke SQLite transitions in exact chronological order!
-     * NEVER silently skip a previously failed intermediate release's SQLite migration (would corrupt independent rows). */
+    /* P0-01 + P0-02 + A7-P0-03: Replay ALL non-revoke SQLite transitions in exact chronological order!
+     * Intermediate steps execute in SQL-only isolation (`fp_bundle_apply_sql_only` / `fp_bundle_rollback_sql_only`)
+     * so `<target_dir>/current` is NEVER flipped to intermediate, failed, or revoked releases! */
     fp_dna_t running_dna = st.current_dna;
     int running_has = st.has_current ? 1 : 0;
     if (sql != NULL && chain_len > 1u) {
+        uint64_t final_step_idx = chain_len;
+        for (uint64_t i = chain_len; i > 0; i--) {
+            if (chain[i - 1u].action != FP_ACTION_REVOKE) {
+                final_step_idx = i - 1u;
+                break;
+            }
+        }
         for (uint64_t i = 0; i < chain_len && err == FP_OK; i++) {
             if (chain[i].action == FP_ACTION_REVOKE) continue;
+            int is_final_step = (i == final_step_idx);
             if (chain[i].action == FP_ACTION_ROLLBACK) {
                 if (running_has && !fp_dna_equal(&running_dna, &chain[i].target_dna)) {
-                    err = fp_bundle_rollback(cfg->store_dir, &running_dna, &chain[i].target_dna,
-                                             cfg->target_dir, sql);
+                    err = is_final_step
+                        ? fp_bundle_rollback(cfg->store_dir, &running_dna, &chain[i].target_dna,
+                                             cfg->target_dir, sql)
+                        : fp_bundle_rollback_sql_only(cfg->store_dir, &running_dna, &chain[i].target_dna,
+                                                      cfg->target_dir, sql);
                 } else if (!running_has) {
                     err = FP_ERR_POLICY;
+                } else if (is_final_step) {
+                    err = fp_bundle_rollback(cfg->store_dir, &running_dna, &chain[i].target_dna,
+                                             cfg->target_dir, sql);
                 }
             } else {
-                err = fp_bundle_apply(cfg->store_dir, &chain[i].target_dna, cfg->target_dir,
-                                      sql, chain[i].serial, 0);
+                err = is_final_step
+                    ? fp_bundle_apply(cfg->store_dir, &chain[i].target_dna, cfg->target_dir,
+                                      sql, chain[i].serial, 0)
+                    : fp_bundle_apply_sql_only(cfg->store_dir, &chain[i].target_dna, cfg->target_dir,
+                                               sql, chain[i].serial);
             }
             if (err == FP_OK) {
                 running_dna = chain[i].target_dna;
@@ -1595,13 +1754,12 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         goto done;
     }
 
-    /* P1-01: Transition from HEALTH_PENDING -> HEALTH_RUNNING right before watchdog fork
-     * so crashes BEFORE watchdog never quarantine an untested release! */
+    /* P1-01 + A7-P1-03: Transition from HEALTH_PENDING -> HEALTH_RUNNING right before watchdog fork;
+     * keep `serial = latest_ev.serial` for full pending_events cleanup and pass `q_serial = eff_q_serial`! */
     if (!is_explicit_rollback) {
         err = write_ota_lifecycle(cfg->target_dir, "HEALTH_RUNNING",
-                                  final_target_serial ? final_target_serial : latest_ev.serial,
-                                  chain_first_serial, &final_target_dna,
-                                  st.has_current ? 1 : 0, &st.current_dna);
+                                  latest_ev.serial, chain_first_serial, eff_q_serial,
+                                  &final_target_dna, st.has_current ? 1 : 0, &st.current_dna);
         if (err != FP_OK) {
             fp_sql_close(sql);
             free(chain); free(chain_ridx);
@@ -1614,7 +1772,7 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     int hrc = fp_agent_run_health_check(cfg->health_cmd, cfg->health_timeout_sec);
     rep.health_exit_code = hrc;
     if (hrc != 0) {
-        uint64_t q_serial = final_target_serial ? final_target_serial : latest_ev.serial;
+        uint64_t q_serial = eff_q_serial;
         int prev_is_revoked = (st.has_current && deny_set_contains(cfg->store_dir, &st.current_dna));
         if (st.has_current && !is_explicit_rollback && !prev_is_revoked) {
             fp_err_t rerr = fp_bundle_rollback(cfg->store_dir, &final_target_dna,
@@ -1644,8 +1802,17 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
             goto done;
         }
         if (prev_is_revoked && !is_explicit_rollback) {
-            /* P0-03: Prior generation V1 is REVOKED in durable deny-set -> NEVER reactivate V1 on first health FAIL! */
-            fp_err_t derr = deactivate_live_target(cfg->target_dir, ".sf_revoked", "REVOKED_NO_HEALTHY_FALLBACK=1\n");
+            /* P0-03 + A7-P0-04: Prior generation V1 is REVOKED in durable deny-set -> NEVER reactivate V1,
+             * AND revert SQLite back to `st.current_dna` checkpoint (`fp_bundle_rollback_sql_only`) so
+             * future replacement releases (V4) apply cleanly without FP_ERR_CHAIN! */
+            fp_err_t derr = FP_OK;
+            if (sql != NULL) {
+                derr = fp_bundle_rollback_sql_only(cfg->store_dir, &final_target_dna,
+                                                   &st.current_dna, cfg->target_dir, sql);
+            }
+            if (derr == FP_OK) {
+                derr = deactivate_live_target(cfg->target_dir, ".sf_revoked", "REVOKED_NO_HEALTHY_FALLBACK=1\n");
+            }
             fp_sql_close(sql);
             free(chain); free(chain_ridx);
             if (derr == FP_OK) {
@@ -1653,12 +1820,14 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
                 cleanup_pending_events(cfg->store_dir, chain_first_serial, latest_ev.serial);
                 derr = clear_ota_lifecycle(cfg->target_dir);
             }
-            rep.outcome = FP_AGENT_REVOKED;
+            rep.outcome = (derr == FP_OK) ? FP_AGENT_REVOKED : FP_AGENT_ROLLBACK_FAILED;
             rep.active_serial = 0;
             memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
             snprintf(rep.detail, sizeof(rep.detail),
-                     "health-check failed (exit=%d) on serial %llu and prior DNA is REVOKED; target deactivated",
-                     hrc, (unsigned long long)q_serial);
+                     derr == FP_OK
+                         ? "health-check failed (exit=%d) on serial %llu and prior DNA is REVOKED; SQLite reverted & target deactivated"
+                         : "CRITICAL: health-check failed (exit=%d) on serial %llu and prior DNA is REVOKED; SQLite revert/deactivation failed (%s)",
+                     hrc, (unsigned long long)q_serial, fp_strerror(derr));
             err = (derr == FP_OK) ? FP_ERR_POLICY : derr;
             goto done;
         }
@@ -1704,9 +1873,9 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     fp_sql_close(sql);
     clear_revoked_marker(cfg->target_dir);
 
-    /* 10. Health-check PASSED -> transition to LEDGER_PENDING (pending_events already persisted before apply!), commit, then clear! */
+    /* 10. Health-check PASSED -> transition to LEDGER_PENDING (pending_events already persisted before apply!), commit, verify, then clear! */
     err = write_ota_lifecycle(cfg->target_dir, "LEDGER_PENDING", latest_ev.serial,
-                              chain[0].serial, &final_target_dna,
+                              chain_first_serial, eff_q_serial, &final_target_dna,
                               st.has_current ? 1 : 0, &st.current_dna);
     if (err != FP_OK) {
         free(chain); free(chain_ridx);
@@ -1725,9 +1894,15 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
             goto done;
         }
     }
-    uint64_t first_s = chain[0].serial;
     free(chain); free(chain_ridx);
-    cleanup_pending_events(cfg->store_dir, first_s, latest_ev.serial);
+    /* A7-P0-05: Verify full post-commit system invariants (including ledger) BEFORE deleting pending_events and .sf_ota_state! */
+    err = verify_system_invariants(cfg, &final_target_dna, NULL, 1, latest_ev.serial);
+    if (err != FP_OK) {
+        snprintf(rep.detail, sizeof(rep.detail),
+                 "post-commit system invariant check failed (%s)", fp_strerror(err));
+        goto done;
+    }
+    cleanup_pending_events(cfg->store_dir, chain_first_serial, latest_ev.serial);
     err = clear_ota_lifecycle(cfg->target_dir);
     if (err != FP_OK) {
         snprintf(rep.detail, sizeof(rep.detail), "failed to clear OTA lifecycle (%s)", fp_strerror(err));

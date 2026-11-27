@@ -2901,17 +2901,29 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                     return;
                 }
                 int cnt = 0;
-                if (sqlite3_prepare_v2(
+                int crc = sqlite3_prepare_v2(
                         st->db,
                         "SELECT COUNT(DISTINCT r.pubkey) FROM approvals a "
                         "JOIN approvers r ON a.approver = r.approver AND a.approver_pubkey = r.pubkey "
                         "WHERE a.channel=? AND a.serial=? AND a.event_hash=? AND length(a.approver_pubkey) = 64;",
-                        -1, &stmt, NULL) == SQLITE_OK) {
-                    sqlite3_bind_text(stmt, 1, ch, -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_int64(stmt, 2, serial);
-                    sqlite3_bind_text(stmt, 3, ev_hash_hex, -1, SQLITE_TRANSIENT);
-                    if (sqlite3_step(stmt) == SQLITE_ROW) cnt = sqlite3_column_int(stmt, 0);
+                        -1, &stmt, NULL);
+                if (crc == SQLITE_OK) {
+                    if (sqlite3_bind_text(stmt, 1, ch, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+                        sqlite3_bind_int64(stmt, 2, serial) != SQLITE_OK ||
+                        sqlite3_bind_text(stmt, 3, ev_hash_hex, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+                        crc = SQLITE_ERROR;
+                    } else {
+                        crc = sqlite3_step(stmt);
+                        if (crc == SQLITE_ROW) cnt = sqlite3_column_int(stmt, 0);
+                    }
                     sqlite3_finalize(stmt);
+                }
+                if (crc != SQLITE_ROW) {
+                    (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database approval count query failed\"}");
+                    return;
                 }
                 char dev_tag[96], det[320];
                 snprintf(dev_tag, sizeof(dev_tag), "APPROVER:%s", approver);
