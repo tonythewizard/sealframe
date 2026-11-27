@@ -347,6 +347,11 @@ fp_err_t fp_tensor_pack_ex(const fp_tensor_meta_t *meta, const void *data, size_
             float scale = (amax > 1e-8f) ? (amax / 7.0f) : 0.0f;
             uint16_t hs = fp_f32_to_f16(scale);
             float rscale = fp_f16_to_f32(hs);
+            /* AI-04: Fail closed if FP16 scale overflows to +Inf or underflows to 0 for non-zero group */
+            if (!isfinite(rscale) || (amax > 1e-8f && rscale <= 0.0f)) {
+                free(buf);
+                return FP_ERR_BOUNDS;
+            }
             float inv = (rscale > 0.0f) ? (1.0f / rscale) : 0.0f;
 
             uint8_t *gdst = dst + (size_t)g * SFT1_INT4_GROUP_BYTES;
@@ -380,6 +385,11 @@ fp_err_t fp_tensor_pack_ex(const fp_tensor_meta_t *meta, const void *data, size_
             float f = 0.0f;
             memcpy(&f, src + (size_t)idx * 4u, 4u);
             uint16_t hf = fp_f32_to_f16(f);
+            float rf = fp_f16_to_f32(hf);
+            if (!isfinite(rf)) {
+                free(out_idxs); free(out_mask); free(buf);
+                return FP_ERR_BOUNDS;
+            }
             op[0] = (uint8_t)(idx & 0xFFu);
             op[1] = (uint8_t)((idx >> 8) & 0xFFu);
             op[2] = (uint8_t)((idx >> 16) & 0xFFu);
@@ -404,6 +414,11 @@ fp_err_t fp_tensor_pack_ex(const fp_tensor_meta_t *meta, const void *data, size_
             float scale = (amax > 1e-8f) ? (amax / 7.0f) : 0.0f;
             uint16_t hs = fp_f32_to_f16(scale);
             float rscale = fp_f16_to_f32(hs);
+            /* AI-04: Fail closed if FP16 scale overflows to +Inf or underflows to 0 for non-zero group */
+            if (!isfinite(rscale) || (amax > 1e-8f && rscale <= 0.0f)) {
+                free(out_idxs); free(out_mask); free(buf);
+                return FP_ERR_BOUNDS;
+            }
             float inv = (rscale > 0.0f) ? (1.0f / rscale) : 0.0f;
 
             uint8_t *gdst = op + (size_t)g * SFT1_INT4_GROUP_BYTES;
@@ -588,13 +603,16 @@ fp_err_t fp_tensor_unpack(const uint8_t *buf, size_t len, int upcast_to_f32,
                 memcpy(payload + (size_t)(base + j) * 4u, &f, 4u);
             }
         }
-        /* Restore exact FP16 outlier channels */
+        /* Restore exact FP16 outlier channels (strictly ascending unique indices) */
+        uint32_t prev_idx = 0;
         for (uint32_t k = 0; k < outlier_cnt; k++) {
             const uint8_t *e = op + (size_t)k * SFT1_OUTLIER_ENTRY_LEN;
             uint32_t idx = (uint32_t)e[0] | ((uint32_t)e[1] << 8) |
                            ((uint32_t)e[2] << 16) | ((uint32_t)e[3] << 24);
             uint16_t hf  = (uint16_t)((uint16_t)e[4] | ((uint16_t)e[5] << 8));
             if ((uint64_t)idx >= elems) { free(payload); return FP_ERR_BOUNDS; }
+            if (k > 0u && idx <= prev_idx) { free(payload); return FP_ERR_INVALID; }
+            prev_idx = idx;
             float fv = fp_f16_to_f32(hf);
             if (!isfinite(fv)) { free(payload); return FP_ERR_INVALID; }
             memcpy(payload + (size_t)idx * 4u, &fv, 4u);

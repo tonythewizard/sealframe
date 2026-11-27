@@ -573,13 +573,30 @@ static void test_int4_outlier_codec(void) {
     assert(l_i4o < (elems * 4u * 18u) / 100u);
     assert(sqnr_out > sqnr_plain + 6.0 && cos_out > 0.9985);
 
-    /* Negative test: out-of-bounds outlier index -> fail-closed FP_ERR_BOUNDS */
-    w_i4o[36] = 0xFFu; w_i4o[37] = 0xFFu; w_i4o[38] = 0xFFu; w_i4o[39] = 0x0Fu;
+    /* Negative test 1: duplicate outlier index -> fail-closed FP_ERR_INVALID (AI-04) */
+    uint8_t saved_idx[4];
+    memcpy(saved_idx, w_i4o + 42, 4);
+    memcpy(w_i4o + 42, w_i4o + 36, 4); /* duplicate index 0 into entry 1 */
     uint8_t *bad = NULL; size_t blen = 0;
+    assert(fp_tensor_unpack(w_i4o, l_i4o, 1, &dm, &bad, &blen) == FP_ERR_INVALID && bad == NULL);
+    memcpy(w_i4o + 42, saved_idx, 4);
+
+    /* Negative test 2: out-of-bounds outlier index -> fail-closed FP_ERR_BOUNDS */
+    w_i4o[36] = 0xFFu; w_i4o[37] = 0xFFu; w_i4o[38] = 0xFFu; w_i4o[39] = 0x0Fu;
     assert(fp_tensor_unpack(w_i4o, l_i4o, 1, &dm, &bad, &blen) == FP_ERR_BOUNDS && bad == NULL);
 
+    /* Negative test 3 (AI-04): FP16 scale overflow (>65504*7) -> fail-closed FP_ERR_BOUNDS */
+    float huge_vals[64];
+    for (int i = 0; i < 64; i++) huge_vals[i] = 1e6f;
+    fp_tensor_meta_t hm;
+    memset(&hm, 0, sizeof(hm));
+    hm.dtype = FP_DTYPE_FP32; hm.ndim = 1u; hm.dims[0] = 64u;
+    uint8_t *hw = NULL; size_t hlen = 0;
+    assert(fp_tensor_pack_ex(&hm, huge_vals, sizeof(huge_vals), FP_WIRE_CAST_INT4_G32, &hw, &hlen) == FP_ERR_BOUNDS && hw == NULL);
+    assert(fp_tensor_pack_ex(&hm, huge_vals, sizeof(huge_vals), FP_WIRE_CAST_INT4_OUTLIER, &hw, &hlen) == FP_ERR_BOUNDS && hw == NULL);
+
     free(w_i4); free(w_i4o); free(d_i4); free(d_i4o); free(src);
-    printf("  [PASS] SFT1 INT4+Outlier FP16 (%zu B vs %zu B FP32, SQNR %.2f -> %.2f dB, cos=%.6f)\n",
+    printf("  [PASS] SFT1 INT4+Outlier FP16 (%zu B vs %zu B FP32, SQNR %.2f -> %.2f dB, cos=%.6f, AI-04 guards OK)\n",
            l_i4o, elems * 4u, sqnr_plain, sqnr_out, cos_out);
 }
 

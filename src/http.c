@@ -164,8 +164,49 @@ typedef struct {
     int      status_code;
     int      has_content_length;
     uint64_t content_length;
+    int      has_content_range;
+    uint64_t cr_start;
+    uint64_t cr_end;
+    uint64_t cr_total;
     size_t   hdr_len;
 } http_hdr_info_t;
+
+static int parse_u64_span(const char *s, const char *end, uint64_t *out) {
+    if (!s || s >= end) return -1;
+    uint64_t v = 0;
+    for (const char *c = s; c < end; c++) {
+        if (*c < '0' || *c > '9') return -1;
+        if (v > (UINT64_MAX - (uint64_t)(*c - '0')) / 10u) return -1;
+        v = v * 10u + (uint64_t)(*c - '0');
+    }
+    *out = v;
+    return 0;
+}
+
+static int parse_content_range(const char *val, const char *endv,
+                               uint64_t *out_start, uint64_t *out_end, uint64_t *out_total) {
+    /* Strict RFC 9110 format: "bytes <start>-<end>/<total>" */
+    while (val < endv && (*val == ' ' || *val == '\t')) val++;
+    while (endv > val && (endv[-1] == ' ' || endv[-1] == '\t')) endv--;
+    if ((size_t)(endv - val) < 10u || !ci_prefix(val, "bytes ")) return -1;
+    val += 6;
+    while (val < endv && (*val == ' ' || *val == '\t')) val++;
+    const char *dash = memchr(val, '-', (size_t)(endv - val));
+    if (!dash) return -1;
+    const char *slash = memchr(dash + 1, '/', (size_t)(endv - (dash + 1)));
+    if (!slash) return -1;
+    uint64_t s = 0, e = 0, t = 0;
+    if (parse_u64_span(val, dash, &s) != 0 ||
+        parse_u64_span(dash + 1, slash, &e) != 0 ||
+        parse_u64_span(slash + 1, endv, &t) != 0) {
+        return -1;
+    }
+    if (e < s || t == 0 || e >= t) return -1;
+    *out_start = s;
+    *out_end = e;
+    *out_total = t;
+    return 0;
+}
 
 static fp_err_t read_http_headers(int fd, uint8_t *buf, size_t buf_cap,
                                   size_t *out_total_read, http_hdr_info_t *info,
@@ -226,6 +267,19 @@ static fp_err_t read_http_headers(int fd, uint8_t *buf, size_t buf_cap,
             }
             info->content_length = cl;
             info->has_content_length = 1;
+        } else if (ci_prefix(line, "content-range:")) {
+            uint64_t cs = 0, ce = 0, ct = 0;
+            if (parse_content_range(line + 14, crlf, &cs, &ce, &ct) != 0) {
+                return FP_ERR_INVALID;
+            }
+            if (info->has_content_range &&
+                (info->cr_start != cs || info->cr_end != ce || info->cr_total != ct)) {
+                return FP_ERR_INVALID; /* Reject conflicting Content-Range headers */
+            }
+            info->cr_start = cs;
+            info->cr_end = ce;
+            info->cr_total = ct;
+            info->has_content_range = 1;
         }
         line = crlf + 2;
     }
@@ -491,12 +545,24 @@ fp_err_t fp_http_pull_object(const char *url, const char *store_dir,
     if (err != FP_OK) { close(fd); return err; }
 
     int sfd = -1;
+    uint64_t range_expected_len = 0;
     if (existing > 0 && hinfo.status_code == 206) {
-        sfd = open(stage_path, O_WRONLY | O_APPEND, 0600);
+        /* SEC-06: Require strict Content-Range verification matching our exact resume offset! */
+        if (!hinfo.has_content_range || hinfo.cr_start != existing ||
+            (expected_size > 0 && hinfo.cr_total != expected_size)) {
+            close(fd);
+            return FP_ERR_INTEGRITY;
+        }
+        range_expected_len = (hinfo.cr_end - hinfo.cr_start) + 1u;
+        if (hinfo.has_content_length && hinfo.content_length != range_expected_len) {
+            close(fd);
+            return FP_ERR_INTEGRITY;
+        }
+        sfd = open(stage_path, O_WRONLY | O_APPEND | O_NOFOLLOW, 0600);
         if (out_resumed_bytes) *out_resumed_bytes = existing;
     } else if (hinfo.status_code == 200) {
         existing = 0;
-        sfd = open(stage_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        sfd = open(stage_path, O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW, 0600);
     } else if (hinfo.status_code == 404) {
         close(fd);
         return FP_ERR_NOT_FOUND;
@@ -512,8 +578,9 @@ fp_err_t fp_http_pull_object(const char *url, const char *store_dir,
         (hinfo.content_length > expected_size || existing > expected_size - hinfo.content_length)) {
         err = FP_ERR_BOUNDS;
     } else if (init_body > 0) {
-        if (expected_size > 0 &&
-            (init_body > expected_size || existing > expected_size - init_body)) {
+        if ((expected_size > 0 &&
+             (init_body > expected_size || existing > expected_size - init_body)) ||
+            (range_expected_len > 0 && init_body > range_expected_len)) {
             err = FP_ERR_BOUNDS;
         } else {
             err = write_all_h(sfd, hbuf + hinfo.hdr_len, init_body);
@@ -524,10 +591,13 @@ fp_err_t fp_http_pull_object(const char *url, const char *store_dir,
     uint8_t buf[16384];
     while (err == FP_OK) {
         if (hinfo.has_content_length && written_this_req >= hinfo.content_length) break;
+        if (range_expected_len > 0 && written_this_req >= range_expected_len) break;
         ssize_t n = recv_some_t(fd, buf, sizeof(buf), timeout_ms);
         if (n < 0) { err = FP_ERR_IO; break; }
         if (n == 0) break;
-        if (expected_size > 0 && existing + written_this_req + (uint64_t)n > expected_size) {
+        if ((expected_size > 0 &&
+             ((uint64_t)n > expected_size - existing || written_this_req > expected_size - existing - (uint64_t)n)) ||
+            (range_expected_len > 0 && ((uint64_t)n > range_expected_len || written_this_req > range_expected_len - (uint64_t)n))) {
             err = FP_ERR_BOUNDS;
             break;
         }
@@ -536,7 +606,14 @@ fp_err_t fp_http_pull_object(const char *url, const char *store_dir,
     }
     close(fd);
 
-    if (err == FP_OK && fsync(sfd) != 0) err = FP_ERR_IO;
+    /* Preserve partial stage_path on truncated transfer rather than deleting valid resume prefix */
+    if (err == FP_OK &&
+        ((hinfo.has_content_length && written_this_req != hinfo.content_length) ||
+         (range_expected_len > 0 && written_this_req != range_expected_len) ||
+         (expected_size > 0 && existing + written_this_req < expected_size))) {
+        err = FP_ERR_IO;
+    }
+    if (fsync(sfd) != 0 && err == FP_OK) err = FP_ERR_IO;
     close(sfd);
     if (err != FP_OK) return err; /* Keep partial stage_path for HTTP Range resume! */
 

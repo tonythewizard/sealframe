@@ -90,6 +90,7 @@ enum {
 #define BR_PROTO_VER     4u
 #define BR_GGML_CMD_MAX  16u
 #define BR_CAP_ALL       0x000000FFu /* SFT1|TOPK|ZSTD|DEDUP|ZERO|PIPE0RTT|ALLOC_CACHE|OUTLIER_GUARD */
+#define BR_ABI_FINGERPRINT ((uint16_t)(((GGML_RPC_TENSOR_LEN & 0x3FFu) ^ (GGML_RPC_NAME_OFF << 3) ^ (GGML_RPC_NAME_LEN << 7) ^ (BR_GGML_CMD_MAX << 11)) & 0xFFFFu))
 
 static int buf_is_all_zero(const uint8_t *p, size_t n) {
     size_t i = 0;
@@ -276,12 +277,14 @@ static fp_err_t unpack_topk_logits(const uint8_t *buf, size_t len,
         return FP_ERR_BOUNDS;
     }
     uint32_t rows = total_elems / ne0;
+    if ((size_t)rows > (SIZE_MAX - 10u) / ((size_t)k * 8u)) return FP_ERR_BOUNDS;
     if (len != 10u + (size_t)rows * (size_t)k * 8u) return FP_ERR_BOUNDS;
 
     float *out = malloc((size_t)total_elems * sizeof(float));
     if (!out) return FP_ERR_NOMEM;
     for (uint32_t i = 0; i < total_elems; i++) out[i] = -1e9f;
 
+    uint32_t seen_idx[BR_LOGITS_MAX_TOPK];
     const uint8_t *p = buf + 10;
     for (uint32_t r = 0; r < rows; r++) {
         float *row = out + (size_t)r * ne0;
@@ -290,6 +293,10 @@ static fp_err_t unpack_topk_logits(const uint8_t *buf, size_t len,
             uint32_t fbits = get_le32(p + 4);
             p += 8;
             if (idx >= ne0) { free(out); return FP_ERR_BOUNDS; }
+            for (uint16_t j = 0; j < i; j++) {
+                if (seen_idx[j] == idx) { free(out); return FP_ERR_INVALID; }
+            }
+            seen_idx[i] = idx;
             float v = 0.0f;
             memcpy(&v, &fbits, 4u);
             if (!isfinite(v)) { free(out); return FP_ERR_INVALID; }
@@ -640,7 +647,7 @@ static fp_err_t run_client_session(int local_cli_fd, sf_split_transport_t tr,
         hlo[14] = (uint8_t)st->wire_cast;
         hlo[15] = (uint8_t)(st->strict_lossless ? 1u : 0u);
         put_be16(hlo + 16, st->logits_topk);
-        put_be16(hlo + 18, 0u);
+        put_be16(hlo + 18, BR_ABI_FINGERPRINT);
         fp_err_t herr = tun_send(tr, ts, us, BR_TAG_HELLO, hlo, sizeof(hlo), NULL);
         if (herr != FP_OK) return herr;
     }
@@ -851,6 +858,10 @@ static fp_err_t run_client_session(int local_cli_fd, sf_split_transport_t tr,
             uint8_t *out_bytes = rbuf;
             size_t out_len = rlen;
             uint8_t *dec_buf = NULL;
+            if (st->strict_lossless && (rtag == BR_TAG_RESP_SFT1 || rtag == BR_TAG_RESP_TOPK)) {
+                free(rbuf); free(acache);
+                return FP_ERR_POLICY;
+            }
             if (rtag == BR_TAG_RESP_SFT1) {
                 fp_tensor_meta_t rm;
                 err = fp_tensor_unpack(rbuf, rlen, 1, &rm, &dec_buf, &out_len);
@@ -930,6 +941,7 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
                                    fp_session_t *ts, fp_udp_session_t *us,
                                    bridge_state_t *st) {
     uint64_t seq = 0;
+    int hello_done = 0;
     for (;;) {
         uint8_t tag = 0;
         uint8_t *msg = NULL;
@@ -938,11 +950,16 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
         if (err != FP_OK) return err;
         if (tag == BR_TAG_CLOSE) { free(msg); return FP_OK; }
         if (tag == BR_TAG_HELLO) {
-            if (mlen != 20u || memcmp(msg, "SFLB", 4) != 0) { free(msg); return FP_ERR_POLICY; }
+            if (hello_done || mlen != 20u || memcmp(msg, "SFLB", 4) != 0) {
+                free(msg);
+                return FP_ERR_POLICY;
+            }
             uint16_t pver = get_be16(msg + 4);
             uint16_t hlen = get_be16(msg + 6);
             uint16_t cmax = get_be16(msg + 8);
-            if (pver != BR_PROTO_VER || hlen != (uint16_t)st->rpc_tensor_hdr_len || cmax > BR_GGML_CMD_MAX) {
+            uint16_t afp  = get_be16(msg + 18);
+            if (pver != BR_PROTO_VER || hlen != (uint16_t)st->rpc_tensor_hdr_len ||
+                cmax > BR_GGML_CMD_MAX || (afp != 0u && afp != BR_ABI_FINGERPRINT)) {
                 free(msg);
                 return FP_ERR_POLICY;
             }
@@ -951,8 +968,14 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
                 st->wire_cast = FP_WIRE_CAST_NONE;
                 st->logits_topk = 0u;
             }
+            hello_done = 1;
             free(msg);
             continue;
+        }
+        /* AI-02: Fail closed if any RPC frame arrives before compatibility HELLO preamble */
+        if (!hello_done) {
+            free(msg);
+            return FP_ERR_POLICY;
         }
 
         uint8_t cmd = 0, expect_resp = 0;
@@ -965,6 +988,8 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
             cmd = msg[0]; expect_resp = msg[1];
             rpc_payload = msg + 2; rpc_len = mlen - 2u;
         } else if (tag == BR_TAG_RPC_SFT1 && mlen >= 6u) {
+            /* AI-03: Never accept lossy SFT1 wire frames when strict_lossless is active */
+            if (st->strict_lossless) { free(msg); return FP_ERR_POLICY; }
             cmd = msg[0]; expect_resp = msg[1];
             uint32_t pref_len = get_be32(msg + 2);
             if (6u + (size_t)pref_len >= mlen) { free(msg); return FP_ERR_BOUNDS; }
@@ -972,6 +997,9 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
             uint8_t *fdata = NULL; size_t flen = 0;
             err = fp_tensor_unpack(msg + 6u + pref_len, mlen - 6u - pref_len, 1, &dm, &fdata, &flen);
             if (err != FP_OK) { free(msg); return err; }
+            if (flen > BR_MAX_PAYLOAD - (size_t)pref_len) {
+                free(fdata); free(msg); return FP_ERR_BOUNDS;
+            }
             rpc_len = (size_t)pref_len + flen;
             alloc_payload = malloc(rpc_len);
             if (!alloc_payload) { free(fdata); free(msg); return FP_ERR_NOMEM; }
@@ -994,8 +1022,13 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
             }
             if (cache_store && st->cache_dir && raw_len > pref_len) {
                 fp_dna_t stored_dna;
-                (void)fp_store_put_object(st->cache_dir, alloc_payload + pref_len,
-                                          raw_len - pref_len, &stored_dna);
+                /* AI-01: Check CAS write status instead of silently ignoring store failures */
+                fp_err_t perr = fp_store_put_object(st->cache_dir, alloc_payload + pref_len,
+                                                    raw_len - pref_len, &stored_dna);
+                if (perr != FP_OK) {
+                    free(alloc_payload); free(msg);
+                    return perr;
+                }
             }
             rpc_payload = alloc_payload;
             rpc_len = raw_len;
@@ -1010,6 +1043,9 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
             uint8_t *obj = NULL; size_t olen = 0;
             err = fp_store_get_object(st->cache_dir, &ref_dna, BR_MAX_PAYLOAD, &obj, &olen);
             if (err != FP_OK) { free(msg); return err; }
+            if (olen > BR_MAX_PAYLOAD - (size_t)pref_len) {
+                free(obj); free(msg); return FP_ERR_BOUNDS;
+            }
             rpc_len = (size_t)pref_len + olen;
             alloc_payload = malloc(rpc_len);
             if (!alloc_payload) { free(obj); free(msg); return FP_ERR_NOMEM; }
@@ -1021,7 +1057,8 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
             cmd = msg[0]; expect_resp = msg[1];
             uint32_t pref_len = get_be32(msg + 2);
             uint32_t dlen     = get_be32(msg + 6);
-            if (mlen != 10u + (size_t)pref_len || dlen > (64u << 20)) {
+            if (mlen != 10u + (size_t)pref_len || dlen > (64u << 20) ||
+                (size_t)pref_len > BR_MAX_PAYLOAD - (size_t)dlen) {
                 free(msg); return FP_ERR_BOUNDS;
             }
             rpc_len = (size_t)pref_len + (size_t)dlen;
@@ -1032,6 +1069,10 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
         } else {
             free(msg);
             return FP_ERR_INVALID;
+        }
+        if (st->strict_lossless && (expect_resp == 2u || expect_resp == 3u)) {
+            free(alloc_payload); free(msg);
+            return FP_ERR_POLICY;
         }
 
         if (cmd == GGML_RPC_GET_TENSOR && rpc_len >= 24u) {
