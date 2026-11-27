@@ -418,6 +418,66 @@ fp_err_t fp_store_load_state(const char *root, fp_store_state_t *out_state) {
     return err;
 }
 
+fp_err_t fp_store_validate_transition(const fp_store_state_t *current,
+                                      const fp_event_t *ev,
+                                      fp_store_state_t *out_next) {
+    if (!current || !ev) return FP_ERR_INVALID;
+
+    fp_store_state_t next = *current;
+    if (next.serial > 0) {
+        if (!fp_dna_equal(&next.repo_id, &ev->repo_id)) {
+            return FP_ERR_POLICY;
+        }
+    } else {
+        next.repo_id = ev->repo_id;
+        memcpy(next.signer_pk, ev->signer_pk, FP_PK_LEN);
+    }
+
+    if (ev->serial != next.serial + 1u ||
+        !fp_dna_equal(&ev->prev_event_hash, &next.last_event_hash)) {
+        return FP_ERR_CHAIN;
+    }
+
+    if (ev->action == FP_ACTION_REVOKE) {
+        if (!dna_in_list(next.revoked, next.revoked_count, &ev->target_dna)) {
+            if (next.revoked_count >= FP_MAX_HISTORY) {
+                return FP_ERR_BOUNDS;
+            }
+            next.revoked[next.revoked_count++] = ev->target_dna;
+        }
+        if (next.has_current && fp_dna_equal(&next.current_dna, &ev->target_dna)) {
+            next.has_current = 0;
+            memset(&next.current_dna, 0, sizeof(next.current_dna));
+        }
+    } else if (ev->action == FP_ACTION_INSTALL || ev->action == FP_ACTION_ROLLBACK) {
+        if (dna_in_list(next.revoked, next.revoked_count, &ev->target_dna)) {
+            return FP_ERR_REVOKED;
+        }
+        int known = dna_in_list(next.installed, next.installed_count, &ev->target_dna);
+        if (ev->action == FP_ACTION_INSTALL && known) {
+            return FP_ERR_POLICY;
+        }
+        if (ev->action == FP_ACTION_ROLLBACK && !known) {
+            return FP_ERR_POLICY;
+        }
+        if (!known) {
+            if (next.installed_count >= FP_MAX_HISTORY) {
+                return FP_ERR_BOUNDS;
+            }
+            next.installed[next.installed_count++] = ev->target_dna;
+        }
+        next.has_current = 1;
+        next.current_dna = ev->target_dna;
+    } else {
+        return FP_ERR_INVALID;
+    }
+
+    next.serial = ev->serial;
+    next.last_event_hash = ev->event_hash;
+    if (out_next) *out_next = next;
+    return FP_OK;
+}
+
 fp_err_t fp_store_apply_event(const char *root, const fp_event_t *ev,
                               const uint8_t expected_pk[FP_PK_LEN],
                               const fp_dna_t *expected_repo,
@@ -438,51 +498,19 @@ fp_err_t fp_store_apply_event(const char *root, const fp_event_t *ev,
         return err;
     }
 
-    if (st.serial > 0) {
-        if (!fp_dna_equal(&st.repo_id, &ev->repo_id) ||
-            sodium_memcmp(st.signer_pk, ev->signer_pk, FP_PK_LEN) != 0) {
-            close(lfd);
-            return FP_ERR_POLICY;
-        }
-    } else {
-        st.repo_id = ev->repo_id;
-        memcpy(st.signer_pk, ev->signer_pk, FP_PK_LEN);
-    }
-
-    if (ev->serial != st.serial + 1u ||
-        !fp_dna_equal(&ev->prev_event_hash, &st.last_event_hash)) {
+    if (st.serial > 0 && sodium_memcmp(st.signer_pk, ev->signer_pk, FP_PK_LEN) != 0) {
         close(lfd);
-        return FP_ERR_CHAIN;
+        return FP_ERR_POLICY;
     }
 
-    if (ev->action == FP_ACTION_REVOKE) {
-        if (!dna_in_list(st.revoked, st.revoked_count, &ev->target_dna)) {
-            if (st.revoked_count >= FP_MAX_HISTORY) {
-                close(lfd);
-                return FP_ERR_BOUNDS;
-            }
-            st.revoked[st.revoked_count++] = ev->target_dna;
-        }
-        if (st.has_current && fp_dna_equal(&st.current_dna, &ev->target_dna)) {
-            st.has_current = 0;
-            memset(&st.current_dna, 0, sizeof(st.current_dna));
-        }
-    } else {
-        if (dna_in_list(st.revoked, st.revoked_count, &ev->target_dna)) {
-            close(lfd);
-            return FP_ERR_REVOKED;
-        }
-        int known = dna_in_list(st.installed, st.installed_count, &ev->target_dna);
-        if (ev->action == FP_ACTION_INSTALL && known) {
-            /* Re-installing a prior DNA requires an explicit ROLLBACK with reason */
-            close(lfd);
-            return FP_ERR_POLICY;
-        }
-        if (ev->action == FP_ACTION_ROLLBACK && !known) {
-            close(lfd);
-            return FP_ERR_POLICY;
-        }
+    fp_store_state_t next_st;
+    err = fp_store_validate_transition(&st, ev, &next_st);
+    if (err != FP_OK) {
+        close(lfd);
+        return err;
+    }
 
+    if (ev->action != FP_ACTION_REVOKE) {
         if (!payload_data && payload_len > 0) {
             close(lfd);
             return FP_ERR_INVALID;
@@ -523,16 +551,6 @@ fp_err_t fp_store_apply_event(const char *root, const fp_event_t *ev,
                 return err != FP_OK ? err : FP_ERR_INTEGRITY;
             }
         }
-
-        if (!known) {
-            if (st.installed_count >= FP_MAX_HISTORY) {
-                close(lfd);
-                return FP_ERR_BOUNDS;
-            }
-            st.installed[st.installed_count++] = ev->target_dna;
-        }
-        st.has_current = 1;
-        st.current_dna = ev->target_dna;
     }
 
     /* Persist signed event audit copy */
@@ -553,12 +571,9 @@ fp_err_t fp_store_apply_event(const char *root, const fp_event_t *ev,
     if (err != FP_OK) { close(lfd); return err; }
 
     /* Advance state atomically */
-    st.serial = ev->serial;
-    st.last_event_hash = ev->event_hash;
-
     uint8_t *st_bytes = NULL;
     size_t st_len = 0;
-    err = encode_state(&st, &st_bytes, &st_len);
+    err = encode_state(&next_st, &st_bytes, &st_len);
     if (err != FP_OK) { close(lfd); return err; }
 
     char st_path[PATH_MAX];

@@ -99,7 +99,7 @@ static int safe_ident(const char *name) {
     if (!name || name[0] == '\0') return 0;
     size_t len = strnlen(name, 128);
     if (len == 0 || len >= 128) return 0;
-    if (strcmp(name, "_fp_progress") == 0) return 0;
+    if (strcmp(name, "_fp_progress") == 0 || strcmp(name, "_fp_sql_history") == 0) return 0;
     for (size_t i = 0; i < len; i++) {
         char c = name[i];
         int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -131,7 +131,13 @@ fp_err_t fp_sql_open(const char *db_path, fp_sql_ctx_t **out_ctx) {
         "  seq INTEGER NOT NULL,"
         "  bundle_dna TEXT NOT NULL"
         ");"
-        "INSERT OR IGNORE INTO _fp_progress(id, seq, bundle_dna) VALUES (1, 0, '');";
+        "INSERT OR IGNORE INTO _fp_progress(id, seq, bundle_dna) VALUES (1, 0, '');"
+        "CREATE TABLE IF NOT EXISTS _fp_sql_history ("
+        "  seq INTEGER PRIMARY KEY,"
+        "  bundle_dna TEXT NOT NULL,"
+        "  prev_dna TEXT NOT NULL,"
+        "  prev_seq INTEGER NOT NULL"
+        ");";
 
     if (sqlite3_exec(ctx->db, init_sql, NULL, NULL, NULL) != SQLITE_OK) {
         fp_sql_close(ctx);
@@ -552,7 +558,7 @@ static fp_err_t atomic_flip_current(const char *target_dir, const char *gen_rel)
 /* SQLite changeset callbacks */
 static int filter_table(void *ctx, const char *zTab) {
     const char *allowed = (const char *)ctx;
-    if (strcmp(zTab, "_fp_progress") == 0) return 0;
+    if (strcmp(zTab, "_fp_progress") == 0 || strcmp(zTab, "_fp_sql_history") == 0) return 0;
     return sqlite3_stricmp(zTab, allowed) == 0;
 }
 
@@ -582,6 +588,74 @@ static fp_err_t write_progress(fp_sql_ctx_t *sql, uint64_t seq, const char *dna_
     int rc = sqlite3_step(sql->stmt_set_prog);
     sqlite3_reset(sql->stmt_set_prog);
     return rc == SQLITE_DONE ? FP_OK : FP_ERR_IO;
+}
+
+fp_err_t fp_sql_get_progress(fp_sql_ctx_t *ctx, uint64_t *out_seq, char out_dna[65]) {
+    if (!ctx || !out_seq || !out_dna) return FP_ERR_INVALID;
+    return read_progress(ctx, out_seq, out_dna);
+}
+
+static fp_err_t record_sql_history(fp_sql_ctx_t *sql, uint64_t seq, const char *dna_hex,
+                                   const char *prev_dna, uint64_t prev_seq) {
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(
+            sql->db,
+            "INSERT OR REPLACE INTO _fp_sql_history(seq, bundle_dna, prev_dna, prev_seq) VALUES(?,?,?,?);",
+            -1, &s, NULL) != SQLITE_OK) {
+        return FP_ERR_IO;
+    }
+    sqlite3_bind_int64(s, 1, (sqlite3_int64)seq);
+    sqlite3_bind_text(s, 2, dna_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 3, prev_dna ? prev_dna : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 4, (sqlite3_int64)prev_seq);
+    int rc = sqlite3_step(s);
+    sqlite3_finalize(s);
+    return rc == SQLITE_DONE ? FP_OK : FP_ERR_IO;
+}
+
+static fp_err_t delete_sql_history_seq(fp_sql_ctx_t *sql, uint64_t seq) {
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(sql->db, "DELETE FROM _fp_sql_history WHERE seq=?;",
+                           -1, &s, NULL) != SQLITE_OK) {
+        return FP_ERR_IO;
+    }
+    sqlite3_bind_int64(s, 1, (sqlite3_int64)seq);
+    int rc = sqlite3_step(s);
+    sqlite3_finalize(s);
+    return rc == SQLITE_DONE ? FP_OK : FP_ERR_IO;
+}
+
+static int lookup_sql_history_by_seq_dna(fp_sql_ctx_t *sql, uint64_t seq, const char *dna_hex,
+                                         char out_prev_dna[65], uint64_t *out_prev_seq) {
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(
+            sql->db,
+            "SELECT prev_dna, prev_seq FROM _fp_sql_history WHERE seq=? AND bundle_dna=?;",
+            -1, &s, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_int64(s, 1, (sqlite3_int64)seq);
+    sqlite3_bind_text(s, 2, dna_hex, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(s);
+    int found = 0;
+    if (rc == SQLITE_ROW) {
+        found = 1;
+        const char *p = (const char *)sqlite3_column_text(s, 0);
+        snprintf(out_prev_dna, 65, "%s", p ? p : "");
+        *out_prev_seq = (uint64_t)sqlite3_column_int64(s, 1);
+    } else if (rc != SQLITE_DONE) {
+        found = -1;
+    }
+    sqlite3_finalize(s);
+    return found;
+}
+
+static int is_zero_hex64(const char *s) {
+    if (!s || strlen(s) != 64u) return 0;
+    for (size_t i = 0; i < 64u; i++) {
+        if (s[i] != '0') return 0;
+    }
+    return 1;
 }
 
 static fp_err_t load_and_verify_bundle(const char *store_dir, const fp_dna_t *bundle_dna,
@@ -864,6 +938,7 @@ static fp_err_t bundle_recover_locked(const char *store_dir, const char *target_
         return FP_OK;
     }
     if (strcmp(state, "ACTIVATION_PENDING") == 0 || strcmp(state, "ROLLBACK_PENDING") == 0) {
+        int is_empty_target = (strcmp(state, "ROLLBACK_PENDING") == 0 && jseq == 0 && is_zero_hex64(dna_hex));
         int db_committed = 0;
         if (has_sql) {
             if (!sql_ctx) return FP_ERR_INVALID;
@@ -871,12 +946,29 @@ static fp_err_t bundle_recover_locked(const char *store_dir, const char *target_
             char cur_dna[65];
             fp_err_t err = read_progress(sql_ctx, &cur_seq, cur_dna);
             if (err != FP_OK) return err;
-            if (cur_seq == jseq && strcmp(cur_dna, dna_hex) == 0) {
+            if (is_empty_target) {
+                if (cur_seq == 0 && cur_dna[0] == '\0') db_committed = 1;
+            } else if (cur_seq == jseq && strcmp(cur_dna, dna_hex) == 0) {
                 db_committed = 1;
             }
         }
         if (db_committed) {
             /* SQLite already committed (apply or rollback) before crash: reconcile symlink forward! */
+            if (is_empty_target) {
+                char cur_link[PATH_MAX];
+                if (snprintf(cur_link, sizeof(cur_link), "%s/current", target_dir) >= (int)sizeof(cur_link)) {
+                    return FP_ERR_BOUNDS;
+                }
+                if (unlink(cur_link) != 0 && errno != ENOENT) return FP_ERR_IO;
+                fp_err_t serr = sync_dir_path(target_dir);
+                if (serr != FP_OK) return serr;
+                char jpath[PATH_MAX];
+                if (snprintf(jpath, sizeof(jpath), "%s/.sf_tx_journal", target_dir) < (int)sizeof(jpath)) {
+                    if (unlink(jpath) != 0 && errno != ENOENT) return FP_ERR_IO;
+                    (void)sync_dir_path(target_dir);
+                }
+                return FP_OK;
+            }
             char gen_dir[PATH_MAX], rel[128];
             int gn = snprintf(gen_dir, sizeof(gen_dir), "%s/gen/%s", target_dir, dna_hex);
             if (gn < 0 || (size_t)gn >= sizeof(gen_dir)) return FP_ERR_BOUNDS;
@@ -1026,6 +1118,9 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
                     if (rc != SQLITE_OK) err = FP_ERR_INTEGRITY;
                 }
                 if (err == FP_OK) {
+                    err = record_sql_history(sql_ctx, expected_seq, dna_hex, cur_dna, cur_seq);
+                }
+                if (err == FP_OK) {
                     err = write_progress(sql_ctx, expected_seq, dna_hex);
                 }
                 if (err == FP_OK && fault_mode == 1) {
@@ -1067,11 +1162,24 @@ cleanup:
     return err;
 }
 
+/* Multi-step atomic & idempotent rollback (P0-01, P0-02, P0-05, P1-01):
+ *   - Supports rolling back single-step OR multi-step SQLite chains (V4 -> V1) in ONE atomic transaction
+ *     by walking `_fp_sql_history` backward and inverting every intermediate bundle in reverse order.
+ *   - Supports `prev_bundle_dna == NULL` to cleanly revert an initial install (restoring SQLite to seq=0
+ *     and removing `current`).
+ *   - Idempotent: if SQLite is already at `prev_bundle_dna`, reconciles symlink cleanly and returns FP_OK.
+ *   - Fails closed BEFORE any mutation if any intermediate bundle/changeset in the chain is missing! */
+typedef struct {
+    uint64_t    seq;
+    char        dna_hex[65];
+    fp_bundle_t b;
+} rb_step_t;
+
 fp_err_t fp_bundle_rollback(const char *store_dir,
                             const fp_dna_t *current_bundle_dna,
                             const fp_dna_t *prev_bundle_dna,
                             const char *target_dir, fp_sql_ctx_t *sql_ctx) {
-    if (!store_dir || !current_bundle_dna || !prev_bundle_dna || !target_dir) {
+    if (!store_dir || !current_bundle_dna || !target_dir) {
         return FP_ERR_INVALID;
     }
     int lfd = acquire_target_lock(target_dir);
@@ -1080,86 +1188,167 @@ fp_err_t fp_bundle_rollback(const char *store_dir,
     fp_err_t err = bundle_recover_locked(store_dir, target_dir, sql_ctx);
     if (err != FP_OK) { release_target_lock(lfd); return err; }
 
+    char cur_hex[65], prev_hex[65], journal_dna_hex[65];
+    fp_hex_encode(current_bundle_dna->bytes, FP_DNA_LEN, cur_hex);
+    if (prev_bundle_dna) {
+        fp_hex_encode(prev_bundle_dna->bytes, FP_DNA_LEN, prev_hex);
+        memcpy(journal_dna_hex, prev_hex, sizeof(journal_dna_hex));
+    } else {
+        prev_hex[0] = '\0';
+        memset(journal_dna_hex, '0', 64);
+        journal_dna_hex[64] = '\0';
+    }
+
     fp_bundle_t cur_b, prev_b;
     err = load_and_verify_bundle(store_dir, current_bundle_dna, &cur_b);
     if (err != FP_OK) { release_target_lock(lfd); return err; }
-    err = load_and_verify_bundle(store_dir, prev_bundle_dna, &prev_b);
-    if (err != FP_OK) { release_target_lock(lfd); return err; }
-
-    char cur_hex[65], prev_hex[65];
-    fp_hex_encode(current_bundle_dna->bytes, FP_DNA_LEN, cur_hex);
-    fp_hex_encode(prev_bundle_dna->bytes, FP_DNA_LEN, prev_hex);
-
-    /* Ensure previous generation files are present and cryptographically verified */
-    err = stage_bundle_files(store_dir, &prev_b, target_dir, prev_hex);
-    if (err != FP_OK) { release_target_lock(lfd); return err; }
-
-    int has_sql = 0;
-    uint64_t total_cs = 0;
-    for (uint16_t i = 0; i < cur_b.entry_count; i++) {
-        if (cur_b.entries[i].role == FP_ROLE_SQLITE_CHANGESET) {
-            has_sql = 1;
-            if (cur_b.entries[i].size > BUNDLE_MAX_CHANGESET ||
-                total_cs > BUNDLE_MAX_TOTAL_CHANGESETS - cur_b.entries[i].size) {
-                release_target_lock(lfd);
-                return FP_ERR_BOUNDS;
-            }
-            total_cs += cur_b.entries[i].size;
-        }
+    if (prev_bundle_dna) {
+        err = load_and_verify_bundle(store_dir, prev_bundle_dna, &prev_b);
+        if (err != FP_OK) { release_target_lock(lfd); return err; }
+        /* Ensure previous generation files are present and cryptographically verified */
+        err = stage_bundle_files(store_dir, &prev_b, target_dir, prev_hex);
+        if (err != FP_OK) { release_target_lock(lfd); return err; }
     }
 
+    int cur_has_sql = 0;
+    for (uint16_t i = 0; i < cur_b.entry_count; i++) {
+        if (cur_b.entries[i].role == FP_ROLE_SQLITE_CHANGESET) { cur_has_sql = 1; break; }
+    }
+    if (cur_has_sql && !sql_ctx) { release_target_lock(lfd); return FP_ERR_INVALID; }
+
+    /* Plan SQLite rollback chain BEFORE mutating anything (P0-05 & P0-02 idempotency!) */
+    rb_step_t *steps = NULL;
+    size_t step_cnt = 0, step_cap = 0;
+    int need_sql_rb = 0;
     uint64_t target_seq = 0;
-    if (has_sql) {
-        if (!sql_ctx) { release_target_lock(lfd); return FP_ERR_INVALID; }
+
+    if (sql_ctx) {
         uint64_t pre_seq = 0;
         char pre_dna[65];
         err = read_progress(sql_ctx, &pre_seq, pre_dna);
         if (err != FP_OK) { release_target_lock(lfd); return err; }
-        if (pre_seq == 0 || strcmp(pre_dna, cur_hex) != 0) {
-            release_target_lock(lfd);
-            return FP_ERR_CHAIN;
+
+        if ((prev_bundle_dna && strcmp(pre_dna, prev_hex) == 0) ||
+            (!prev_bundle_dna && pre_seq == 0 && pre_dna[0] == '\0')) {
+            /* Already at target SQLite state (e.g. crash recovery / idempotent retry) */
+            need_sql_rb = 0;
+            target_seq = pre_seq;
+        } else if (cur_has_sql || strcmp(pre_dna, cur_hex) == 0) {
+            if (pre_seq == 0 || strcmp(pre_dna, cur_hex) != 0) {
+                release_target_lock(lfd);
+                return FP_ERR_CHAIN;
+            }
+            need_sql_rb = 1;
+            uint64_t walk_seq = pre_seq;
+            char walk_dna[65];
+            memcpy(walk_dna, pre_dna, sizeof(walk_dna));
+            uint64_t total_cs = 0;
+
+            while (strcmp(walk_dna, prev_hex) != 0) {
+                if (step_cnt >= 64u) { err = FP_ERR_BOUNDS; break; }
+                char next_prev_dna[65];
+                uint64_t next_prev_seq = 0;
+                int found = lookup_sql_history_by_seq_dna(sql_ctx, walk_seq, walk_dna,
+                                                          next_prev_dna, &next_prev_seq);
+                if (found < 0) { err = FP_ERR_IO; break; }
+                if (found == 0) {
+                    /* Fail closed if history is missing (prevents silent multi-step SQLite divergence!) */
+                    err = FP_ERR_CHAIN;
+                    break;
+                }
+                fp_dna_t wdna;
+                if (fp_hex_decode(walk_dna, wdna.bytes, FP_DNA_LEN) != FP_OK) {
+                    err = FP_ERR_INTEGRITY;
+                    break;
+                }
+                fp_bundle_t wb;
+                err = load_and_verify_bundle(store_dir, &wdna, &wb);
+                if (err != FP_OK) break;
+
+                for (uint16_t i = 0; i < wb.entry_count; i++) {
+                    if (wb.entries[i].role == FP_ROLE_SQLITE_CHANGESET) {
+                        if (wb.entries[i].size > BUNDLE_MAX_CHANGESET ||
+                            total_cs > BUNDLE_MAX_TOTAL_CHANGESETS - wb.entries[i].size) {
+                            err = FP_ERR_BOUNDS;
+                            break;
+                        }
+                        total_cs += wb.entries[i].size;
+                    }
+                }
+                if (err != FP_OK) break;
+
+                if (step_cnt == step_cap) {
+                    size_t nc = step_cap ? step_cap * 2u : 4u;
+                    rb_step_t *ns = realloc(steps, nc * sizeof(*ns));
+                    if (!ns) { err = FP_ERR_NOMEM; break; }
+                    steps = ns;
+                    step_cap = nc;
+                }
+                steps[step_cnt].seq = walk_seq;
+                memcpy(steps[step_cnt].dna_hex, walk_dna, 65);
+                steps[step_cnt].b = wb;
+                step_cnt++;
+
+                walk_seq = next_prev_seq;
+                memcpy(walk_dna, next_prev_dna, 65);
+                if (walk_seq == 0 && walk_dna[0] == '\0') break;
+            }
+            if (err == FP_OK && strcmp(walk_dna, prev_hex) != 0) {
+                err = FP_ERR_CHAIN; /* Requested rollback target is not an ancestor in SQLite history! */
+            }
+            if (err != FP_OK) {
+                free(steps);
+                release_target_lock(lfd);
+                return err;
+            }
+            target_seq = walk_seq;
         }
-        target_seq = pre_seq - 1u;
     }
 
     /* P0-01: Persist ROLLBACK_PENDING intent BEFORE SQLite COMMIT so any crash recovers forward! */
-    err = tx_journal_write(target_dir, "ROLLBACK_PENDING", target_seq, prev_hex, has_sql);
-    if (err != FP_OK) { release_target_lock(lfd); return err; }
+    err = tx_journal_write(target_dir, "ROLLBACK_PENDING", target_seq, journal_dna_hex, need_sql_rb);
+    if (err != FP_OK) { free(steps); release_target_lock(lfd); return err; }
 
-    if (has_sql) {
+    if (need_sql_rb && step_cnt > 0) {
         if (sqlite3_exec(sql_ctx->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+            free(steps);
             release_target_lock(lfd);
             return FP_ERR_IO;
         }
         uint64_t seq = 0;
         char active_dna[65];
         err = read_progress(sql_ctx, &seq, active_dna);
-        if (err == FP_OK && (seq == 0 || strcmp(active_dna, cur_hex) != 0)) {
+        if (err == FP_OK && (seq != steps[0].seq || strcmp(active_dna, steps[0].dna_hex) != 0)) {
             err = FP_ERR_CHAIN;
         }
-        /* Invert and apply each changeset in reverse order */
-        for (int i = (int)cur_b.entry_count - 1; i >= 0 && err == FP_OK; i--) {
-            if (cur_b.entries[i].role != FP_ROLE_SQLITE_CHANGESET) continue;
-            uint8_t *cs = NULL;
-            size_t cs_len = 0;
-            err = fp_store_get_object(store_dir, &cur_b.entries[i].dna, BUNDLE_MAX_CHANGESET,
-                                      &cs, &cs_len);
-            if (err != FP_OK) break;
+        /* Invert and apply each bundle in reverse chain order (V4 -> V3 -> V2) inside ONE transaction */
+        for (size_t s = 0; s < step_cnt && err == FP_OK; s++) {
+            const fp_bundle_t *sb = &steps[s].b;
+            for (int i = (int)sb->entry_count - 1; i >= 0 && err == FP_OK; i--) {
+                if (sb->entries[i].role != FP_ROLE_SQLITE_CHANGESET) continue;
+                uint8_t *cs = NULL;
+                size_t cs_len = 0;
+                err = fp_store_get_object(store_dir, &sb->entries[i].dna, BUNDLE_MAX_CHANGESET,
+                                          &cs, &cs_len);
+                if (err != FP_OK) break;
 
-            int inv_len = 0;
-            void *inv = NULL;
-            int rc = sqlite3changeset_invert((int)cs_len, cs, &inv_len, &inv);
-            free(cs);
-            if (rc != SQLITE_OK) { err = FP_ERR_INTEGRITY; break; }
+                int inv_len = 0;
+                void *inv = NULL;
+                int rc = sqlite3changeset_invert((int)cs_len, cs, &inv_len, &inv);
+                free(cs);
+                if (rc != SQLITE_OK) { err = FP_ERR_INTEGRITY; break; }
 
-            rc = sqlite3changeset_apply(sql_ctx->db, inv_len, inv,
-                                        filter_table, conflict_abort,
-                                        (void *)cur_b.entries[i].path);
-            sqlite3_free(inv);
-            if (rc != SQLITE_OK) { err = FP_ERR_INTEGRITY; break; }
+                rc = sqlite3changeset_apply(sql_ctx->db, inv_len, inv,
+                                            filter_table, conflict_abort,
+                                            (void *)sb->entries[i].path);
+                sqlite3_free(inv);
+                if (rc != SQLITE_OK) { err = FP_ERR_INTEGRITY; break; }
+            }
+            if (err == FP_OK) {
+                err = delete_sql_history_seq(sql_ctx, steps[s].seq);
+            }
         }
         if (err == FP_OK) {
-            target_seq = seq - 1u;
             err = write_progress(sql_ctx, target_seq, prev_hex);
         }
         if (err == FP_OK) {
@@ -1169,14 +1358,33 @@ fp_err_t fp_bundle_rollback(const char *store_dir,
         } else {
             (void)sqlite3_exec(sql_ctx->db, "ROLLBACK", NULL, NULL, NULL);
         }
-        if (err != FP_OK) { release_target_lock(lfd); return err; }
+        if (err != FP_OK) { free(steps); release_target_lock(lfd); return err; }
     }
+    free(steps);
 
-    char rel[128];
-    snprintf(rel, sizeof(rel), "gen/%s", prev_hex);
-    err = atomic_flip_current(target_dir, rel);
-    if (err == FP_OK) {
-        err = tx_journal_write(target_dir, "COMMITTED", target_seq, prev_hex, has_sql);
+    if (prev_bundle_dna) {
+        char rel[128];
+        snprintf(rel, sizeof(rel), "gen/%s", prev_hex);
+        err = atomic_flip_current(target_dir, rel);
+        if (err == FP_OK) {
+            err = tx_journal_write(target_dir, "COMMITTED", target_seq, prev_hex, need_sql_rb);
+        }
+    } else {
+        char cur_link[PATH_MAX];
+        if (snprintf(cur_link, sizeof(cur_link), "%s/current", target_dir) >= (int)sizeof(cur_link)) {
+            err = FP_ERR_BOUNDS;
+        } else if (unlink(cur_link) != 0 && errno != ENOENT) {
+            err = FP_ERR_IO;
+        } else {
+            err = sync_dir_path(target_dir);
+        }
+        if (err == FP_OK) {
+            char jpath[PATH_MAX];
+            if (snprintf(jpath, sizeof(jpath), "%s/.sf_tx_journal", target_dir) < (int)sizeof(jpath)) {
+                if (unlink(jpath) != 0 && errno != ENOENT) err = FP_ERR_IO;
+                else (void)sync_dir_path(target_dir);
+            }
+        }
     }
     release_target_lock(lfd);
     return err;

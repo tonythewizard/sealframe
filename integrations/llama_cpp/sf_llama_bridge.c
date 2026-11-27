@@ -90,7 +90,43 @@ enum {
 #define BR_PROTO_VER     4u
 #define BR_GGML_CMD_MAX  16u
 #define BR_CAP_ALL       0x000000FFu /* SFT1|TOPK|ZSTD|DEDUP|ZERO|PIPE0RTT|ALLOC_CACHE|OUTLIER_GUARD */
-#define BR_ABI_FINGERPRINT ((uint16_t)(((GGML_RPC_TENSOR_LEN & 0x3FFu) ^ (GGML_RPC_NAME_OFF << 3) ^ (GGML_RPC_NAME_LEN << 7) ^ (BR_GGML_CMD_MAX << 11)) & 0xFFFFu))
+
+/* AI-02: Full normative ABI schema digest (BLAKE3 over protocol ver, tensor layout, command table, dtypes) */
+static uint16_t br_abi_fingerprint(void) {
+    static const char schema[] =
+        "SFLB_ABI_V4|TENSOR_LEN=296|NAME_OFF=228|NAME_LEN=64|CMD_MAX=16|"
+        "CMDS=ALLOC0:ALIGN1:MAX2:BASE3:FREE4:CLR5:SET6:SETH7:GET8:CPY9:CMP10:MEM11:INIT12:ASZ13:HLO14:CNT15:RCMP16|"
+        "F32=0|CAPS=000000FF";
+    uint8_t digest[32];
+    blake3_hasher h;
+    blake3_hasher_init(&h);
+    blake3_hasher_update(&h, schema, sizeof(schema) - 1u);
+    blake3_hasher_finalize(&h, digest, sizeof(digest));
+    uint16_t fp = (uint16_t)(((uint16_t)digest[0] << 8) | digest[1]);
+    return fp ? fp : 1u;
+}
+
+/* AI-03: Normative ggml-rpc command validator — never trust peer-declared expect_resp blindly! */
+static int br_validate_rpc_cmd(uint8_t cmd, uint8_t expect_resp, size_t rpc_len, int strict_lossless) {
+    if (cmd > BR_GGML_CMD_MAX) return 0;
+    if (strict_lossless && (expect_resp == 2u || expect_resp == 3u)) return 0;
+    switch (cmd) {
+        case GGML_RPC_SET_TENSOR:
+            return expect_resp == 0u && rpc_len >= GGML_RPC_TENSOR_LEN + 8u;
+        case GGML_RPC_GRAPH_COMPUTE:
+        case GGML_RPC_GRAPH_RECOMPUTE:
+            return expect_resp == 0u;
+        case GGML_RPC_FREE_BUFFER:
+        case GGML_RPC_BUFFER_CLEAR:
+        case GGML_RPC_INIT_TENSOR:
+            return (expect_resp == 1u || expect_resp == 4u);
+        case GGML_RPC_GET_TENSOR:
+            return (expect_resp == 1u || expect_resp == 2u || expect_resp == 3u) &&
+                   rpc_len >= GGML_RPC_TENSOR_LEN + 16u;
+        default:
+            return expect_resp == 1u;
+    }
+}
 
 static int buf_is_all_zero(const uint8_t *p, size_t n) {
     size_t i = 0;
@@ -647,7 +683,7 @@ static fp_err_t run_client_session(int local_cli_fd, sf_split_transport_t tr,
         hlo[14] = (uint8_t)st->wire_cast;
         hlo[15] = (uint8_t)(st->strict_lossless ? 1u : 0u);
         put_be16(hlo + 16, st->logits_topk);
-        put_be16(hlo + 18, BR_ABI_FINGERPRINT);
+        put_be16(hlo + 18, br_abi_fingerprint());
         fp_err_t herr = tun_send(tr, ts, us, BR_TAG_HELLO, hlo, sizeof(hlo), NULL);
         if (herr != FP_OK) return herr;
     }
@@ -959,7 +995,7 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
             uint16_t cmax = get_be16(msg + 8);
             uint16_t afp  = get_be16(msg + 18);
             if (pver != BR_PROTO_VER || hlen != (uint16_t)st->rpc_tensor_hdr_len ||
-                cmax > BR_GGML_CMD_MAX || (afp != 0u && afp != BR_ABI_FINGERPRINT)) {
+                cmax > BR_GGML_CMD_MAX || afp != br_abi_fingerprint()) {
                 free(msg);
                 return FP_ERR_POLICY;
             }
@@ -1070,7 +1106,7 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
             free(msg);
             return FP_ERR_INVALID;
         }
-        if (st->strict_lossless && (expect_resp == 2u || expect_resp == 3u)) {
+        if (!br_validate_rpc_cmd(cmd, expect_resp, rpc_len, st->strict_lossless)) {
             free(alloc_payload); free(msg);
             return FP_ERR_POLICY;
         }
@@ -1603,7 +1639,7 @@ int main(int argc, char **argv) {
     uint16_t logits_topk = 64u;
     double wan_rtt_ms = 0.0, wan_jitter_ms = 0.0, wan_p99_ms = 0.0;
     double wan_ul_mbps = 0.0, wan_dl_mbps = 0.0, wan_tcp_loss_pct = 0.0;
-    int do_selftest = 0, once = 0, enable_zstd = 1, strict_lossless = 0;
+    int do_selftest = 0, once = 0, enable_zstd = 1, strict_lossless = 0, allow_any_peer = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--keygen") == 0 && i + 1 < argc) {
@@ -1618,6 +1654,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--once") == 0) { once = 1; }
         else if (strcmp(argv[i], "--no-zstd") == 0) { enable_zstd = 0; }
         else if (strcmp(argv[i], "--strict-lossless") == 0) { strict_lossless = 1; }
+        else if (strcmp(argv[i], "--allow-any-peer") == 0) { allow_any_peer = 1; }
         else if (strcmp(argv[i], "--role") == 0 && i + 1 < argc) { role = argv[++i]; }
         else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) { keyfile = argv[++i]; }
         else if (strcmp(argv[i], "--cache-dir") == 0 && i + 1 < argc) { cache_dir = argv[++i]; }
@@ -1659,7 +1696,18 @@ int main(int argc, char **argv) {
         peer_pin = peer_pk;
     }
 
+    int exit_rc = 0;
     if (strcmp(role, "server") == 0) {
+        /* SEC-07: Fail closed on server unless --allow-pk/--peer-pk OR explicit --allow-any-peer is provided */
+        if (!peer_pin && !allow_any_peer) {
+            fprintf(stderr, "sf-llama-bridge [SERVER]: --allow-pk/--peer-pk is required by default "
+                            "(or pass --allow-any-peer for isolated lab testing)\n");
+            sodium_memzero(&kp, sizeof(kp));
+            return 1;
+        }
+        if (allow_any_peer && !peer_pin) {
+            fprintf(stderr, "sf-llama-bridge [SERVER]: WARNING: --allow-any-peer active (unauthenticated client keys allowed)\n");
+        }
         int tun_fd = (tr == SF_SPLIT_TCP) ? fp_net_listen(bind_ip, port, NULL)
                                           : fp_udp_bind(bind_ip, port, NULL);
         if (tun_fd < 0) { fprintf(stderr, "Failed to bind %s:%u\n", bind_ip, (unsigned)port); return 1; }
@@ -1671,7 +1719,7 @@ int main(int argc, char **argv) {
             fp_err_t err = (tr == SF_SPLIT_TCP)
                                ? fp_session_accept(tun_fd, &kp, peer_pin, 600000, &ts)
                                : fp_udp_session_accept(tun_fd, &kp, peer_pin, 600000, drop_pct, &us);
-            if (err != FP_OK) { if (once) break; continue; }
+            if (err != FP_OK) { if (once) { exit_rc = 1; break; } continue; }
             if (us) fp_udp_session_set_fec(us, fec_mode);
             int bfd = tcp_connect_local(backend_ip, backend_port);
             if (bfd >= 0) {
@@ -1681,8 +1729,16 @@ int main(int argc, char **argv) {
                 st.rpc_tensor_hdr_len = GGML_RPC_TENSOR_LEN;
                 st.enable_zstd = enable_zstd; st.strict_lossless = strict_lossless; st.cache_dir = cache_dir;
                 st.logits_topk = logits_topk;
-                (void)run_server_session(bfd, tr, ts, us, &st);
+                fp_err_t serr = run_server_session(bfd, tr, ts, us, &st);
+                if (serr != FP_OK) {
+                    fprintf(stderr, "sf-llama-bridge [SERVER] session failed: %s\n", fp_strerror(serr));
+                    if (once) exit_rc = 1;
+                }
                 close(bfd);
+            } else {
+                fprintf(stderr, "sf-llama-bridge [SERVER] backend connect failed (%s:%u)\n",
+                        backend_ip, (unsigned)backend_port);
+                if (once) exit_rc = 1;
             }
             if (ts) fp_session_close(ts);
             if (us) fp_udp_session_close(us);
@@ -1720,10 +1776,19 @@ int main(int argc, char **argv) {
                 st.wan_ul_mbps = wan_ul_mbps; st.wan_dl_mbps = wan_dl_mbps;
                 st.wan_tcp_loss_pct = wan_tcp_loss_pct;
                 st.wan_rng = UINT64_C(0x9E3779B97F4A7C15) ^ (uint64_t)remote_port;
-                (void)run_client_session(cfd, tr, ts, us, &st);
-                seal_and_report_session(&st, &kp, keryx_ws);
+                fp_err_t cerr = run_client_session(cfd, tr, ts, us, &st);
+                if (cerr == FP_OK) {
+                    seal_and_report_session(&st, &kp, keryx_ws);
+                } else {
+                    fprintf(stderr, "sf-llama-bridge [CLIENT] session failed (%s) — skipping success receipt\n",
+                            fp_strerror(cerr));
+                    if (once) exit_rc = 1;
+                }
                 if (ts) fp_session_close(ts);
                 if (us) fp_udp_session_close(us);
+            } else {
+                fprintf(stderr, "sf-llama-bridge [CLIENT] connect failed (%s)\n", fp_strerror(err));
+                if (once) exit_rc = 1;
             }
             close(cfd);
             if (once) break;
@@ -1731,5 +1796,5 @@ int main(int argc, char **argv) {
         close(lfd);
     }
     sodium_memzero(&kp, sizeof(kp));
-    return 0;
+    return exit_rc;
 }

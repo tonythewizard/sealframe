@@ -699,6 +699,7 @@ typedef struct {
     int             require_signed_hb;
     int             require_enrolled;
     int             require_quorum;
+    int             require_admin_read_auth;
     sqlite3        *db;
     pthread_mutex_t mu;
     pthread_mutex_t w_mu;
@@ -739,7 +740,8 @@ static int db_table_has_col(sqlite3 *db, const char *table_name, const char *col
 
 static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_path,
                          const char *explicit_tok, int require_signed_hb,
-                         int require_enrolled, int require_quorum) {
+                         int require_enrolled, int require_quorum,
+                         int require_admin_read_auth) {
     memset(st, 0, sizeof(*st));
     pthread_mutex_init(&st->mu, NULL);
     pthread_mutex_init(&st->w_mu, NULL);
@@ -747,6 +749,7 @@ static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_
     st->require_signed_hb = require_signed_hb;
     st->require_enrolled = require_enrolled;
     st->require_quorum = require_quorum;
+    st->require_admin_read_auth = require_admin_read_auth;
 
     if (mkdir_p(data_dir) != 0) return -1;
     if (!realpath(data_dir, st->data_dir)) {
@@ -950,30 +953,33 @@ static int check_admin_bearer(const cp_state_t *st, const char *auth) {
     return sodium_memcmp(s, st->admin_token, tlen) == 0;
 }
 
-static void db_append_audit(sqlite3 *db, const char *dev_id, const char *ip, const char *ch,
-                            const char *outcome, int64_t active_serial, const char *detail,
-                            int auth_verified, const char *utc) {
+/* SEC-03/SEC-04: Propagate audit write errors fail-closed + retain 50,000 events */
+static int db_append_audit(sqlite3 *db, const char *dev_id, const char *ip, const char *ch,
+                           const char *outcome, int64_t active_serial, const char *detail,
+                           int auth_verified, const char *utc) {
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(
+    int rc = sqlite3_prepare_v2(
             db,
             "INSERT INTO audit_log(device_id,ip,channel,outcome,active_serial,detail,auth_verified,last_seen_utc) "
             "VALUES(?,?,?,?,?,?,?,?);",
-            -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, dev_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, ip, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, ch, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 4, outcome, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 5, active_serial);
-        sqlite3_bind_text(stmt, 6, detail, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(stmt, 7, auth_verified ? 1 : 0);
-        sqlite3_bind_text(stmt, 8, utc, -1, SQLITE_TRANSIENT);
-        (void)sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-    }
+            -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, dev_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, ip, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, ch, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, outcome, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 5, active_serial);
+    sqlite3_bind_text(stmt, 6, detail, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 7, auth_verified ? 1 : 0);
+    sqlite3_bind_text(stmt, 8, utc, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return -1;
     (void)sqlite3_exec(
         db,
-        "DELETE FROM audit_log WHERE id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT 500);",
+        "DELETE FROM audit_log WHERE id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT 50000);",
         NULL, NULL, NULL);
+    return 0;
 }
 
 static int cp_record_heartbeat(cp_state_t *st, const char *ip, const jval_t *body,
@@ -1187,7 +1193,13 @@ static int cp_record_heartbeat(cp_state_t *st, const char *ip, const jval_t *bod
         snprintf(err_msg, err_cap, "database heartbeat write failed");
         return -1;
     }
-    db_append_audit(st->db, dev_id, ip, channel, outcome, active_serial, detail, auth_ok, utc);
+    if (db_append_audit(st->db, dev_id, ip, channel, outcome, active_serial, detail, auth_ok, utc) != 0) {
+        (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+        pthread_mutex_unlock(&st->mu);
+        *out_http_status = 500;
+        snprintf(err_msg, err_cap, "database audit log write failed");
+        return -1;
+    }
     if (sqlite3_exec(st->db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
         (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
         pthread_mutex_unlock(&st->mu);
@@ -1307,28 +1319,24 @@ static int cp_set_channel_serial(cp_state_t *st, const char *ch, int64_t serial,
         }
     }
 
+    /* SEC-05: Single authoritative channel publication (GET /repo/latest.ev serves channels/stable/latest.ev directly!) */
+    char utc[32], detail[256];
+    utc_now(utc);
+    snprintf(detail, sizeof(detail), "%s: channel '%s' -> serial #%lld", reason, ch, (long long)serial);
     if (mkdir_p(cdir) != 0 || copy_file_atomic(src, dst) != 0) {
         pthread_mutex_unlock(&st->mu);
         *out_http_status = 500;
         snprintf(msg, msg_cap, "failed to write channel latest.ev");
         return -1;
     }
-    if (strcmp(ch, "stable") == 0) {
-        char root_latest[PATH_MAX];
-        if (snprintf(root_latest, sizeof(root_latest), "%s/latest.ev", st->repo_dir) >= (int)sizeof(root_latest) ||
-            copy_file_atomic(src, root_latest) != 0) {
-            pthread_mutex_unlock(&st->mu);
-            *out_http_status = 500;
-            snprintf(msg, msg_cap, "failed to write root latest.ev");
-            return -1;
-        }
+    if (db_append_audit(st->db, "CONTROL_PLANE", "admin", ch,
+                        is_emergency_rollback ? "EMERGENCY_ROLLBACK" : "CHANNEL_SET",
+                        serial, detail, 1, utc) != 0) {
+        pthread_mutex_unlock(&st->mu);
+        *out_http_status = 500;
+        snprintf(msg, msg_cap, "channel updated but audit log write failed");
+        return -1;
     }
-    char utc[32], detail[256];
-    utc_now(utc);
-    snprintf(detail, sizeof(detail), "%s: channel '%s' -> serial #%lld", reason, ch, (long long)serial);
-    db_append_audit(st->db, "CONTROL_PLANE", "admin", ch,
-                    is_emergency_rollback ? "EMERGENCY_ROLLBACK" : "CHANNEL_SET",
-                    serial, detail, 1, utc);
     pthread_mutex_unlock(&st->mu);
     snprintf(msg, msg_cap, "%s: channel '%s' promoted to serial %lld", reason, ch, (long long)serial);
     *out_http_status = 200;
@@ -2087,6 +2095,10 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
             return;
         }
         if (strcmp(path, "/api/v1/fleet") == 0) {
+            if (st->require_admin_read_auth && !check_admin_bearer(st, hdr_auth)) {
+                send_json(cfd, 401, "{\"ok\":false,\"error\":\"unauthorized: valid Bearer token required\"}");
+                return;
+            }
             sbuf_t jb;
             sb_init(&jb, 512);
             sb_puts(&jb, "{\"devices\":");
@@ -2099,6 +2111,10 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
             return;
         }
         if (strcmp(path, "/api/v1/approvals") == 0) {
+            if (st->require_admin_read_auth && !check_admin_bearer(st, hdr_auth)) {
+                send_json(cfd, 401, "{\"ok\":false,\"error\":\"unauthorized: valid Bearer token required\"}");
+                return;
+            }
             sbuf_t jb;
             sb_init(&jb, 512);
             sb_puts(&jb, "{\"approvals\":");
@@ -2111,6 +2127,10 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
             return;
         }
         if (strcmp(path, "/api/v1/audit/cra") == 0) {
+            if (st->require_admin_read_auth && !check_admin_bearer(st, hdr_auth)) {
+                send_json(cfd, 401, "{\"ok\":false,\"error\":\"unauthorized: valid Bearer token required\"}");
+                return;
+            }
             sbuf_t jb;
             sb_init(&jb, 4096);
             cp_build_cra_json(st, &jb);
@@ -2119,6 +2139,10 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
             return;
         }
         if (strcmp(path, "/api/v1/audit/cra.html") == 0) {
+            if (st->require_admin_read_auth && !check_admin_bearer(st, hdr_auth)) {
+                send_json(cfd, 401, "{\"ok\":false,\"error\":\"unauthorized: valid Bearer token required\"}");
+                return;
+            }
             sbuf_t hb;
             sb_init(&hb, 4096);
             cp_build_cra_html(st, &hb);
@@ -2151,8 +2175,15 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
             }
         }
         if (strcmp(path, "/repo/latest.ev") == 0) {
-            if (snprintf(fpath, sizeof(fpath), "%s/latest.ev", st->repo_dir) >= (int)sizeof(fpath)) {
+            /* SEC-05: Serve single authoritative stable channel pointer directly (zero dual-write split-brain) */
+            if (snprintf(fpath, sizeof(fpath), "%s/stable/latest.ev", st->chan_dir) >= (int)sizeof(fpath)) {
                 send_text(cfd, 404, "not found"); return;
+            }
+            struct stat lsb;
+            if (stat(fpath, &lsb) != 0) {
+                if (snprintf(fpath, sizeof(fpath), "%s/latest.ev", st->repo_dir) >= (int)sizeof(fpath)) {
+                    send_text(cfd, 404, "not found"); return;
+                }
             }
             serve_file_with_range(cfd, fpath, hdr_range);
             return;
@@ -2338,7 +2369,12 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 }
                 char det[256];
                 snprintf(det, sizeof(det), "Enrolled Ed25519 pubkey %.16s... for %s", pk_hex, dev_id);
-                db_append_audit(st->db, dev_id, "admin", "enrollment", "DEVICE_ENROLLED", 0, det, 1, utc);
+                if (db_append_audit(st->db, dev_id, "admin", "enrollment", "DEVICE_ENROLLED", 0, det, 1, utc) != 0) {
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database audit write failed\"}");
+                    return;
+                }
                 pthread_mutex_unlock(&st->mu);
                 sbuf_t resp;
                 sb_init(&resp, 192);
@@ -2393,7 +2429,12 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 }
                 char det[256];
                 snprintf(det, sizeof(det), "Registered Ed25519 approver %s (%.16s...)", approver, pk_hex);
-                db_append_audit(st->db, "CONTROL_PLANE", "admin", "governance", "APPROVER_ADDED", 0, det, 1, utc);
+                if (db_append_audit(st->db, "CONTROL_PLANE", "admin", "governance", "APPROVER_ADDED", 0, det, 1, utc) != 0) {
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database audit write failed\"}");
+                    return;
+                }
                 pthread_mutex_unlock(&st->mu);
                 sbuf_t resp;
                 sb_init(&resp, 192);
@@ -2517,9 +2558,14 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 snprintf(dev_tag, sizeof(dev_tag), "APPROVER:%s", approver);
                 snprintf(det, sizeof(det), "Ed25519-verified approval %d/%d for %s#%lld: %s",
                          cnt, thr, ch, (long long)serial, reason);
-                db_append_audit(st->db, dev_tag, "admin", ch,
-                                (cnt >= thr) ? "QUORUM_MET" : "APPROVED_PARTIAL",
-                                serial, det, 1, utc);
+                if (db_append_audit(st->db, dev_tag, "admin", ch,
+                                    (cnt >= thr) ? "QUORUM_MET" : "APPROVED_PARTIAL",
+                                    serial, det, 1, utc) != 0) {
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database audit write failed\"}");
+                    return;
+                }
                 sbuf_t resp;
                 sb_init(&resp, 256);
                 sb_puts(&resp, "{\"ok\":true,\"approval\":");
@@ -2629,6 +2675,7 @@ int main(int argc, char **argv) {
     int require_signed_hb = 1;
     int require_enrolled = 1;
     int require_quorum = 1;
+    int require_admin_read_auth = 1;
     int insecure_dev = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -2651,6 +2698,7 @@ int main(int argc, char **argv) {
             require_signed_hb = 0;
             require_enrolled = 0;
             require_quorum = 0;
+            require_admin_read_auth = 0;
         } else if (strcmp(argv[i], "--require-signed-heartbeat") == 0) {
             require_signed_hb = 1;
         } else if (strcmp(argv[i], "--require-enrolled") == 0) {
@@ -2679,7 +2727,7 @@ int main(int argc, char **argv) {
 
     cp_state_t st;
     if (cp_state_init(&st, data_dir, sbom_path, admin_tok, require_signed_hb,
-                      require_enrolled, require_quorum) != 0) {
+                      require_enrolled, require_quorum, require_admin_read_auth) != 0) {
         fprintf(stderr, "sf-cp: failed to initialize state in %s\n", data_dir);
         return 1;
     }
