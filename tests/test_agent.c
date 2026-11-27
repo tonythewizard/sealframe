@@ -23,6 +23,7 @@ typedef struct {
     const char *repo_dir;
     _Atomic int stop;
     _Atomic int corrupt_next_obj;
+    _Atomic int bad_range_next;
     _Atomic int heartbeats_received;
     _Atomic int signed_heartbeats_verified;
 } mini_http_t;
@@ -140,8 +141,15 @@ static void *mini_http_thread(void *arg) {
             unsigned long off = strtoul(rng + 13, NULL, 10);
             if (off < fsz) {
                 char extra[128];
-                snprintf(extra, sizeof(extra), "Content-Range: bytes %lu-%zu/%zu\r\n",
-                         off, fsz - 1u, fsz);
+                if (s->bad_range_next) {
+                    s->bad_range_next = 0;
+                    /* SEC-06 adversarial test: lie about start offset in Content-Range! */
+                    snprintf(extra, sizeof(extra), "Content-Range: bytes 0-%zu/%zu\r\n",
+                             fsz - off - 1u, fsz);
+                } else {
+                    snprintf(extra, sizeof(extra), "Content-Range: bytes %lu-%zu/%zu\r\n",
+                             off, fsz - 1u, fsz);
+                }
                 send_http_simple(cfd, 206, "application/octet-stream", data + off, fsz - off, extra);
                 free(data);
                 close(cfd);
@@ -317,12 +325,17 @@ int main(void) {
         snprintf(sdir, sizeof(sdir), "%s/staging", edge_store);
         assert(mkdir(edge_store, 0700) == 0 && mkdir(sdir, 0700) == 0);
         snprintf(spath, sizeof(spath), "%s/%s.http", sdir, hex);
-        /* Pre-stage first 30,000 bytes -> MUST resume via HTTP 206! */
+        /* Pre-stage first 30,000 bytes -> SEC-06: mismatched Content-Range MUST fail closed first! */
         write_bytes_file(spath, blob, 30000);
         uint64_t resumed = 0;
+        srv.bad_range_next = 1;
+        assert(fp_http_pull_object(ourl, edge_store, &bdna, sizeof(blob), 5000, &resumed) == FP_ERR_INTEGRITY);
+        assert(!fp_store_has_object(edge_store, &bdna, NULL));
+
+        /* Now with valid Content-Range -> MUST resume via HTTP 206 cleanly! */
         assert(fp_http_pull_object(ourl, edge_store, &bdna, sizeof(blob), 5000, &resumed) == FP_OK);
         assert(resumed == 30000);
-        printf("[PASS] HTTP/1.1 206 Partial Content Range resume (30000 B resumed + BLAKE3 verified)\n");
+        printf("[PASS] HTTP/1.1 206 Partial Content Range resume + SEC-06 Content-Range offset verification\n");
 
         /* Corrupted HTTP body MUST fail closed with FP_ERR_INTEGRITY */
         blob[0] ^= 0xAAu;

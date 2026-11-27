@@ -235,6 +235,10 @@ int fp_udp_bind(const char *bind_addr, uint16_t port, uint16_t *out_port) {
 
 /* --- UDP Server (multi-session anti-DoS, stateless retry cookie, AEAD path validation) --- */
 
+/* RES-01: Keep Merkle tree in RAM for objects <= 1 GiB (~4 MiB RAM, nanosecond proofs);
+ * automatically stream proofs from .fpm index file in O(1) RAM for multi-GiB objects. */
+#define UDP_MERKLE_RAM_THRESHOLD (1024ull << 20)
+
 typedef struct {
     int                active;
     uint64_t           sid;
@@ -250,6 +254,7 @@ typedef struct {
     uint64_t           obj_len;
     uint64_t           total_chunks;
     fp_merkle_tree_t  *tree;
+    char               idx_path[PATH_MAX];
     struct sockaddr_in validated_peer;
     int                path_pending;
     struct sockaddr_in pending_peer;
@@ -466,6 +471,8 @@ fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
                 continue;
             }
             uint64_t total_chunks = obj_len > 0 ? (obj_len + FP_CHUNK_SIZE - 1u) / FP_CHUNK_SIZE : 0;
+            char idx_path[PATH_MAX];
+            idx_path[0] = '\0';
             fp_merkle_tree_t *tree = total_chunks > 0
                 ? fp_merkle_tree_build_file_cached(obj_path, &target_dna, NULL) : NULL;
             if (total_chunks > 0) {
@@ -473,6 +480,12 @@ fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
                 fp_dna_t check = fp_merkle_tree_dna(tree);
                 if (!fp_dna_equal(&check, &target_dna)) {
                     fp_merkle_tree_free(tree); close(obj_fd); continue;
+                }
+                if (obj_len > UDP_MERKLE_RAM_THRESHOLD &&
+                    snprintf(idx_path, sizeof(idx_path), "%s.fpm", obj_path) < (int)sizeof(idx_path)) {
+                    /* Object > 1 GiB: drop in-RAM Merkle tree and prove directly from verified .fpm in O(1) RAM */
+                    fp_merkle_tree_free(tree);
+                    tree = NULL;
                 }
             }
 
@@ -508,6 +521,7 @@ fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
             s->obj_len = obj_len;
             s->total_chunks = total_chunks;
             s->tree = tree;
+            snprintf(s->idx_path, sizeof(s->idx_path), "%s", idx_path);
             s->validated_peer = peer;
             s->path_pending = 0;
             s->last_active_ns = tnow;
@@ -596,7 +610,10 @@ fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
             if (ci >= s->total_chunks) continue;
 
             fp_merkle_proof_t proof;
-            if (fp_merkle_tree_prove(s->tree, ci, &proof) != FP_OK) continue;
+            fp_err_t perr = s->tree
+                ? fp_merkle_tree_prove(s->tree, ci, &proof)
+                : fp_merkle_prove_from_index_file(s->idx_path, ci, &proof);
+            if (perr != FP_OK) continue;
             uint8_t raw_chunk[FP_CHUNK_SIZE];
             if (udp_pread_exact(s->obj_fd, raw_chunk, proof.chunk_len,
                                 (off_t)(ci * FP_CHUNK_SIZE)) != FP_OK) {
@@ -1068,16 +1085,21 @@ fp_err_t fp_udp_pull(const fp_udp_pull_cfg_t *cfg, fp_udp_stats_t *out_stats) {
 #define UDP_SESS_MAX_FRAGS    32768u /* Up to ~37 MiB per verified tensor message */
 
 enum {
-    U_SESS_FRAG  = 10,
-    U_SESS_ACK   = 11,
-    U_SESS_CLOSE = 12,
-    U_SESS_FEC   = 13
+    U_SESS_FRAG      = 10,
+    U_SESS_ACK       = 11,
+    U_SESS_CLOSE     = 12,
+    U_SESS_FEC       = 13,
+    U_SESS_PATH_CHAL = 14,
+    U_SESS_PATH_RESP = 15
 };
 
 struct fp_udp_session {
     int                fd;
     int                owns_fd;
     struct sockaddr_in peer;
+    int                path_pending;
+    struct sockaddr_in pending_peer;
+    uint8_t            path_challenge[16];
     uint64_t           sid;
     uint8_t            tx_key[32];
     uint8_t            rx_key[32];
@@ -1137,8 +1159,42 @@ static int udp_sess_recv_pkt(fp_udp_session_t *s, int wait_ms,
     if (!udp_replay_accept(seq, &s->rx_max_seq, &s->rx_bitmap)) {
         return 0; /* Drop replay */
     }
-    s->peer = from; /* Seamless NAT / port migration */
     s->rx_bytes += (uint64_t)n;
+
+    /* Transparent AEAD path validation responder (0 overhead on validated fast path) */
+    if (*out_type == U_SESS_PATH_CHAL && *out_pt_len == 16u) {
+        uint8_t rp[UDP_MAX_DATAGRAM];
+        size_t rlen = seal_udp_packet(rp, U_SESS_PATH_RESP, s->sid, s->tx_seq++,
+                                      s->tx_key, out_pt, 16u);
+        (void)sendto(s->fd, rp, rlen, 0, (const struct sockaddr *)&from, sizeof(from));
+        s->tx_bytes += rlen;
+        return 0;
+    }
+
+    /* SEC-01: Never switch s->peer on unvalidated IP/port change (prevents spoofed traffic redirection) */
+    if (!peer_equal(&from, &s->peer)) {
+        if (*out_type == U_SESS_PATH_RESP && *out_pt_len == 16u && s->path_pending &&
+            peer_equal(&from, &s->pending_peer) &&
+            sodium_memcmp(out_pt, s->path_challenge, 16u) == 0) {
+            s->peer = from;
+            s->path_pending = 0;
+            return 0;
+        }
+        if (*out_type == U_SESS_CLOSE) {
+            return 1;
+        }
+        if (!s->path_pending || !peer_equal(&from, &s->pending_peer)) {
+            randombytes_buf(s->path_challenge, sizeof(s->path_challenge));
+            s->pending_peer = from;
+            s->path_pending = 1;
+        }
+        uint8_t ch[UDP_MAX_DATAGRAM];
+        size_t clen = seal_udp_packet(ch, U_SESS_PATH_CHAL, s->sid, s->tx_seq++,
+                                      s->tx_key, s->path_challenge, 16u);
+        (void)sendto(s->fd, ch, clen, 0, (const struct sockaddr *)&from, sizeof(from));
+        s->tx_bytes += clen;
+        return 0;
+    }
     return 1;
 }
 
@@ -1472,6 +1528,10 @@ fp_err_t fp_udp_session_send_verified(fp_udp_session_t *sess, uint8_t tag,
     int rto_ms = 12;
     uint8_t rpt[UDP_MAX_DATAGRAM];
     int done = 0;
+    /* RES-04: Hard safety caps on retransmissions (preserves 0-RTT burst throughput, blocks NACK flood) */
+    uint64_t msg_retx_budget = (uint64_t)ftot * 8u + 128u;
+    uint64_t msg_retx_used = 0u;
+    uint32_t rto_rounds = 0u;
 
     while (!done && now_ns() < deadline) {
         uint8_t ptype = 0;
@@ -1479,11 +1539,16 @@ fp_err_t fp_udp_session_send_verified(fp_udp_session_t *sess, uint8_t tag,
         int rc = udp_sess_recv_pkt(sess, rto_ms, &ptype, rpt, &rlen);
         if (rc < 0) { err = FP_ERR_IO; break; }
         if (rc == 0) {
+            if (++rto_rounds > 128u || msg_retx_used >= msg_retx_budget) {
+                err = FP_ERR_IO;
+                break;
+            }
             /* RTO expired without ACK: retransmit up to first 32 fragments to trigger NACK/COMPLETE */
             uint32_t lim = ftot < 32u ? ftot : 32u;
-            for (uint32_t i = 0; i < lim; i++) {
+            for (uint32_t i = 0; i < lim && msg_retx_used < msg_retx_budget; i++) {
                 (void)udp_sess_send_one_frag(sess, msg_id, i, ftot, blob, blob_len);
                 sess->retransmits++;
+                msg_retx_used++;
             }
             if (rto_ms < 80) rto_ms += 8;
             continue;
@@ -1498,16 +1563,19 @@ fp_err_t fp_udp_session_send_verified(fp_udp_session_t *sess, uint8_t tag,
                 done = 1;
                 break;
             }
-            if (status == 0u && rlen == 7u + (size_t)ncnt * 4u) {
-                /* Selective fragment retransmit — only missing packets! */
+            if (status == 0u && ncnt <= UDP_SESS_MAX_NACKS && rlen == 7u + (size_t)ncnt * 4u) {
+                /* Selective fragment retransmit — only missing packets within safety budget! */
                 if (sess->fec_mode == 2 && ncnt > 0u) sess->fec_active_msgs = 64u;
                 for (uint16_t k = 0; k < ncnt; k++) {
+                    if (msg_retx_used >= msg_retx_budget) { err = FP_ERR_IO; break; }
                     uint32_t midx = get_be32(rpt + 7u + (size_t)k * 4u);
                     if (midx < ftot) {
                         (void)udp_sess_send_one_frag(sess, msg_id, midx, ftot, blob, blob_len);
                         sess->retransmits++;
+                        msg_retx_used++;
                     }
                 }
+                if (err != FP_OK) break;
                 rto_ms = 12;
             }
         }
@@ -1703,7 +1771,6 @@ fp_err_t fp_udp_session_recv_verified(fp_udp_session_t *sess, size_t max_bytes,
         }
 
         if (ftot > 0 && got_cnt == ftot) {
-            udp_sess_send_ack(sess, expected_id, 1u, NULL, 0);
             size_t blob_len = (size_t)(ftot - 1u) * UDP_SESS_FRAG_PAYLOAD + last_frag_len;
             if (blob_len < 37u) { err = FP_ERR_INVALID; break; }
             uint8_t tag = buf[0];
@@ -1723,6 +1790,8 @@ fp_err_t fp_udp_session_recv_verified(fp_udp_session_t *sess, size_t max_bytes,
             uint8_t *out = malloc(mlen > 0 ? mlen : 1u);
             if (!out) { err = FP_ERR_NOMEM; break; }
             if (mlen > 0) memcpy(out, buf + 37, mlen);
+            /* SEC-02: Emit COMPLETE ACK only AFTER BLAKE3 DNA verification & buffer allocation succeed! */
+            udp_sess_send_ack(sess, expected_id, 1u, NULL, 0);
             free(buf); free(got); free(frag_lens);
             free(fec_has); free(fec_xor_len); free(fec_buf);
             sess->rx_msg_id++;
