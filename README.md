@@ -1,6 +1,12 @@
-# SealFrame™ (`sf`) — v0.6.0
+<p align="center">
+  <img src="assets/sealframe-logo.jpg" alt="SealFrame™ Logo" width="260" />
+</p>
 
-**100% Pure ISO C11 verified content, Edge OTA, distributed split-model WAN acceleration, and EU CRA Control Plane engine.**
+<h1 align="center">SealFrame™ (<code>sf</code>) — v0.6.0</h1>
+
+<p align="center">
+  <strong>100% Pure ISO C11 verified content, Edge OTA, distributed split-model WAN acceleration, and EU CRA Control Plane engine.</strong>
+</p>
 
 Zero Python runtime dependencies. Zero C++. Zero OpenSSL. Zero `libcurl`. Vendored pure-C BLAKE3 + permissive runtime libraries (`libsodium`, `libzstd`, `libsqlite3`).
 
