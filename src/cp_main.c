@@ -700,6 +700,7 @@ typedef struct {
     int             require_enrolled;
     int             require_quorum;
     int             require_admin_read_auth;
+    int             allow_legacy_channel_files;
     sqlite3        *db;
     pthread_mutex_t mu;
     pthread_mutex_t w_mu;
@@ -741,7 +742,7 @@ static int db_table_has_col(sqlite3 *db, const char *table_name, const char *col
 static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_path,
                          const char *explicit_tok, int require_signed_hb,
                          int require_enrolled, int require_quorum,
-                         int require_admin_read_auth) {
+                         int require_admin_read_auth, int allow_legacy_channel_files) {
     memset(st, 0, sizeof(*st));
     pthread_mutex_init(&st->mu, NULL);
     pthread_mutex_init(&st->w_mu, NULL);
@@ -750,6 +751,7 @@ static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_
     st->require_enrolled = require_enrolled;
     st->require_quorum = require_quorum;
     st->require_admin_read_auth = require_admin_read_auth;
+    st->allow_legacy_channel_files = allow_legacy_channel_files;
 
     if (mkdir_p(data_dir) != 0) return -1;
     if (!realpath(data_dir, st->data_dir)) {
@@ -2009,6 +2011,7 @@ static const char *status_text(int code) {
         case 413: return "Payload Too Large";
         case 416: return "Range Not Satisfiable";
         case 500: return "Internal Server Error";
+        case 503: return "Service Unavailable";
         default:  return "Error";
     }
 }
@@ -2039,47 +2042,155 @@ static void send_json(int fd, int code, const char *json) {
     send_resp(fd, code, "application/json", json, strlen(json), NULL);
 }
 
-/* R4: Resolve authoritative channel event path from committed SQLite `channels` table (fallback to pre-existing file) */
-static int cp_resolve_channel_ev_path(cp_state_t *st, const char *ch, char out_path[PATH_MAX]) {
+/* F7: Read bounded file once (O_NOFOLLOW) into memory so hash verification and HTTP transmission use identical bytes (zero TOCTOU!) */
+static int cp_read_ev_file_once(const char *path, uint8_t **out_buf, size_t *out_len) {
+    *out_buf = NULL;
+    *out_len = 0;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size <= 0 || sb.st_size > (1 << 20)) {
+        close(fd);
+        return -1;
+    }
+    size_t sz = (size_t)sb.st_size;
+    uint8_t *buf = malloc(sz);
+    if (!buf) { close(fd); return -1; }
+    size_t got = 0;
+    while (got < sz) {
+        ssize_t r = read(fd, buf + got, sz - got);
+        if (r < 0) { if (errno == EINTR) continue; free(buf); close(fd); return -1; }
+        if (r == 0) { free(buf); close(fd); return -1; }
+        got += (size_t)r;
+    }
+    close(fd);
+    *out_buf = buf;
+    *out_len = sz;
+    return 0;
+}
+
+/* F6 + F7: Authoritative channel lookup distinguishing FOUND / NOT_FOUND / SQL_ERROR (503).
+ * Never falls back to filesystem mirror on SQLite error; verifies event_hash on the exact served buffer! */
+static int cp_load_channel_event_buf(cp_state_t *st, const char *ch,
+                                     uint8_t **out_buf, size_t *out_len) {
+    *out_buf = NULL;
+    *out_len = 0;
     int64_t ser = 0;
     char exp_hash[65];
     exp_hash[0] = '\0';
+    int db_state = -1; /* 1=found, 0=confirmed absent, -1=SQLite error */
+
     pthread_mutex_lock(&st->mu);
     sqlite3_stmt *cs = NULL;
     if (sqlite3_prepare_v2(st->db, "SELECT serial, event_hash FROM channels WHERE channel=?;", -1, &cs, NULL) == SQLITE_OK) {
         sqlite3_bind_text(cs, 1, ch, -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(cs) == SQLITE_ROW) {
+        int rc = sqlite3_step(cs);
+        if (rc == SQLITE_ROW) {
             ser = sqlite3_column_int64(cs, 0);
             const char *eh = (const char *)sqlite3_column_text(cs, 1);
             if (eh) snprintf(exp_hash, sizeof(exp_hash), "%.64s", eh);
+            db_state = 1;
+        } else if (rc == SQLITE_DONE) {
+            db_state = 0;
         }
         sqlite3_finalize(cs);
     }
     pthread_mutex_unlock(&st->mu);
-    if (ser > 0) {
-        if (snprintf(out_path, PATH_MAX, "%s/%lld.ev", st->ev_dir, (long long)ser) >= PATH_MAX) {
-            return -1;
+
+    if (db_state < 0) {
+        return 503; /* F6: Fail closed on DB error — NEVER silently fall back to legacy mirror! */
+    }
+    if (db_state == 1) {
+        if (ser <= 0) return 503;
+        char ev_path[PATH_MAX];
+        if (snprintf(ev_path, sizeof(ev_path), "%s/%lld.ev", st->ev_dir, (long long)ser) >= (int)sizeof(ev_path)) {
+            return 503;
         }
+        uint8_t *buf = NULL;
+        size_t sz = 0;
+        if (cp_read_ev_file_once(ev_path, &buf, &sz) != 0) return 503;
         fp_event_t ev;
         char actual_hash[65];
-        if (cp_load_event_file(out_path, &ev, actual_hash) != 0 ||
-            (exp_hash[0] && strcmp(actual_hash, exp_hash) != 0)) {
-            return -1;
+        if (fp_event_decode(buf, sz, &ev) != FP_OK) {
+            free(buf);
+            return 503;
         }
-        return 0;
-    }
-    if (snprintf(out_path, PATH_MAX, "%s/%s/latest.ev", st->chan_dir, ch) >= PATH_MAX) {
-        return -1;
-    }
-    struct stat lsb;
-    if (stat(out_path, &lsb) == 0 && S_ISREG(lsb.st_mode)) return 0;
-    if (strcmp(ch, "stable") == 0) {
-        if (snprintf(out_path, PATH_MAX, "%s/latest.ev", st->repo_dir) < PATH_MAX &&
-            stat(out_path, &lsb) == 0 && S_ISREG(lsb.st_mode)) {
-            return 0;
+        to_hex_lower(ev.event_hash.bytes, FP_DNA_LEN, actual_hash);
+        if ((int64_t)ev.serial != ser || (exp_hash[0] && strcmp(actual_hash, exp_hash) != 0)) {
+            free(buf);
+            return 503;
         }
+        *out_buf = buf;
+        *out_len = sz;
+        return 200;
     }
-    return -1;
+
+    /* Confirmed absent from committed `channels` table: allow unpromoted file mirror ONLY in explicit legacy/dev mode */
+    if (!st->allow_legacy_channel_files) return 404;
+
+    char leg_path[PATH_MAX];
+    if (snprintf(leg_path, sizeof(leg_path), "%s/%s/latest.ev", st->chan_dir, ch) < (int)sizeof(leg_path) &&
+        cp_read_ev_file_once(leg_path, out_buf, out_len) == 0) {
+        return 200;
+    }
+    if (strcmp(ch, "stable") == 0 &&
+        snprintf(leg_path, sizeof(leg_path), "%s/latest.ev", st->repo_dir) < (int)sizeof(leg_path) &&
+        cp_read_ev_file_once(leg_path, out_buf, out_len) == 0) {
+        return 200;
+    }
+    return 404;
+}
+
+static void serve_buf_with_range(int fd, const uint8_t *data, size_t total_sz, const char *range_hdr) {
+    uint64_t total = (uint64_t)total_sz;
+    uint64_t start = 0;
+    uint64_t end = total > 0 ? total - 1u : 0u;
+    int code = 200;
+    char extra[256] = "Accept-Ranges: bytes\r\n";
+
+    if (range_hdr && strncmp(range_hdr, "bytes=", 6) == 0) {
+        const char *spec = range_hdr + 6;
+        while (*spec == ' ') spec++;
+        const char *dash = strchr(spec, '-');
+        if (!dash || total == 0 || dash == spec) {
+            send_text(fd, 416, "range not satisfiable");
+            return;
+        }
+        char s1[32], s2[32];
+        size_t l1 = (size_t)(dash - spec);
+        size_t l2 = strlen(dash + 1);
+        if (l1 >= sizeof(s1) || l2 >= sizeof(s2)) {
+            send_text(fd, 416, "bad range");
+            return;
+        }
+        memcpy(s1, spec, l1); s1[l1] = '\0';
+        memcpy(s2, dash + 1, l2 + 1u);
+        if (!is_digits_only(s1) || (l2 > 0 && !is_digits_only(s2))) {
+            send_text(fd, 416, "bad range");
+            return;
+        }
+        errno = 0;
+        start = strtoull(s1, NULL, 10);
+        if (errno != 0) { send_text(fd, 416, "bad range"); return; }
+        if (l2 > 0) {
+            errno = 0;
+            end = strtoull(s2, NULL, 10);
+            if (errno != 0) { send_text(fd, 416, "bad range"); return; }
+        } else {
+            end = total - 1u;
+        }
+        if (start >= total || end < start) {
+            send_text(fd, 416, "range not satisfiable");
+            return;
+        }
+        if (end >= total) end = total - 1u;
+        code = 206;
+        snprintf(extra, sizeof(extra), "Accept-Ranges: bytes\r\nContent-Range: bytes %llu-%llu/%llu\r\n",
+                 (unsigned long long)start, (unsigned long long)end, (unsigned long long)total);
+    }
+
+    uint64_t length = (total > 0) ? (end - start + 1u) : 0u;
+    send_resp(fd, code, "application/octet-stream", data + start, (size_t)length, extra);
 }
 
 static void serve_file_with_range(int fd, const char *path, const char *range_hdr) {
@@ -2368,11 +2479,16 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
             }
         }
         if (strcmp(path, "/repo/latest.ev") == 0) {
-            /* SEC-05 + R4: Serve committed authoritative stable channel pointer directly */
-            if (cp_resolve_channel_ev_path(st, "stable", fpath) != 0) {
-                send_text(cfd, 404, "not found"); return;
+            /* SEC-05 + R4 + F6 + F7: Serve verified committed stable channel buffer directly (zero TOCTOU, 503 on DB error) */
+            uint8_t *ev_buf = NULL;
+            size_t ev_len = 0;
+            int rc_ch = cp_load_channel_event_buf(st, "stable", &ev_buf, &ev_len);
+            if (rc_ch != 200) {
+                send_text(cfd, rc_ch, rc_ch == 503 ? "channel store unavailable" : "not found");
+                return;
             }
-            serve_file_with_range(cfd, fpath, hdr_range);
+            serve_buf_with_range(cfd, ev_buf, ev_len, hdr_range);
+            free(ev_buf);
             return;
         }
         if (strncmp(path, "/repo/channels/", 15) == 0) {
@@ -2384,10 +2500,15 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 if (cl == 0 || cl >= sizeof(ch)) { send_text(cfd, 400, "bad channel"); return; }
                 memcpy(ch, rest, cl); ch[cl] = '\0';
                 if (!is_valid_channel(ch)) { send_text(cfd, 400, "bad channel"); return; }
-                if (cp_resolve_channel_ev_path(st, ch, fpath) != 0) {
-                    send_text(cfd, 404, "not found"); return;
+                uint8_t *ev_buf = NULL;
+                size_t ev_len = 0;
+                int rc_ch = cp_load_channel_event_buf(st, ch, &ev_buf, &ev_len);
+                if (rc_ch != 200) {
+                    send_text(cfd, rc_ch, rc_ch == 503 ? "channel store unavailable" : "not found");
+                    return;
                 }
-                serve_file_with_range(cfd, fpath, hdr_range);
+                serve_buf_with_range(cfd, ev_buf, ev_len, hdr_range);
+                free(ev_buf);
                 return;
             }
         }
@@ -2914,7 +3035,7 @@ int main(int argc, char **argv) {
 
     cp_state_t st;
     if (cp_state_init(&st, data_dir, sbom_path, admin_tok, require_signed_hb,
-                      require_enrolled, require_quorum, require_admin_read_auth) != 0) {
+                      require_enrolled, require_quorum, require_admin_read_auth, insecure_dev) != 0) {
         fprintf(stderr, "sf-cp: failed to initialize state in %s\n", data_dir);
         return 1;
     }
