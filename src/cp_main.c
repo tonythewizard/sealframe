@@ -1304,21 +1304,41 @@ static int cp_set_channel_serial(cp_state_t *st, const char *ch, int64_t serial,
     /* Serialize monotonicity check, quorum verification, atomic file write, and audit log (SEC-03, P0-05) */
     pthread_mutex_lock(&st->mu);
 
-    /* Enforce strict monotonicity on channel serial (check committed SQLite channels table first, fallback to file!) */
+    /* SEC-02: Enforce strict monotonicity using committed SQLite channels table (fail-closed 503 on DB error!) */
     uint64_t cur_ser = 0;
     {
         sqlite3_stmt *ms = NULL;
-        if (sqlite3_prepare_v2(st->db, "SELECT serial FROM channels WHERE channel=?;", -1, &ms, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(ms, 1, ch, -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(ms) == SQLITE_ROW) {
-                int64_t s = sqlite3_column_int64(ms, 0);
-                if (s > 0) cur_ser = (uint64_t)s;
-            }
-            sqlite3_finalize(ms);
+        int mrc = sqlite3_prepare_v2(st->db, "SELECT serial FROM channels WHERE channel=?;", -1, &ms, NULL);
+        if (mrc != SQLITE_OK) {
+            pthread_mutex_unlock(&st->mu);
+            *out_http_status = 503;
+            snprintf(msg, msg_cap, "database channel monotonicity lookup failed");
+            return -1;
         }
-        fp_event_t cur_ev;
-        if (cp_load_event_file(dst, &cur_ev, NULL) == 0 && cur_ev.serial > cur_ser) {
-            cur_ser = cur_ev.serial;
+        if (sqlite3_bind_text(ms, 1, ch, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+            sqlite3_finalize(ms);
+            pthread_mutex_unlock(&st->mu);
+            *out_http_status = 503;
+            snprintf(msg, msg_cap, "database channel bind failed");
+            return -1;
+        }
+        mrc = sqlite3_step(ms);
+        if (mrc == SQLITE_ROW) {
+            int64_t s = sqlite3_column_int64(ms, 0);
+            if (s > 0) cur_ser = (uint64_t)s;
+        } else if (mrc != SQLITE_DONE) {
+            sqlite3_finalize(ms);
+            pthread_mutex_unlock(&st->mu);
+            *out_http_status = 503;
+            snprintf(msg, msg_cap, "database channel monotonicity query failed");
+            return -1;
+        }
+        sqlite3_finalize(ms);
+        if (st->allow_legacy_channel_files) {
+            fp_event_t cur_ev;
+            if (cp_load_event_file(dst, &cur_ev, NULL) == 0 && cur_ev.serial > cur_ser) {
+                cur_ser = cur_ev.serial;
+            }
         }
     }
     if (cur_ser > 0 && (uint64_t)serial <= cur_ser) {
@@ -2083,15 +2103,16 @@ static int cp_load_channel_event_buf(cp_state_t *st, const char *ch,
     pthread_mutex_lock(&st->mu);
     sqlite3_stmt *cs = NULL;
     if (sqlite3_prepare_v2(st->db, "SELECT serial, event_hash FROM channels WHERE channel=?;", -1, &cs, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(cs, 1, ch, -1, SQLITE_TRANSIENT);
-        int rc = sqlite3_step(cs);
-        if (rc == SQLITE_ROW) {
-            ser = sqlite3_column_int64(cs, 0);
-            const char *eh = (const char *)sqlite3_column_text(cs, 1);
-            if (eh) snprintf(exp_hash, sizeof(exp_hash), "%.64s", eh);
-            db_state = 1;
-        } else if (rc == SQLITE_DONE) {
-            db_state = 0;
+        if (sqlite3_bind_text(cs, 1, ch, -1, SQLITE_TRANSIENT) == SQLITE_OK) {
+            int rc = sqlite3_step(cs);
+            if (rc == SQLITE_ROW) {
+                ser = sqlite3_column_int64(cs, 0);
+                const char *eh = (const char *)sqlite3_column_text(cs, 1);
+                if (eh) snprintf(exp_hash, sizeof(exp_hash), "%.64s", eh);
+                db_state = 1;
+            } else if (rc == SQLITE_DONE) {
+                db_state = 0;
+            }
         }
         sqlite3_finalize(cs);
     }
@@ -2101,7 +2122,8 @@ static int cp_load_channel_event_buf(cp_state_t *st, const char *ch,
         return 503; /* F6: Fail closed on DB error — NEVER silently fall back to legacy mirror! */
     }
     if (db_state == 1) {
-        if (ser <= 0) return 503;
+        /* SEC-01: Mandatory 64-hex authoritative event_hash (never allow empty/malformed hash in channels table!) */
+        if (ser <= 0 || !is_hex_lower(exp_hash, 64u)) return 503;
         char ev_path[PATH_MAX];
         if (snprintf(ev_path, sizeof(ev_path), "%s/%lld.ev", st->ev_dir, (long long)ser) >= (int)sizeof(ev_path)) {
             return 503;
@@ -2116,7 +2138,7 @@ static int cp_load_channel_event_buf(cp_state_t *st, const char *ch,
             return 503;
         }
         to_hex_lower(ev.event_hash.bytes, FP_DNA_LEN, actual_hash);
-        if ((int64_t)ev.serial != ser || (exp_hash[0] && strcmp(actual_hash, exp_hash) != 0)) {
+        if ((int64_t)ev.serial != ser || strcmp(actual_hash, exp_hash) != 0) {
             free(buf);
             return 503;
         }
@@ -2653,7 +2675,14 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 }
                 char utc[32];
                 utc_now(utc);
+                /* SEC-04: Atomic SQLite transaction binding device enrollment + durable audit record */
                 pthread_mutex_lock(&st->mu);
+                if (sqlite3_exec(st->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database transaction begin failed\"}");
+                    return;
+                }
                 sqlite3_stmt *stmt = NULL;
                 int erc = sqlite3_prepare_v2(
                         st->db,
@@ -2670,6 +2699,7 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                     sqlite3_finalize(stmt);
                 }
                 if (erc != SQLITE_DONE) {
+                    (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
                     pthread_mutex_unlock(&st->mu);
                     jval_free(body); free(raw_body);
                     send_json(cfd, 500, "{\"ok\":false,\"error\":\"database enrollment write failed\"}");
@@ -2677,10 +2707,12 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 }
                 char det[256];
                 snprintf(det, sizeof(det), "Enrolled Ed25519 pubkey %.16s... for %s", pk_hex, dev_id);
-                if (db_append_audit(st->db, "admin", dev_id, "admin", "enrollment", "DEVICE_ENROLLED", 0, det, 1, utc) != 0) {
+                if (db_append_audit(st->db, "admin", dev_id, "admin", "enrollment", "DEVICE_ENROLLED", 0, det, 1, utc) != 0 ||
+                    sqlite3_exec(st->db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+                    (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
                     pthread_mutex_unlock(&st->mu);
                     jval_free(body); free(raw_body);
-                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database audit write failed\"}");
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database audit/commit failed\"}");
                     return;
                 }
                 pthread_mutex_unlock(&st->mu);
@@ -2709,7 +2741,14 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 }
                 char utc[32];
                 utc_now(utc);
+                /* SEC-04: Atomic SQLite transaction binding approver mutation + durable audit record */
                 pthread_mutex_lock(&st->mu);
+                if (sqlite3_exec(st->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database transaction begin failed\"}");
+                    return;
+                }
                 sqlite3_stmt *stmt = NULL;
                 int arc = sqlite3_prepare_v2(
                         st->db,
@@ -2724,12 +2763,14 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                     sqlite3_finalize(stmt);
                 }
                 if (arc == SQLITE_CONSTRAINT || arc == SQLITE_CONSTRAINT_UNIQUE) {
+                    (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
                     pthread_mutex_unlock(&st->mu);
                     jval_free(body); free(raw_body);
                     send_json(cfd, 409, "{\"ok\":false,\"error\":\"approver pubkey already registered to another identity\"}");
                     return;
                 }
                 if (arc != SQLITE_DONE) {
+                    (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
                     pthread_mutex_unlock(&st->mu);
                     jval_free(body); free(raw_body);
                     send_json(cfd, 500, "{\"ok\":false,\"error\":\"database approver write failed\"}");
@@ -2737,10 +2778,12 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 }
                 char det[256];
                 snprintf(det, sizeof(det), "Registered Ed25519 approver %s (%.16s...)", approver, pk_hex);
-                if (db_append_audit(st->db, "admin", "CONTROL_PLANE", "admin", "governance", "APPROVER_ADDED", 0, det, 1, utc) != 0) {
+                if (db_append_audit(st->db, "admin", "CONTROL_PLANE", "admin", "governance", "APPROVER_ADDED", 0, det, 1, utc) != 0 ||
+                    sqlite3_exec(st->db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+                    (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
                     pthread_mutex_unlock(&st->mu);
                     jval_free(body); free(raw_body);
-                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database audit write failed\"}");
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database audit/commit failed\"}");
                     return;
                 }
                 pthread_mutex_unlock(&st->mu);
@@ -2822,9 +2865,16 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                     return;
                 }
 
+                /* SEC-04: Atomic SQLite transaction binding approval insert + durable audit record */
                 int thr = 2;
                 char utc[32];
                 utc_now(utc);
+                if (sqlite3_exec(st->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database transaction begin failed\"}");
+                    return;
+                }
                 int wrc = sqlite3_prepare_v2(
                         st->db,
                         "INSERT OR REPLACE INTO approvals("
@@ -2844,6 +2894,7 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                     sqlite3_finalize(stmt);
                 }
                 if (wrc != SQLITE_DONE) {
+                    (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
                     pthread_mutex_unlock(&st->mu);
                     jval_free(body); free(raw_body);
                     send_json(cfd, 500, "{\"ok\":false,\"error\":\"database approval write failed\"}");
@@ -2868,10 +2919,12 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                          cnt, thr, ch, (long long)serial, reason);
                 if (db_append_audit(st->db, "admin", dev_tag, "admin", ch,
                                     (cnt >= thr) ? "QUORUM_MET" : "APPROVED_PARTIAL",
-                                    serial, det, 1, utc) != 0) {
+                                    serial, det, 1, utc) != 0 ||
+                    sqlite3_exec(st->db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+                    (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
                     pthread_mutex_unlock(&st->mu);
                     jval_free(body); free(raw_body);
-                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database audit write failed\"}");
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database audit/commit failed\"}");
                     return;
                 }
                 sbuf_t resp;
