@@ -264,12 +264,7 @@ int main(void) {
     assert(fp_sql_capture_changeset(rdb, "settings",
            "UPDATE settings SET val='v2-broken' WHERE id=1;", &cs2, &cs2_l) == FP_OK);
 
-    /* Capture v3 relative to v1 (since v2 will be rolled back to v1!) */
-    fp_sql_close(rdb);
-    unlink(ref_db_p);
-    assert(fp_sql_open(ref_db_p, &rdb) == FP_OK);
-    assert(fp_sql_exec(rdb, schema) == FP_OK);
-    assert(fp_sql_exec(rdb, "INSERT INTO settings(id,val) VALUES(1,'v1-healthy');") == FP_OK);
+    /* Capture v3 incrementally on top of v2 (linear causal chain e1 -> e2 -> e3, P0-01) */
     assert(fp_sql_capture_changeset(rdb, "settings",
            "UPDATE settings SET val='v3-fixed' WHERE id=1;", &cs3, &cs3_l) == FP_OK);
     fp_dna_t db_dig_v3;
@@ -1428,6 +1423,271 @@ int main(void) {
                     assert(fp_sql_state_digest(d3, "t", &f3dig_now) == FP_OK && fp_dna_equal(&f3dig_now, &fdig[0]));
                     fp_sql_close(d3);
                     printf("[PASS] F4: 65-step SQLite catch-up rejected preflight (FP_ERR_BOUNDS) with zero mutation to V1\n");
+                }
+
+                /* Test O (6th Audit P0-01/03/04/05/06 & P1-01):
+                 * TX-01 independent rows after failed V2, TX-02/03 first health FAIL after REVOKE V1 + offline crash,
+                 * TX-05 mixed ROLLBACK->INSTALL preflight reject, TX-07 LEDGER_PENDING missing current, TX-08 HEALTH_PENDING vs HEALTH_RUNNING */
+                {
+                    char otmpl[] = "/tmp/fp-ag-m7-XXXXXX";
+                    char *odir = mkdtemp(otmpl);
+                    assert(odir != NULL);
+                    char orepo[256], oev[300], och[300], ost[340], oedge[256];
+                    char ostore[300], otarget[300], osrc[300], odst[300], oroot[300], ohcmd[512];
+                    snprintf(orepo, sizeof(orepo), "%s/repo", odir);
+                    snprintf(oev, sizeof(oev), "%s/events", orepo);
+                    snprintf(och, sizeof(och), "%s/channels", orepo);
+                    snprintf(ost, sizeof(ost), "%s/stable", och);
+                    snprintf(oedge, sizeof(oedge), "%s/edge", odir);
+                    snprintf(ostore, sizeof(ostore), "%s/store", oedge);
+                    snprintf(otarget, sizeof(otarget), "%s/live", oedge);
+                    snprintf(osrc, sizeof(osrc), "%s/src.db", odir);
+                    snprintf(odst, sizeof(odst), "%s/dst.db", oedge);
+                    snprintf(oroot, sizeof(oroot), "%s/root.fpr", oedge);
+                    snprintf(ohcmd, sizeof(ohcmd), "grep -q 'OK=1' '%s/current/app.cfg'", otarget);
+                    assert(mkdir(orepo, 0755) == 0 && mkdir(oev, 0755) == 0 &&
+                           mkdir(och, 0755) == 0 && mkdir(ost, 0755) == 0 && mkdir(oedge, 0755) == 0);
+
+                    assert(fp_root_encode(&nr, &rb, &rl) == FP_OK);
+                    write_bytes_file(oroot, rb, rl);
+                    snprintf(rp, sizeof(rp), "%s/root.fpr", orepo); write_bytes_file(rp, rb, rl);
+                    free(rb);
+
+                    fp_sql_ctx_t *os = NULL, *od = NULL;
+                    assert(fp_sql_open(osrc, &os) == FP_OK && fp_sql_open(odst, &od) == FP_OK);
+                    assert(fp_sql_exec(os, "CREATE TABLE ab(k TEXT PRIMARY KEY, v INTEGER);") == FP_OK);
+                    assert(fp_sql_exec(od, "CREATE TABLE ab(k TEXT PRIMARY KEY, v INTEGER);") == FP_OK);
+                    fp_sql_close(od);
+
+                    /* TX-01 (P0-01): V1=(A:100,B:100) -> V2(A:200, FAIL=1) -> V3(B:300, OK=1) -> MUST yield exact (200,300)! */
+                    const char *osqls[4] = {
+                        "INSERT INTO ab VALUES ('A', 100); INSERT INTO ab VALUES ('B', 100);",
+                        "UPDATE ab SET v=200 WHERE k='A';",
+                        "UPDATE ab SET v=300 WHERE k='B';",
+                        "UPDATE ab SET v=400 WHERE k='B';"
+                    };
+                    const char *ocfgs[4] = { "OK=1\nV=1\n", "FAIL=1\nV=2\n", "OK=1\nV=3\n", "OK=1\nV=4\n" };
+                    fp_dna_t obd[4], odig[4];
+                    uint64_t obsz[4];
+                    for (int i = 0; i < 4; i++) {
+                        uint8_t *cs = NULL; size_t csl = 0;
+                        assert(fp_sql_capture_changeset(os, "ab", osqls[i], &cs, &csl) == FP_OK);
+                        assert(fp_sql_state_digest(os, "ab", &odig[i]) == FP_OK);
+                        fp_bundle_t ob;
+                        memset(&ob, 0, sizeof(ob));
+                        ob.version = 1; ob.entry_count = 2;
+                        ob.entries[0].role = FP_ROLE_FILE; ob.entries[0].mode = 0644; ob.entries[0].size = strlen(ocfgs[i]);
+                        snprintf(ob.entries[0].path, sizeof(ob.entries[0].path), "app.cfg");
+                        assert(fp_store_put_object(orepo, (const uint8_t *)ocfgs[i], strlen(ocfgs[i]), &ob.entries[0].dna) == FP_OK);
+                        ob.entries[1].role = FP_ROLE_SQLITE_CHANGESET; ob.entries[1].size = csl;
+                        snprintf(ob.entries[1].path, sizeof(ob.entries[1].path), "ab");
+                        assert(fp_store_put_object(orepo, cs, csl, &ob.entries[1].dna) == FP_OK);
+                        free(cs);
+                        assert(fp_bundle_pack(orepo, &ob, &obd[i]) == FP_OK);
+                        assert(fp_store_has_object(orepo, &obd[i], &obsz[i]));
+                    }
+                    fp_sql_close(os);
+
+                    fp_event_t oe1, oe2, oe3;
+                    memset(&oe1, 0, sizeof(oe1)); memset(&oe2, 0, sizeof(oe2)); memset(&oe3, 0, sizeof(oe3));
+                    oe1.action = FP_ACTION_INSTALL; oe1.repo_id = nrid; oe1.serial = 1;
+                    oe1.timestamp_unix = now; oe1.expires_unix = now + 3600;
+                    oe1.target_dna = obd[0]; oe1.target_size = obsz[0];
+                    assert(fp_event_sign(&oe1, &nrel) == FP_OK);
+                    assert(fp_event_encode(&oe1, &eb, &el) == FP_OK);
+                    snprintf(rp, sizeof(rp), "%s/1.ev", oev); write_bytes_file(rp, eb, el);
+                    snprintf(rp, sizeof(rp), "%s/latest.ev", ost); write_bytes_file(rp, eb, el); free(eb);
+
+                    srv.repo_dir = orepo;
+                    fp_agent_cfg_t ocfg;
+                    memset(&ocfg, 0, sizeof(ocfg));
+                    ocfg.device_id = "edge-m7"; ocfg.repo_url = base_url; ocfg.channel = "stable";
+                    ocfg.store_dir = ostore; ocfg.target_dir = otarget; ocfg.db_path = odst;
+                    ocfg.root_path = oroot; ocfg.health_cmd = ohcmd; ocfg.health_timeout_sec = 5;
+                    assert(fp_agent_sync_once(&ocfg, &rep) == FP_OK && rep.active_serial == 1);
+
+                    /* V2 fails health -> auto-rolls back to V1 */
+                    oe2.action = FP_ACTION_INSTALL; oe2.repo_id = nrid; oe2.serial = 2;
+                    oe2.prev_event_hash = oe1.event_hash; oe2.timestamp_unix = now; oe2.expires_unix = now + 3600;
+                    oe2.target_dna = obd[1]; oe2.target_size = obsz[1];
+                    assert(fp_event_sign(&oe2, &nrel) == FP_OK);
+                    assert(fp_event_encode(&oe2, &eb, &el) == FP_OK);
+                    snprintf(rp, sizeof(rp), "%s/2.ev", oev); write_bytes_file(rp, eb, el);
+                    snprintf(rp, sizeof(rp), "%s/latest.ev", ost); write_bytes_file(rp, eb, el); free(eb);
+                    assert(fp_agent_sync_once(&ocfg, &rep) == FP_OK && rep.outcome == FP_AGENT_ROLLED_BACK);
+
+                    /* V3 (B=300, health=true) MUST replay V2's SQL migration (A=200) + V3 (B=300) -> exact odig[2]! */
+                    oe3.action = FP_ACTION_INSTALL; oe3.repo_id = nrid; oe3.serial = 3;
+                    oe3.prev_event_hash = oe2.event_hash; oe3.timestamp_unix = now; oe3.expires_unix = now + 3600;
+                    oe3.target_dna = obd[2]; oe3.target_size = obsz[2];
+                    assert(fp_event_sign(&oe3, &nrel) == FP_OK);
+                    assert(fp_event_encode(&oe3, &eb, &el) == FP_OK);
+                    snprintf(rp, sizeof(rp), "%s/3.ev", oev); write_bytes_file(rp, eb, el);
+                    snprintf(rp, sizeof(rp), "%s/latest.ev", ost); write_bytes_file(rp, eb, el); free(eb);
+                    ocfg.health_cmd = "true";
+                    assert(fp_agent_sync_once(&ocfg, &rep) == FP_OK && rep.active_serial == 3);
+                    assert(fp_sql_open(odst, &od) == FP_OK);
+                    fp_dna_t odig_now;
+                    assert(fp_sql_state_digest(od, "ab", &odig_now) == FP_OK && fp_dna_equal(&odig_now, &odig[2]));
+                    fp_sql_close(od);
+                    printf("[PASS] TX-01 (P0-01): Failed intermediate V2(A=200) NOT skipped on V3(B=300) -> exact SQL digest (200,300)!\n");
+
+                    /* TX-05 (P0-04): Mixed [ROLLBACK V3->V1, INSTALL V4] with SQLite MUST fail closed pre-mutation! */
+                    fp_event_t oe4, oe5;
+                    memset(&oe4, 0, sizeof(oe4)); memset(&oe5, 0, sizeof(oe5));
+                    oe4.action = FP_ACTION_ROLLBACK; oe4.repo_id = nrid; oe4.serial = 4;
+                    oe4.prev_event_hash = oe3.event_hash; oe4.timestamp_unix = now; oe4.expires_unix = now + 3600;
+                    oe4.target_dna = obd[0]; oe4.target_size = obsz[0];
+                    snprintf(oe4.reason, sizeof(oe4.reason), "mix-rb");
+                    assert(fp_event_sign(&oe4, &nrel) == FP_OK);
+                    assert(fp_event_encode(&oe4, &eb, &el) == FP_OK);
+                    snprintf(rp, sizeof(rp), "%s/4.ev", oev); write_bytes_file(rp, eb, el); free(eb);
+
+                    oe5.action = FP_ACTION_INSTALL; oe5.repo_id = nrid; oe5.serial = 5;
+                    oe5.prev_event_hash = oe4.event_hash; oe5.timestamp_unix = now; oe5.expires_unix = now + 3600;
+                    oe5.target_dna = obd[3]; oe5.target_size = obsz[3];
+                    assert(fp_event_sign(&oe5, &nrel) == FP_OK);
+                    assert(fp_event_encode(&oe5, &eb, &el) == FP_OK);
+                    snprintf(rp, sizeof(rp), "%s/5.ev", oev); write_bytes_file(rp, eb, el);
+                    snprintf(rp, sizeof(rp), "%s/latest.ev", ost); write_bytes_file(rp, eb, el); free(eb);
+
+                    assert(fp_agent_sync_once(&ocfg, &rep) == FP_ERR_POLICY);
+                    assert(fp_sql_open(odst, &od) == FP_OK);
+                    assert(fp_sql_state_digest(od, "ab", &odig_now) == FP_OK && fp_dna_equal(&odig_now, &odig[2]));
+                    fp_sql_close(od);
+                    printf("[PASS] TX-05 (P0-04): Mixed [ROLLBACK->INSTALL] SQLite chain rejected preflight (FP_ERR_POLICY), V3 intact\n");
+
+                    /* TX-08 (P1-01): Crash in HEALTH_PENDING AFTER target reached (before watchdog) -> rollback WITHOUT quarantine! */
+                    char ootap[360], ofailp[360], ocur[360], orev[360], ob2h[65], ob3h[65];
+                    snprintf(ootap, sizeof(ootap), "%s/.sf_ota_state", otarget);
+                    snprintf(ofailp, sizeof(ofailp), "%s/agent_failed_serial", ostore);
+                    snprintf(ocur, sizeof(ocur), "%s/current", otarget);
+                    snprintf(orev, sizeof(orev), "%s/.sf_revoked", otarget);
+                    fp_hex_encode(obd[2].bytes, FP_DNA_LEN, ob2h);
+                    fp_hex_encode(obd[3].bytes, FP_DNA_LEN, ob3h);
+                    /* Stage V4 locally & simulate crash right BEFORE watchdog (state=HEALTH_PENDING, not HEALTH_RUNNING) */
+                    assert(fp_store_put_object(ostore, (const uint8_t *)ocfgs[3], strlen(ocfgs[3]), NULL) == FP_OK);
+                    {
+                        uint8_t *b4b = NULL; size_t b4l = 0;
+                        assert(fp_store_get_object(orepo, &obd[3], (1u << 20), &b4b, &b4l) == FP_OK);
+                        fp_bundle_t b4;
+                        assert(fp_bundle_decode(b4b, b4l, &b4) == FP_OK);
+                        assert(fp_store_put_object(ostore, b4b, b4l, NULL) == FP_OK);
+                        free(b4b);
+                        for (uint16_t j = 0; j < b4.entry_count; j++) {
+                            uint8_t *eb2 = NULL; size_t el2 = 0;
+                            assert(fp_store_get_object(orepo, &b4.entries[j].dna, (1u << 20), &eb2, &el2) == FP_OK);
+                            assert(fp_store_put_object(ostore, eb2, el2, NULL) == FP_OK);
+                            free(eb2);
+                        }
+                    }
+                    assert(fp_sql_open(odst, &od) == FP_OK);
+                    assert(fp_bundle_apply(ostore, &obd[3], otarget, od, 4, 0) == FP_OK);
+                    fp_sql_close(od);
+                    oln = snprintf(oline, sizeof(oline), "SFOTA1 HEALTH_PENDING 4 %s 1 %s 4\n", ob3h, ob2h);
+                    write_bytes_file(ootap, (const uint8_t *)oline, (size_t)oln);
+                    ocfg.repo_url = "http://127.0.0.1:1";
+                    (void)fp_agent_sync_once(&ocfg, &rep);
+                    assert(lstat(ootap, &st_chk) != 0);
+                    assert(lstat(ofailp, &st_chk) != 0); /* ZERO false quarantine on pre-watchdog crash! */
+                    printf("[PASS] TX-08 (P1-01): Pre-watchdog crash on final DNA reverted cleanly without false quarantine\n");
+
+                    /* TX-07 (P0-06): LEDGER_PENDING with missing `current` symlink MUST fail closed & preserve .sf_ota_state! */
+                    assert(unlink(ocur) == 0);
+                    oln = snprintf(oline, sizeof(oline), "SFOTA1 LEDGER_PENDING 3 %s 1 %s 3\n", ob2h, ob2h);
+                    write_bytes_file(ootap, (const uint8_t *)oline, (size_t)oln);
+                    assert(fp_agent_sync_once(&ocfg, &rep) == FP_ERR_INTEGRITY);
+                    assert(lstat(ootap, &st_chk) == 0); /* Evidence preserved! */
+                    assert(unlink(ootap) == 0);
+                    printf("[PASS] TX-07 (P0-06): LEDGER_PENDING with missing current symlink rejected fail-closed (evidence preserved)\n");
+
+                    /* TX-02 & TX-03 (P0-03 & P0-05): [REVOKE active V1, INSTALL V2(FAIL)] -> FIRST health FAIL MUST NOT reactivate V1! */
+                    char p03tmpl[] = "/tmp/fp-ag-p03-XXXXXX";
+                    char *p03dir = mkdtemp(p03tmpl);
+                    assert(p03dir != NULL);
+                    char p03repo[256], p03ev[300], p03ch[300], p03st[340], p03edge[256];
+                    char p03store[300], p03target[300], p03root[300], p03cur[360], p03rev[360], p03hcmd[512];
+                    snprintf(p03repo, sizeof(p03repo), "%s/repo", p03dir);
+                    snprintf(p03ev, sizeof(p03ev), "%s/events", p03repo);
+                    snprintf(p03ch, sizeof(p03ch), "%s/channels", p03repo);
+                    snprintf(p03st, sizeof(p03st), "%s/stable", p03ch);
+                    snprintf(p03edge, sizeof(p03edge), "%s/edge", p03dir);
+                    snprintf(p03store, sizeof(p03store), "%s/store", p03edge);
+                    snprintf(p03target, sizeof(p03target), "%s/live", p03edge);
+                    snprintf(p03root, sizeof(p03root), "%s/root.fpr", p03edge);
+                    snprintf(p03cur, sizeof(p03cur), "%s/current", p03target);
+                    snprintf(p03rev, sizeof(p03rev), "%s/.sf_revoked", p03target);
+                    snprintf(p03hcmd, sizeof(p03hcmd), "grep -q 'OK=1' '%s/current/app.cfg'", p03target);
+                    assert(mkdir(p03repo, 0755) == 0 && mkdir(p03ev, 0755) == 0 &&
+                           mkdir(p03ch, 0755) == 0 && mkdir(p03st, 0755) == 0 && mkdir(p03edge, 0755) == 0);
+                    assert(fp_root_encode(&nr, &rb, &rl) == FP_OK);
+                    write_bytes_file(p03root, rb, rl);
+                    snprintf(rp, sizeof(rp), "%s/root.fpr", p03repo); write_bytes_file(rp, rb, rl); free(rb);
+
+                    fp_bundle_t pb1, pb2;
+                    memset(&pb1, 0, sizeof(pb1)); memset(&pb2, 0, sizeof(pb2));
+                    pb1.version = 1; pb1.entry_count = 1; pb1.entries[0].role = FP_ROLE_FILE;
+                    pb1.entries[0].mode = 0644; pb1.entries[0].size = 5;
+                    snprintf(pb1.entries[0].path, sizeof(pb1.entries[0].path), "app.cfg");
+                    assert(fp_store_put_object(p03repo, (const uint8_t *)"OK=1\n", 5, &pb1.entries[0].dna) == FP_OK);
+                    pb2 = pb1; pb2.entries[0].size = 7;
+                    assert(fp_store_put_object(p03repo, (const uint8_t *)"FAIL=1\n", 7, &pb2.entries[0].dna) == FP_OK);
+                    fp_dna_t pbd1, pbd2; uint64_t pbs1 = 0, pbs2 = 0;
+                    assert(fp_bundle_pack(p03repo, &pb1, &pbd1) == FP_OK && fp_store_has_object(p03repo, &pbd1, &pbs1));
+                    assert(fp_bundle_pack(p03repo, &pb2, &pbd2) == FP_OK && fp_store_has_object(p03repo, &pbd2, &pbs2));
+
+                    fp_event_t pe1, pe2, pe3;
+                    memset(&pe1, 0, sizeof(pe1)); memset(&pe2, 0, sizeof(pe2)); memset(&pe3, 0, sizeof(pe3));
+                    pe1.action = FP_ACTION_INSTALL; pe1.repo_id = nrid; pe1.serial = 1;
+                    pe1.timestamp_unix = now; pe1.expires_unix = now + 3600;
+                    pe1.target_dna = pbd1; pe1.target_size = pbs1;
+                    assert(fp_event_sign(&pe1, &nrel) == FP_OK);
+                    assert(fp_event_encode(&pe1, &eb, &el) == FP_OK);
+                    snprintf(rp, sizeof(rp), "%s/1.ev", p03ev); write_bytes_file(rp, eb, el);
+                    snprintf(rp, sizeof(rp), "%s/latest.ev", p03st); write_bytes_file(rp, eb, el); free(eb);
+
+                    srv.repo_dir = p03repo;
+                    fp_agent_cfg_t p03cfg;
+                    memset(&p03cfg, 0, sizeof(p03cfg));
+                    p03cfg.device_id = "edge-p03"; p03cfg.repo_url = base_url; p03cfg.channel = "stable";
+                    p03cfg.store_dir = p03store; p03cfg.target_dir = p03target;
+                    p03cfg.root_path = p03root; p03cfg.health_cmd = p03hcmd; p03cfg.health_timeout_sec = 5;
+                    assert(fp_agent_sync_once(&p03cfg, &rep) == FP_OK && rep.active_serial == 1);
+
+                    /* Now emit [2: REVOKE V1, 3: INSTALL V2(FAIL)] -> V2 has NEVER been tried before! */
+                    pe2.action = FP_ACTION_REVOKE; pe2.repo_id = nrid; pe2.serial = 2;
+                    pe2.prev_event_hash = pe1.event_hash; pe2.timestamp_unix = now; pe2.expires_unix = now + 3600;
+                    pe2.target_dna = pbd1; pe2.target_size = 0;
+                    snprintf(pe2.reason, sizeof(pe2.reason), "compromised-v1");
+                    assert(fp_event_sign(&pe2, &nrel) == FP_OK);
+                    assert(fp_event_encode(&pe2, &eb, &el) == FP_OK);
+                    snprintf(rp, sizeof(rp), "%s/2.ev", p03ev); write_bytes_file(rp, eb, el); free(eb);
+
+                    pe3.action = FP_ACTION_INSTALL; pe3.repo_id = nrid; pe3.serial = 3;
+                    pe3.prev_event_hash = pe2.event_hash; pe3.timestamp_unix = now; pe3.expires_unix = now + 3600;
+                    pe3.target_dna = pbd2; pe3.target_size = pbs2;
+                    assert(fp_event_sign(&pe3, &nrel) == FP_OK);
+                    assert(fp_event_encode(&pe3, &eb, &el) == FP_OK);
+                    snprintf(rp, sizeof(rp), "%s/3.ev", p03ev); write_bytes_file(rp, eb, el);
+                    snprintf(rp, sizeof(rp), "%s/latest.ev", p03st); write_bytes_file(rp, eb, el); free(eb);
+
+                    /* FIRST health FAIL on V2 MUST deactivate live target (NEVER roll back to revoked V1!) */
+                    assert(fp_agent_sync_once(&p03cfg, &rep) == FP_ERR_POLICY);
+                    assert(rep.outcome == FP_AGENT_REVOKED && rep.active_serial == 0);
+                    assert(lstat(p03cur, &st_chk) != 0 && lstat(p03rev, &st_chk) == 0);
+
+                    /* Offline crash recovery (TX-03): even if HEALTH_PENDING points prev=V1, durable deny-set blocks V1 offline! */
+                    char p1h[65], p2h[65], p03otap[360];
+                    fp_hex_encode(pbd1.bytes, FP_DNA_LEN, p1h);
+                    fp_hex_encode(pbd2.bytes, FP_DNA_LEN, p2h);
+                    snprintf(p03otap, sizeof(p03otap), "%s/.sf_ota_state", p03target);
+                    oln = snprintf(oline, sizeof(oline), "SFOTA1 HEALTH_PENDING 3 %s 1 %s 2\n", p2h, p1h);
+                    write_bytes_file(p03otap, (const uint8_t *)oline, (size_t)oln);
+                    p03cfg.repo_url = "http://127.0.0.1:1"; /* completely offline! */
+                    (void)fp_agent_sync_once(&p03cfg, &rep);
+                    assert(lstat(p03otap, &st_chk) != 0);
+                    assert(lstat(p03cur, &st_chk) != 0 && lstat(p03rev, &st_chk) == 0);
+                    printf("[PASS] TX-02/TX-03 (P0-03/P0-05): Monotonic deny-set prevents V1 reactivation on first health FAIL & offline crash!\n");
                 }
             }
         }

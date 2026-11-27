@@ -213,8 +213,46 @@ fp_err_t fp_sql_capture_changeset(fp_sql_ctx_t *ctx, const char *table_name,
 fp_err_t fp_sql_state_digest(fp_sql_ctx_t *ctx, const char *table_name, fp_dna_t *out_dna) {
     if (!ctx || !table_name || !out_dna || !safe_ident(table_name)) return FP_ERR_INVALID;
 
-    char query[256];
-    snprintf(query, sizeof(query), "SELECT * FROM \"%s\" ORDER BY rowid", table_name);
+    /* P1-02: Canonical PK-ordered row digest (independent of SQLite internal rowid insertion order
+     * for non-INTEGER PRIMARY KEY tables such as TEXT/composite PKs!) */
+    char pk_cols[16][65];
+    memset(pk_cols, 0, sizeof(pk_cols));
+    int max_pk = 0;
+    {
+        char pinfo[192];
+        if (snprintf(pinfo, sizeof(pinfo), "PRAGMA table_info(\"%s\");", table_name) >= (int)sizeof(pinfo)) {
+            return FP_ERR_BOUNDS;
+        }
+        sqlite3_stmt *ps = NULL;
+        if (sqlite3_prepare_v2(ctx->db, pinfo, -1, &ps, NULL) != SQLITE_OK) return FP_ERR_IO;
+        while (sqlite3_step(ps) == SQLITE_ROW) {
+            int pk = sqlite3_column_int(ps, 5);
+            const char *cname = (const char *)sqlite3_column_text(ps, 1);
+            if (pk >= 1 && pk <= 16 && cname && safe_ident(cname)) {
+                snprintf(pk_cols[pk - 1], sizeof(pk_cols[0]), "%s", cname);
+                if (pk > max_pk) max_pk = pk;
+            }
+        }
+        sqlite3_finalize(ps);
+    }
+
+    char query[1536];
+    int qpos = snprintf(query, sizeof(query), "SELECT * FROM \"%s\" ORDER BY ", table_name);
+    if (qpos <= 0 || (size_t)qpos >= sizeof(query)) return FP_ERR_BOUNDS;
+    int added_pk = 0;
+    for (int i = 0; i < max_pk; i++) {
+        if (!pk_cols[i][0]) continue;
+        int w = snprintf(query + qpos, sizeof(query) - (size_t)qpos, "%s\"%s\"",
+                         added_pk ? ", " : "", pk_cols[i]);
+        if (w <= 0 || (size_t)(qpos + w) >= sizeof(query)) return FP_ERR_BOUNDS;
+        qpos += w;
+        added_pk = 1;
+    }
+    if (!added_pk) {
+        int w = snprintf(query + qpos, sizeof(query) - (size_t)qpos, "rowid");
+        if (w <= 0 || (size_t)(qpos + w) >= sizeof(query)) return FP_ERR_BOUNDS;
+    }
+
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(ctx->db, query, -1, &stmt, NULL) != SQLITE_OK) {
         return FP_ERR_IO;
@@ -584,6 +622,91 @@ static fp_err_t validate_changeset_table(const uint8_t *cs, size_t cs_len, const
     int frc = sqlite3changeset_finalize(iter);
     if (err != FP_OK) return err;
     if (rc != SQLITE_DONE || frc != SQLITE_OK) return FP_ERR_INTEGRITY;
+    return FP_OK;
+}
+
+/* P0-02: Strict destination schema/PK compatibility check BEFORE sqlite3changeset_apply()!
+ * SQLite Session silently returns SQLITE_OK (0) without invoking the conflict callback when
+ * the target table is missing, has fewer columns than the changeset, or has mismatched PKs. */
+static fp_err_t validate_changeset_schema(sqlite3 *db, const uint8_t *cs, size_t cs_len,
+                                          const char *allowed_table, int *out_op_count) {
+    if (out_op_count) *out_op_count = 0;
+    if (!db || !cs || cs_len == 0 || !allowed_table || !safe_ident(allowed_table)) {
+        return FP_ERR_INVALID;
+    }
+
+    char pragma_sql[192];
+    if (snprintf(pragma_sql, sizeof(pragma_sql), "PRAGMA table_info(\"%s\");", allowed_table) >= (int)sizeof(pragma_sql)) {
+        return FP_ERR_BOUNDS;
+    }
+    sqlite3_stmt *ps = NULL;
+    if (sqlite3_prepare_v2(db, pragma_sql, -1, &ps, NULL) != SQLITE_OK) {
+        return FP_ERR_IO;
+    }
+    int db_cols = 0;
+    uint8_t db_pk[256];
+    memset(db_pk, 0, sizeof(db_pk));
+    int prc;
+    while ((prc = sqlite3_step(ps)) == SQLITE_ROW) {
+        int pk_idx = sqlite3_column_int(ps, 5);
+        if (db_cols < (int)sizeof(db_pk)) {
+            db_pk[db_cols] = (pk_idx > 0) ? 1u : 0u;
+        }
+        db_cols++;
+    }
+    sqlite3_finalize(ps);
+    if (prc != SQLITE_DONE) return FP_ERR_IO;
+    if (db_cols <= 0 || db_cols > (int)sizeof(db_pk)) {
+        /* Target table does NOT exist (or exceeds supported column width) -> fail closed! */
+        return FP_ERR_INTEGRITY;
+    }
+
+    sqlite3_changeset_iter *iter = NULL;
+    if (sqlite3changeset_start(&iter, (int)cs_len, (void *)cs) != SQLITE_OK || !iter) {
+        return FP_ERR_INTEGRITY;
+    }
+    fp_err_t err = FP_OK;
+    int ops = 0;
+    int rc;
+    while ((rc = sqlite3changeset_next(iter)) == SQLITE_ROW) {
+        const char *zTab = NULL;
+        int nCol = 0, op = 0, indirect = 0;
+        if (sqlite3changeset_op(iter, &zTab, &nCol, &op, &indirect) != SQLITE_OK ||
+            !zTab || sqlite3_strnicmp(zTab, "_fp_", 4) == 0 ||
+            sqlite3_stricmp(zTab, allowed_table) != 0) {
+            err = FP_ERR_POLICY;
+            break;
+        }
+        if (nCol <= 0 || nCol > db_cols) {
+            err = FP_ERR_INTEGRITY;
+            break;
+        }
+        unsigned char *abPK = NULL;
+        int nPK = 0;
+        if (sqlite3changeset_pk(iter, &abPK, &nPK) != SQLITE_OK || !abPK || nPK != nCol) {
+            err = FP_ERR_INTEGRITY;
+            break;
+        }
+        for (int c = 0; c < nCol; c++) {
+            uint8_t want_pk = abPK[c] ? 1u : 0u;
+            if (want_pk != db_pk[c]) {
+                err = FP_ERR_INTEGRITY;
+                break;
+            }
+        }
+        for (int c = nCol; c < db_cols && err == FP_OK; c++) {
+            if (db_pk[c] != 0u) {
+                err = FP_ERR_INTEGRITY;
+                break;
+            }
+        }
+        if (err != FP_OK) break;
+        ops++;
+    }
+    int frc = sqlite3changeset_finalize(iter);
+    if (err != FP_OK) return err;
+    if (rc != SQLITE_DONE || frc != SQLITE_OK) return FP_ERR_INTEGRITY;
+    if (out_op_count) *out_op_count = ops;
     return FP_OK;
 }
 
@@ -1143,10 +1266,18 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
             } else {
                 for (uint16_t i = 0; i < b.entry_count && err == FP_OK; i++) {
                     if (b.entries[i].role != FP_ROLE_SQLITE_CHANGESET) continue;
+                    int op_cnt = 0;
+                    err = validate_changeset_schema(sql_ctx->db, cs_blobs[i], cs_lens[i],
+                                                    b.entries[i].path, &op_cnt);
+                    if (err != FP_OK) break;
+                    int ch_before = sqlite3_total_changes(sql_ctx->db);
                     int rc = sqlite3changeset_apply(sql_ctx->db, (int)cs_lens[i], cs_blobs[i],
                                                     filter_table, conflict_abort,
                                                     (void *)b.entries[i].path);
-                    if (rc != SQLITE_OK) err = FP_ERR_INTEGRITY;
+                    int ch_after = sqlite3_total_changes(sql_ctx->db);
+                    if (rc != SQLITE_OK || (op_cnt > 0 && (ch_after - ch_before) < op_cnt)) {
+                        err = FP_ERR_INTEGRITY;
+                    }
                 }
                 if (err == FP_OK) {
                     err = record_sql_history(sql_ctx, expected_seq, dna_hex, cur_dna, cur_seq);
@@ -1371,11 +1502,21 @@ fp_err_t fp_bundle_rollback(const char *store_dir,
                 free(cs);
                 if (rc != SQLITE_OK) { err = FP_ERR_INTEGRITY; break; }
 
+                int inv_ops = 0;
+                err = validate_changeset_schema(sql_ctx->db, (const uint8_t *)inv, (size_t)inv_len,
+                                                sb->entries[i].path, &inv_ops);
+                if (err != FP_OK) { sqlite3_free(inv); break; }
+
+                int ch_before = sqlite3_total_changes(sql_ctx->db);
                 rc = sqlite3changeset_apply(sql_ctx->db, inv_len, inv,
                                             filter_table, conflict_abort,
                                             (void *)sb->entries[i].path);
+                int ch_after = sqlite3_total_changes(sql_ctx->db);
                 sqlite3_free(inv);
-                if (rc != SQLITE_OK) { err = FP_ERR_INTEGRITY; break; }
+                if (rc != SQLITE_OK || (inv_ops > 0 && (ch_after - ch_before) < inv_ops)) {
+                    err = FP_ERR_INTEGRITY;
+                    break;
+                }
             }
             if (err == FP_OK) {
                 err = delete_sql_history_seq(sql_ctx, steps[s].seq);

@@ -566,6 +566,38 @@ static void test_m4_mixed_rollback_and_sql_namespace_guards(void) {
         printf("[PASS] P0-01/SF-A03: Mixed V1(SQL)->V2(SQL)->V3(file-only) rollback to V1 & NULL restored exact SQLite+files\n");
     }
 
+    /* SQL-01 & SQL-02 (P0-02): Missing table, fewer columns, and mismatched PK MUST fail closed (FP_ERR_INTEGRITY)
+     * instead of letting sqlite3changeset_apply() silently return SQLITE_OK and advance _fp_progress! */
+    {
+        char s1p[256], s2p[256], s3p[256], t_bad[256];
+        snprintf(s1p, sizeof(s1p), "%s/missing_tbl.db", tmp);
+        snprintf(s2p, sizeof(s2p), "%s/fewer_cols.db", tmp);
+        snprintf(s3p, sizeof(s3p), "%s/wrong_pk.db", tmp);
+        snprintf(t_bad, sizeof(t_bad), "%s/t_bad", tmp);
+
+        fp_sql_ctx_t *db_miss = NULL, *db_cols = NULL, *db_pk = NULL;
+        assert(fp_sql_open(s1p, &db_miss) == FP_OK);
+        assert(fp_sql_open(s2p, &db_cols) == FP_OK);
+        assert(fp_sql_open(s3p, &db_pk) == FP_OK);
+
+        /* db_miss has NO table `kv` at all */
+        /* db_cols has `kv(k INTEGER PRIMARY KEY)` (1 col instead of 2) */
+        assert(fp_sql_exec(db_cols, "CREATE TABLE kv(k INTEGER PRIMARY KEY);") == FP_OK);
+        /* db_pk has `kv(k INTEGER, v INTEGER PRIMARY KEY)` (PK on col 1 instead of col 0) */
+        assert(fp_sql_exec(db_pk, "CREATE TABLE kv(k INTEGER, v INTEGER PRIMARY KEY);") == FP_OK);
+
+        fp_sql_ctx_t *bad_dbs[3] = { db_miss, db_cols, db_pk };
+        for (int i = 0; i < 3; i++) {
+            assert(fp_bundle_apply(store, &b1_dna, t_bad, bad_dbs[i], 1, 0) == FP_ERR_INTEGRITY);
+            uint64_t pseq = 99; char pdna[65];
+            assert(fp_sql_get_progress(bad_dbs[i], &pseq, pdna) == FP_OK && pseq == 0 && pdna[0] == '\0');
+        }
+        fp_sql_close(db_miss);
+        fp_sql_close(db_cols);
+        fp_sql_close(db_pk);
+        printf("[PASS] SQL-01/SQL-02 (P0-02): Missing table, fewer columns & mismatched PK rejected fail-closed (no silent SQLITE_OK)\n");
+    }
+
     fp_sql_close(src_db);
     fp_sql_close(dst_db);
 }

@@ -873,6 +873,22 @@ static void test_control_plane(const char *work) {
                     record_ok("CP-F7", "Single-read verified buffer serves Range (206) and fails closed (503) on event tamper");
                 }
             }
+
+            /* CP-02 (SEC-01): Empty or malformed authoritative event_hash in channels table MUST fail closed with 503! */
+            sqlite3 *hdb = NULL;
+            assert(sqlite3_open(sec_db_path, &hdb) == SQLITE_OK);
+            assert(sqlite3_exec(hdb,
+                                "INSERT OR REPLACE INTO channels(channel,serial,event_hash,updated_utc) "
+                                "VALUES('emptyhash',1,'','2026-01-01T00:00:00Z');",
+                                NULL, NULL, NULL) == SQLITE_OK);
+            sqlite3_close(hdb);
+            snprintf(req, sizeof(req), "GET /repo/channels/emptyhash/latest.ev HTTP/1.1\r\nHost: x\r\n\r\n");
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            if (strncmp(resp, "HTTP/1.1 503", 12) != 0) {
+                record_finding("HIGH", "CP-SEC-01", "Channel row with empty event_hash was not rejected with 503");
+            } else {
+                record_ok("CP-SEC-01", "Mandatory 64-hex authoritative event_hash enforced (empty hash -> 503)");
+            }
         }
 
         /* SEC-07: sf-llama-bridge --role server without --peer-pk or --allow-any-peer MUST fail closed */
