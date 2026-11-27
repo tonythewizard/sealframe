@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -176,10 +177,104 @@ static void test_composite_atomic_sigkill_and_rollback(void) {
     fp_sql_close(dst_db);
 }
 
+static void test_p1_streaming_gc_and_merkle_index(void) {
+    char tmpl[] = "/tmp/fp-p1-bundle-XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    assert(dir != NULL);
+
+    char store[256], target[256];
+    snprintf(store, sizeof(store), "%s/store", dir);
+    snprintf(target, sizeof(target), "%s/live", dir);
+
+    /* 1. Streaming staging + GC across 4 immutable generations + orphaned .stage dir */
+    fp_dna_t dnas[4];
+    for (int g = 0; g < 4; g++) {
+        uint8_t payload[131072]; /* 128 KiB -> exercises multi-chunk 64 KiB streaming loop */
+        for (size_t i = 0; i < sizeof(payload); i++) {
+            payload[i] = (uint8_t)((i * 13u + (size_t)g * 31u) & 0xFFu);
+        }
+        fp_bundle_t b;
+        memset(&b, 0, sizeof(b));
+        b.version = 1;
+        b.entry_count = 1;
+        b.entries[0].role = FP_ROLE_FILE;
+        b.entries[0].mode = 0644;
+        b.entries[0].size = sizeof(payload);
+        snprintf(b.entries[0].path, sizeof(b.entries[0].path), "models/nested/v%d.bin", g);
+        assert(fp_store_put_object(store, payload, sizeof(payload), &b.entries[0].dna) == FP_OK);
+        assert(fp_bundle_pack(store, &b, &dnas[g]) == FP_OK);
+        assert(fp_bundle_apply(store, &dnas[g], target, NULL, (uint64_t)(g + 1), 0) == FP_OK);
+    }
+
+    char orphan[512];
+    snprintf(orphan, sizeof(orphan), "%s/gen/.stage-orphan-99999", target);
+    assert(mkdir(orphan, 0755) == 0);
+
+    uint32_t removed = 0;
+    assert(fp_bundle_gc(target, 1, &removed) == FP_OK);
+    assert(removed == 3u); /* 2 old generations + 1 orphaned .stage dir */
+    struct stat sb;
+    assert(lstat(orphan, &sb) != 0);
+    /* Active generation (v3) MUST remain intact */
+    char active_f[512];
+    snprintf(active_f, sizeof(active_f), "%s/current/models/nested/v3.bin", target);
+    assert(stat(active_f, &sb) == 0 && sb.st_size == 131072);
+    printf("[PASS] P1-01/02/03: O(1)-RAM streaming bundle staging (openat/O_NOFOLLOW) + safe GC (removed=%u)\n",
+           removed);
+
+    /* 2. Persistent FPM1 Merkle Index + O(log N) disk proof in O(1) RAM */
+    const size_t N = 512u << 10; /* 32 chunks */
+    uint8_t *big = malloc(N);
+    assert(big != NULL);
+    for (size_t i = 0; i < N; i++) big[i] = (uint8_t)((i * 29u + 7u) & 0xFFu);
+    fp_dna_t big_dna;
+    assert(fp_store_put_object(store, big, N, &big_dna) == FP_OK);
+
+    char hex[65], obj_p[512], idx_p[528];
+    fp_hex_encode(big_dna.bytes, FP_DNA_LEN, hex);
+    snprintf(obj_p, sizeof(obj_p), "%s/objects/%s", store, hex);
+    snprintf(idx_p, sizeof(idx_p), "%s.fpm", obj_p);
+
+    /* First build creates persistent .fpm index */
+    fp_merkle_tree_t *t1 = fp_merkle_tree_build_file_cached(obj_p, &big_dna, NULL);
+    assert(t1 != NULL);
+    assert(stat(idx_p, &sb) == 0 && sb.st_size > 56);
+    fp_merkle_tree_free(t1);
+
+    /* Second load reads directly from .fpm without re-hashing object */
+    fp_merkle_tree_t *t2 = fp_merkle_tree_build_file_cached(obj_p, &big_dna, NULL);
+    assert(t2 != NULL);
+    fp_dna_t tdna = fp_merkle_tree_dna(t2);
+    assert(fp_dna_equal(&tdna, &big_dna));
+    fp_merkle_tree_free(t2);
+
+    /* O(1)-RAM disk proof reader matches fp_merkle_verify() on first/mid/last chunks */
+    uint64_t idxs[3] = { 0, 15, 31 };
+    for (int k = 0; k < 3; k++) {
+        fp_merkle_proof_t pr;
+        assert(fp_merkle_prove_from_index_file(idx_p, idxs[k], &pr) == FP_OK);
+        assert(fp_merkle_verify(&big_dna, &pr, big + idxs[k] * FP_CHUNK_SIZE, pr.chunk_len) == FP_OK);
+    }
+
+    /* Corrupt 1 bit in .fpm root hash -> load_index MUST fail closed (NULL)! */
+    FILE *f = fopen(idx_p, "r+b");
+    assert(f != NULL);
+    assert(fseek(f, 56, SEEK_SET) == 0);
+    int c = fgetc(f);
+    assert(fseek(f, 56, SEEK_SET) == 0);
+    fputc(c ^ 0x01, f);
+    fclose(f);
+    assert(fp_merkle_tree_load_index(idx_p, N, &big_dna) == NULL);
+
+    free(big);
+    printf("[PASS] P1-05: Persistent FPM1 Merkle index (cached hit + O(1)-RAM disk proofs + tamper rejection)\n");
+}
+
 int main(void) {
     assert(fp_init() == FP_OK);
     test_bundle_security_validation();
     test_composite_atomic_sigkill_and_rollback();
+    test_p1_streaming_gc_and_merkle_index();
     printf("ALL M3 PARTICLE BUNDLE & SQLITE SESSION TESTS PASSED.\n");
     return 0;
 }

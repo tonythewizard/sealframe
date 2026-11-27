@@ -334,6 +334,10 @@ fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
             if (crypto_sign_ed25519_verify_detached(c_sig, cmsg, sizeof(cmsg), c_pk) != 0) {
                 continue;
             }
+            /* Reject unauthorized peer BEFORE any disk I/O or Merkle index access! */
+            if (cfg->allowed_peer_pk && sodium_memcmp(c_pk, cfg->allowed_peer_pk, FP_PK_LEN) != 0) {
+                continue;
+            }
 
             /* Idempotent U_HELLO deduplication: if the client retransmitted U_HELLO while
              * the server was building the Merkle tree on a slow HDD/WAN, resend the cached
@@ -354,7 +358,8 @@ fp_err_t fp_udp_serve_fd(int udp_fd, const fp_udp_server_cfg_t *cfg) {
                 continue;
             }
             uint64_t total_chunks = obj_len > 0 ? (obj_len + FP_CHUNK_SIZE - 1u) / FP_CHUNK_SIZE : 0;
-            fp_merkle_tree_t *tree = total_chunks > 0 ? fp_merkle_tree_build_file(obj_path, NULL) : NULL;
+            fp_merkle_tree_t *tree = total_chunks > 0
+                ? fp_merkle_tree_build_file_cached(obj_path, &target_dna, NULL) : NULL;
             if (total_chunks > 0) {
                 if (!tree) { close(obj_fd); continue; }
                 fp_dna_t check = fp_merkle_tree_dna(tree);

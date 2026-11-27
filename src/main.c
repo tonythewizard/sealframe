@@ -1119,6 +1119,27 @@ static int cmd_udp_pull(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_bundle_gc(int argc, char **argv) {
+    if (argc < 1) { usage(); return 1; }
+    const char *target_dir = argv[0];
+    uint32_t keep_last = 2;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--keep") == 0 && i + 1 < argc) {
+            uint64_t v = 0;
+            if (parse_u64_strict(argv[++i], &v) != 0 || v > 1024u) return 1;
+            keep_last = (uint32_t)v;
+        } else { usage(); return 1; }
+    }
+    uint32_t removed = 0;
+    fp_err_t err = fp_bundle_gc(target_dir, keep_last, &removed);
+    if (err != FP_OK) {
+        fprintf(stderr, "sf bundle-gc: %s\n", fp_strerror(err));
+        return 1;
+    }
+    printf("gc_ok=true removed=%u keep=%u\n", removed, keep_last);
+    return 0;
+}
+
 static int cmd_sign_approval(int argc, char **argv) {
     const char *key_path = NULL, *channel = "stable", *ev_path = NULL;
     uint64_t serial = 0;
@@ -1198,6 +1219,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "bundle-pack") == 0)     return cmd_bundle_pack(argc - 2, argv + 2);
     if (strcmp(cmd, "bundle-apply") == 0)    return cmd_bundle_apply(argc - 2, argv + 2);
     if (strcmp(cmd, "bundle-rollback") == 0) return cmd_bundle_rollback(argc - 2, argv + 2);
+    if (strcmp(cmd, "bundle-gc") == 0)       return cmd_bundle_gc(argc - 2, argv + 2);
     if (strcmp(cmd, "root-init") == 0)       return cmd_root_init(argc - 2, argv + 2);
     if (strcmp(cmd, "root-verify") == 0)     return cmd_root_verify(argc - 2, argv + 2);
     if (strcmp(cmd, "swarm-pull") == 0)      return cmd_swarm_pull(argc - 2, argv + 2);

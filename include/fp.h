@@ -87,6 +87,14 @@ fp_err_t fp_dna_compute(const uint8_t *data, size_t len, fp_dna_t *out_dna);
 fp_err_t fp_dna_compute_file(const char *path, fp_dna_t *out_dna, uint64_t *out_size);
 fp_merkle_tree_t *fp_merkle_tree_build(const uint8_t *data, size_t len);
 fp_merkle_tree_t *fp_merkle_tree_build_file(const char *path, uint64_t *out_size);
+fp_err_t fp_merkle_tree_save_index(const fp_merkle_tree_t *tree, const char *idx_path);
+fp_merkle_tree_t *fp_merkle_tree_load_index(const char *idx_path, uint64_t expected_size,
+                                            const fp_dna_t *expected_dna);
+fp_merkle_tree_t *fp_merkle_tree_build_file_cached(const char *obj_path,
+                                                   const fp_dna_t *expected_dna,
+                                                   uint64_t *out_size);
+fp_err_t fp_merkle_prove_from_index_file(const char *idx_path, uint64_t chunk_index,
+                                         fp_merkle_proof_t *out_proof);
 fp_dna_t fp_merkle_tree_dna(const fp_merkle_tree_t *tree);
 void     fp_merkle_tree_free(fp_merkle_tree_t *tree);
 fp_err_t fp_merkle_tree_prove(const fp_merkle_tree_t *tree, uint64_t chunk_index,
@@ -465,6 +473,11 @@ fp_err_t fp_bundle_rollback(const char *store_dir,
                             const fp_dna_t *prev_bundle_dna,
                             const char *target_dir, fp_sql_ctx_t *sql_ctx);
 
+/* Safe garbage collection of stale/unreferenced generations in `<target_dir>/gen/`.
+ * Never removes the generation referenced by `<target_dir>/current`, keeps the most recent
+ * `keep_last` inactive generations, and removes orphaned `.stage-*` / `.stale-*` directories. */
+fp_err_t fp_bundle_gc(const char *target_dir, uint32_t keep_last, uint32_t *out_removed);
+
 /* --- M4: Industrial Security (TUF-style Root Multi-Sig k-of-n & Key Rotation) --- */
 
 #define FP_MAX_ROOT_KEYS    8u
@@ -545,6 +558,7 @@ typedef struct {
     uint16_t            port;
     const char         *store_dir;
     const fp_keypair_t *server_kp;
+    const uint8_t      *allowed_peer_pk; /* Optional 32B client Ed25519 pin (checked BEFORE disk I/O) */
     uint32_t            max_sessions;    /* 0 = serve forever */
     int                 io_timeout_ms;
     uint32_t            fault_drop_pct;  /* Test hook: drop N% of outgoing UDP packets */

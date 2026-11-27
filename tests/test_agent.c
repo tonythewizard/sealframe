@@ -566,6 +566,137 @@ int main(void) {
         printf("[PASS] P0-02 initial install health failure returns error + INITIAL_INSTALL_FAILED + removes current\n");
     }
 
+    /* Test J (P1-04): Offline recovery from EXPIRED pinned root v1 across multi-step v1->v2->v3
+     * rotation with historical release keys & expired intermediate event! */
+    {
+        char r2tmpl[] = "/tmp/fp-ag-hist-repo-XXXXXX";
+        char e3tmpl[] = "/tmp/fp-ag-hist-edge-XXXXXX";
+        char *hrepo = mkdtemp(r2tmpl);
+        char *hedge = mkdtemp(e3tmpl);
+        assert(hrepo && hedge);
+
+        char h_ev[512], h_ch[512], h_st[512], h_roots[512];
+        snprintf(h_ev, sizeof(h_ev), "%s/events", hrepo);
+        snprintf(h_ch, sizeof(h_ch), "%s/channels", hrepo);
+        snprintf(h_st, sizeof(h_st), "%s/channels/stable", hrepo);
+        snprintf(h_roots, sizeof(h_roots), "%s/roots", hrepo);
+        assert(mkdir(h_ev, 0700) == 0 && mkdir(h_ch, 0700) == 0 &&
+               mkdir(h_st, 0700) == 0 && mkdir(h_roots, 0700) == 0);
+
+        fp_keypair_t hrk[3], hrel1, hrel2, hrel3;
+        for (int i = 0; i < 3; i++) assert(fp_keygen(&hrk[i]) == FP_OK);
+        assert(fp_keygen(&hrel1) == FP_OK && fp_keygen(&hrel2) == FP_OK && fp_keygen(&hrel3) == FP_OK);
+        fp_dna_t hrid;
+        assert(fp_random_id(&hrid) == FP_OK);
+
+        /* Root v1: EXPIRED (simulating device offline for months!) */
+        fp_root_doc_t rv1;
+        memset(&rv1, 0, sizeof(rv1));
+        rv1.version = 1; rv1.root_version = 1; rv1.repo_id = hrid;
+        rv1.timestamp_unix = now - 7200; rv1.expires_unix = now - 3600; /* EXPIRED! */
+        rv1.root_threshold = 2; rv1.root_key_count = 3;
+        for (int i = 0; i < 3; i++) memcpy(rv1.root_keys[i], hrk[i].pk, FP_PK_LEN);
+        memcpy(rv1.release_pk, hrel1.pk, FP_PK_LEN);
+        assert(fp_root_add_sig(&rv1, &hrk[0]) == FP_OK && fp_root_add_sig(&rv1, &hrk[1]) == FP_OK);
+
+        /* Root v2: historical intermediate root (also expired, rotated release_pk -> hrel2) */
+        fp_root_doc_t rv2 = rv1;
+        rv2.root_version = 2; rv2.sig_count = 0;
+        rv2.timestamp_unix = now - 3500; rv2.expires_unix = now - 1000;
+        memcpy(rv2.release_pk, hrel2.pk, FP_PK_LEN);
+        assert(fp_root_add_sig(&rv2, &hrk[0]) == FP_OK && fp_root_add_sig(&rv2, &hrk[2]) == FP_OK);
+
+        /* Root v3: fresh active root (rotated release_pk -> hrel3) */
+        fp_root_doc_t rv3 = rv2;
+        rv3.root_version = 3; rv3.sig_count = 0;
+        rv3.timestamp_unix = now - 60; rv3.expires_unix = now + 86400;
+        memcpy(rv3.release_pk, hrel3.pk, FP_PK_LEN);
+        assert(fp_root_add_sig(&rv3, &hrk[1]) == FP_OK && fp_root_add_sig(&rv3, &hrk[2]) == FP_OK);
+
+        uint8_t *rb = NULL; size_t rl = 0;
+        char rp[600], hedge_root[600];
+        assert(fp_root_encode(&rv1, &rb, &rl) == FP_OK);
+        snprintf(hedge_root, sizeof(hedge_root), "%s/pinned_root.fpr", hedge);
+        write_bytes_file(hedge_root, rb, rl);
+        free(rb);
+
+        assert(fp_root_encode(&rv2, &rb, &rl) == FP_OK);
+        snprintf(rp, sizeof(rp), "%s/2.fpr", h_roots);
+        write_bytes_file(rp, rb, rl);
+        free(rb);
+
+        assert(fp_root_encode(&rv3, &rb, &rl) == FP_OK);
+        snprintf(rp, sizeof(rp), "%s/3.fpr", h_roots);
+        write_bytes_file(rp, rb, rl);
+        snprintf(rp, sizeof(rp), "%s/root.fpr", hrepo);
+        write_bytes_file(rp, rb, rl);
+        free(rb);
+
+        /* Bundle 1 & 2 (file-only) */
+        fp_bundle_t hb1, hb2;
+        memset(&hb1, 0, sizeof(hb1)); memset(&hb2, 0, sizeof(hb2));
+        hb1.version = 1; hb1.entry_count = 1; hb1.entries[0].role = FP_ROLE_FILE;
+        hb1.entries[0].mode = 0644; hb1.entries[0].size = 10;
+        snprintf(hb1.entries[0].path, sizeof(hb1.entries[0].path), "app.cfg");
+        assert(fp_store_put_object(hrepo, (const uint8_t *)"STATUS=OK\n", 10, &hb1.entries[0].dna) == FP_OK);
+        fp_dna_t hbd1, hbd2; uint64_t hbs1 = 0, hbs2 = 0;
+        assert(fp_bundle_pack(hrepo, &hb1, &hbd1) == FP_OK);
+        assert(fp_store_has_object(hrepo, &hbd1, &hbs1));
+
+        hb2 = hb1;
+        hb2.entries[0].size = 14;
+        assert(fp_store_put_object(hrepo, (const uint8_t *)"STATUS=OK_V3!\n", 14, &hb2.entries[0].dna) == FP_OK);
+        assert(fp_bundle_pack(hrepo, &hb2, &hbd2) == FP_OK);
+        assert(fp_store_has_object(hrepo, &hbd2, &hbs2));
+
+        /* Event 1: historical & expired, signed by OLD release key hrel2! */
+        fp_event_t he1, he2;
+        memset(&he1, 0, sizeof(he1)); memset(&he2, 0, sizeof(he2));
+        he1.action = FP_ACTION_INSTALL; he1.repo_id = hrid; he1.serial = 1;
+        he1.timestamp_unix = now - 3000; he1.expires_unix = now - 1500; /* expired intermediate! */
+        he1.target_dna = hbd1; he1.target_size = hbs1;
+        assert(fp_event_sign(&he1, &hrel2) == FP_OK);
+        assert(fp_event_encode(&he1, &eb, &el) == FP_OK);
+        snprintf(rp, sizeof(rp), "%s/1.ev", h_ev);
+        write_bytes_file(rp, eb, el);
+        free(eb);
+
+        /* Event 2: fresh latest event signed by NEW release key hrel3! */
+        he2.action = FP_ACTION_INSTALL; he2.repo_id = hrid; he2.serial = 2;
+        he2.prev_event_hash = he1.event_hash;
+        he2.timestamp_unix = now - 10; he2.expires_unix = now + 3600;
+        he2.target_dna = hbd2; he2.target_size = hbs2;
+        assert(fp_event_sign(&he2, &hrel3) == FP_OK);
+        assert(fp_event_encode(&he2, &eb, &el) == FP_OK);
+        snprintf(rp, sizeof(rp), "%s/2.ev", h_ev);
+        write_bytes_file(rp, eb, el);
+        snprintf(rp, sizeof(rp), "%s/latest.ev", h_st);
+        write_bytes_file(rp, eb, el);
+        free(eb);
+
+        /* Point mini HTTP server at hrepo temporarily */
+        srv.repo_dir = hrepo;
+        char hstore[512], htarget[512], hhcmd[768];
+        snprintf(hstore, sizeof(hstore), "%s/store", hedge);
+        snprintf(htarget, sizeof(htarget), "%s/live", hedge);
+        snprintf(hhcmd, sizeof(hhcmd), "grep -q 'STATUS=OK_V3!' '%s/current/app.cfg'", htarget);
+
+        fp_agent_cfg_t hcfg;
+        memset(&hcfg, 0, sizeof(hcfg));
+        hcfg.device_id = "edge-offline-recover";
+        hcfg.repo_url = base_url;
+        hcfg.channel = "stable";
+        hcfg.store_dir = hstore;
+        hcfg.target_dir = htarget;
+        hcfg.root_path = hedge_root;
+        hcfg.health_cmd = hhcmd;
+        hcfg.health_timeout_sec = 5;
+
+        assert(fp_agent_sync_once(&hcfg, &rep) == FP_OK);
+        assert(rep.outcome == FP_AGENT_UPDATED && rep.root_version == 3 && rep.active_serial == 2);
+        printf("[PASS] P1-04 offline recovery: expired root v1 -> v2 -> v3 + historical key chain synced cleanly!\n");
+    }
+
     srv.stop = 1;
     shutdown(lfd, SHUT_RDWR);
     close(lfd);

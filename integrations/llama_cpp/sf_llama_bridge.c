@@ -83,8 +83,13 @@ enum {
     BR_TAG_CHUNK_HDR = 10,
     BR_TAG_CHUNK_DAT = 11,
     BR_TAG_RPC_ZERO  = 12, /* cmd(1) | expect_resp(1) | pref_len(4 BE) | data_len(4 BE) | prefix */
+    BR_TAG_HELLO     = 13, /* "SFLB"(4) | ver(2 BE) | hdr_len(2 BE) | cmd_max(2 BE) | caps(4 BE) | cast(1) | strict(1) | topk(2 BE) | rsv(2) */
     BR_TAG_CLOSE     = 99
 };
+
+#define BR_PROTO_VER     4u
+#define BR_GGML_CMD_MAX  16u
+#define BR_CAP_ALL       0x000000FFu /* SFT1|TOPK|ZSTD|DEDUP|ZERO|PIPE0RTT|ALLOC_CACHE|OUTLIER_GUARD */
 
 static int buf_is_all_zero(const uint8_t *p, size_t n) {
     size_t i = 0;
@@ -458,6 +463,7 @@ typedef struct {
     int                  fec_mode;       /* 0=off, 1=on, 2=adaptive */
     int                  io_timeout_ms;
     int                  enable_zstd;
+    int                  strict_lossless;
     uint16_t             logits_topk;    /* Default 64 (0 = disabled) */
     const char          *cache_dir;
     known_dna_set_t     *known_dnas;
@@ -619,6 +625,25 @@ static fp_err_t run_client_session(int local_cli_fd, sf_split_transport_t tr,
                                    fp_session_t *ts, fp_udp_session_t *us,
                                    bridge_state_t *st) {
     uint64_t seq = 0;
+    if (st->strict_lossless) {
+        st->wire_cast = FP_WIRE_CAST_NONE;
+        st->logits_topk = 0u;
+    }
+    /* One-shot 20 B protocol compatibility preamble (0 RTT added, 0 per-token overhead) */
+    {
+        uint8_t hlo[20];
+        memcpy(hlo, "SFLB", 4);
+        put_be16(hlo + 4, (uint16_t)BR_PROTO_VER);
+        put_be16(hlo + 6, (uint16_t)st->rpc_tensor_hdr_len);
+        put_be16(hlo + 8, (uint16_t)BR_GGML_CMD_MAX);
+        put_be32(hlo + 10, BR_CAP_ALL);
+        hlo[14] = (uint8_t)st->wire_cast;
+        hlo[15] = (uint8_t)(st->strict_lossless ? 1u : 0u);
+        put_be16(hlo + 16, st->logits_topk);
+        put_be16(hlo + 18, 0u);
+        fp_err_t herr = tun_send(tr, ts, us, BR_TAG_HELLO, hlo, sizeof(hlo), NULL);
+        if (herr != FP_OK) return herr;
+    }
     alloc_cache_entry_t *acache = calloc(BR_ALLOC_CACHE_SZ, sizeof(*acache));
     for (;;) {
         uint8_t hdr[9];
@@ -912,6 +937,23 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
         fp_err_t err = tun_recv(tr, ts, us, BR_MAX_PAYLOAD, &tag, &msg, &mlen, NULL);
         if (err != FP_OK) return err;
         if (tag == BR_TAG_CLOSE) { free(msg); return FP_OK; }
+        if (tag == BR_TAG_HELLO) {
+            if (mlen != 20u || memcmp(msg, "SFLB", 4) != 0) { free(msg); return FP_ERR_POLICY; }
+            uint16_t pver = get_be16(msg + 4);
+            uint16_t hlen = get_be16(msg + 6);
+            uint16_t cmax = get_be16(msg + 8);
+            if (pver != BR_PROTO_VER || hlen != (uint16_t)st->rpc_tensor_hdr_len || cmax > BR_GGML_CMD_MAX) {
+                free(msg);
+                return FP_ERR_POLICY;
+            }
+            if (msg[15] != 0u) {
+                st->strict_lossless = 1;
+                st->wire_cast = FP_WIRE_CAST_NONE;
+                st->logits_topk = 0u;
+            }
+            free(msg);
+            continue;
+        }
 
         uint8_t cmd = 0, expect_resp = 0;
         uint8_t *rpc_payload = NULL;
@@ -1520,7 +1562,7 @@ int main(int argc, char **argv) {
     uint16_t logits_topk = 64u;
     double wan_rtt_ms = 0.0, wan_jitter_ms = 0.0, wan_p99_ms = 0.0;
     double wan_ul_mbps = 0.0, wan_dl_mbps = 0.0, wan_tcp_loss_pct = 0.0;
-    int do_selftest = 0, once = 0, enable_zstd = 1;
+    int do_selftest = 0, once = 0, enable_zstd = 1, strict_lossless = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--keygen") == 0 && i + 1 < argc) {
@@ -1534,6 +1576,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--selftest") == 0) { do_selftest = 1; }
         else if (strcmp(argv[i], "--once") == 0) { once = 1; }
         else if (strcmp(argv[i], "--no-zstd") == 0) { enable_zstd = 0; }
+        else if (strcmp(argv[i], "--strict-lossless") == 0) { strict_lossless = 1; }
         else if (strcmp(argv[i], "--role") == 0 && i + 1 < argc) { role = argv[++i]; }
         else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) { keyfile = argv[++i]; }
         else if (strcmp(argv[i], "--cache-dir") == 0 && i + 1 < argc) { cache_dir = argv[++i]; }
@@ -1595,7 +1638,7 @@ int main(int argc, char **argv) {
                 memset(&st, 0, sizeof(st));
                 st.transport = tr; st.wire_cast = cast; st.fec_mode = fec_mode;
                 st.rpc_tensor_hdr_len = GGML_RPC_TENSOR_LEN;
-                st.enable_zstd = enable_zstd; st.cache_dir = cache_dir;
+                st.enable_zstd = enable_zstd; st.strict_lossless = strict_lossless; st.cache_dir = cache_dir;
                 st.logits_topk = logits_topk;
                 (void)run_server_session(bfd, tr, ts, us, &st);
                 close(bfd);
@@ -1628,7 +1671,7 @@ int main(int argc, char **argv) {
                 memset(&st, 0, sizeof(st));
                 st.transport = tr; st.wire_cast = cast; st.fec_mode = fec_mode;
                 st.rpc_tensor_hdr_len = GGML_RPC_TENSOR_LEN;
-                st.enable_zstd = enable_zstd; st.cache_dir = cache_dir;
+                st.enable_zstd = enable_zstd; st.strict_lossless = strict_lossless; st.cache_dir = cache_dir;
                 st.known_dnas = cache_dir ? &known : NULL;
                 st.logits_topk = logits_topk;
                 st.wan_rtt_ms = wan_rtt_ms; st.wan_jitter_ms = wan_jitter_ms;

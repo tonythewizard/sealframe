@@ -1957,6 +1957,22 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
             serve_file_with_range(cfd, fpath, hdr_range);
             return;
         }
+        if (strncmp(path, "/repo/roots/", 12) == 0) {
+            const char *rest = path + 12;
+            size_t rlen = strlen(rest);
+            if (rlen > 4u && strcmp(rest + rlen - 4u, ".fpr") == 0) {
+                char num[32];
+                size_t nl = rlen - 4u;
+                if (nl == 0 || nl >= sizeof(num)) { send_text(cfd, 400, "bad root version"); return; }
+                memcpy(num, rest, nl); num[nl] = '\0';
+                if (!is_digits_only(num)) { send_text(cfd, 400, "bad root version"); return; }
+                if (snprintf(fpath, sizeof(fpath), "%s/roots/%s.fpr", st->repo_dir, num) >= (int)sizeof(fpath)) {
+                    send_text(cfd, 404, "not found"); return;
+                }
+                serve_file_with_range(cfd, fpath, hdr_range);
+                return;
+            }
+        }
         if (strcmp(path, "/repo/latest.ev") == 0) {
             if (snprintf(fpath, sizeof(fpath), "%s/latest.ev", st->repo_dir) >= (int)sizeof(fpath)) {
                 send_text(cfd, 404, "not found"); return;
