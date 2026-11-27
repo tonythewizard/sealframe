@@ -1,0 +1,17 @@
+build/
+bin/
+*.o
+*.a
+*.so
+*.so.*
+*.deb
+*.deb.sha256
+*.key
+*.pub
+*.pem
+*.gguf
+*.log
+*.tar.gz
+.env
+__pycache__/
+*.pyc

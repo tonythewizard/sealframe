@@ -1,0 +1,31 @@
+[Unit]
+Description=SealFrame On-Premises Enterprise Control Plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/sealframe/control-plane.env
+ExecStart=/usr/local/bin/sf-cp \
+    --bind ${SF_CP_BIND} \
+    --port ${SF_CP_PORT} \
+    --data-dir ${SF_CP_DATA_DIR} \
+    --sbom ${SF_CP_SBOM} \
+    --require-signed-heartbeat
+Restart=on-failure
+RestartSec=5s
+
+# Security & Resource Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+MemoryMax=64M
+ReadWritePaths=/var/lib/sealframe-control-plane
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,36 @@
+[Unit]
+Description=SealFrame Edge Agent (FP01/FPR1)
+Documentation=file:///usr/local/share/doc/sealframe/CRA_TECHNICAL_FILE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/sealframe/agent.env
+ExecStart=/usr/local/bin/sf-agent \
+    --repo ${SF_REPO_URL} \
+    --channel ${SF_CHANNEL} \
+    --device ${SF_DEVICE_ID} \
+    --store ${SF_STORE_DIR} \
+    --target ${SF_TARGET_DIR} \
+    --root ${SF_ROOT_FPR} \
+    --key ${SF_DEVICE_KEY} \
+    --health-cmd ${SF_HEALTH_CMD} \
+    --interval ${SF_INTERVAL_SEC}
+Restart=on-failure
+RestartSec=5s
+
+# Security & Resource Hardening (EU CRA / IEC 62443 aligned)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+MemoryMax=32M
+ReadWritePaths=/var/lib/sealframe-agent /opt/sealframe-app
+
+[Install]
+WantedBy=multi-user.target

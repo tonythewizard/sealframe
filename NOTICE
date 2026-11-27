@@ -1,0 +1,28 @@
+SealFrame™
+Copyright © 2026 SealFrame Authors.
+
+This product is dual-licensed under the GNU Affero General Public License v3.0
+(see LICENSE) and a Commercial License (see LICENSE-COMMERCIAL.md).
+
+================================================================================
+THIRD-PARTY SOFTWARE NOTICES AND ATTRIBUTIONS
+================================================================================
+
+1. BLAKE3 Reference C Implementation (vendored in third_party/blake3/)
+   - Copyright (c) 2019-2025 Jack O'Connor and Samuel Neves
+   - License: CC0 1.0 Universal OR Apache License, Version 2.0
+   - Source: https://github.com/BLAKE3-team/BLAKE3
+
+2. libsodium (dynamically linked system library)
+   - Copyright (c) 2013-2026 Frank Denis
+   - License: ISC License
+   - Source: https://github.com/jedisct1/libsodium
+
+3. Zstandard / libzstd (dynamically linked system library)
+   - Copyright (c) Meta Platforms, Inc. and affiliates
+   - License: BSD-3-Clause License (dual BSD / GPLv2)
+   - Source: https://github.com/facebook/zstd
+
+4. SQLite / libsqlite3 (dynamically linked system library)
+   - License: Public Domain
+   - Source: https://www.sqlite.org/

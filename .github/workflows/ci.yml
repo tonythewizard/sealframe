@@ -1,0 +1,44 @@
+name: SealFrame Pure-C11 CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler: [ gcc, clang ]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install minimal C11 runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang pkg-config \
+            libsodium-dev libzstd-dev libsqlite3-dev binutils
+
+      - name: Build, run all 11 test suites, ELF hardening & SBOM (${{ matrix.compiler }})
+        run: |
+          make CC=${{ matrix.compiler }} clean all test security-check sbom
+
+      - name: Run sf-llama-bridge multi-profile selftest
+        run: |
+          ./bin/sf-llama-bridge --selftest --transport udp --cast int8 --fec auto --logits-topk 64 --drop 2
+          ./bin/sf-llama-bridge --selftest --transport udp --cast int4o --fec auto --logits-topk 64 --drop 2
+
+      - name: AddressSanitizer + UBSan verification (GCC)
+        if: matrix.compiler == 'gcc'
+        run: |
+          make clean
+          make CC=gcc CFLAGS="-std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Werror -pedantic -Iinclude -Ithird_party/blake3 -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0" \
+               LDFLAGS="-fsanitize=address,undefined -lsodium -lzstd -lsqlite3 -lpthread -lm" \
+               build/test_particle build/test_net build/test_cdc build/test_bundle build/test_trust build/test_swarm build/test_chain_adapters build/test_split_shim
+          for t in build/test_particle build/test_net build/test_cdc build/test_bundle build/test_trust build/test_swarm build/test_chain_adapters build/test_split_shim; do
+            ./"$t"
+          done

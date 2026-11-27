@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SealFrame — Dossier Commerciale &amp; Tecnico B2B (EU CRA Ready)</title>
+<style>
+  :root {
+    --ink: #0f172a;
+    --muted: #475569;
+    --line: #dbe3ee;
+    --soft: #f8fafc;
+    --navy: #0b162c;
+    --blue: #0284c7;
+    --teal: #0f766e;
+    --amber: #b45309;
+    --okbg: #ecfdf5;
+    --oktx: #065f46;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #eef2f7;
+    color: var(--ink);
+    font: 13.5px/1.58 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .toolbar {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--navy); color: #fff;
+    padding: 10px 24px; display: flex; justify-content: space-between; align-items: center;
+    border-bottom: 2px solid var(--blue);
+  }
+  .toolbar button {
+    background: var(--blue); color: #fff; border: 0; border-radius: 6px;
+    padding: 8px 16px; font-weight: 700; cursor: pointer; font-size: 13px;
+  }
+  .sheet {
+    max-width: 920px;
+    margin: 24px auto;
+    background: #fff;
+    box-shadow: 0 10px 30px rgba(15,23,42,.08);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .cover {
+    background: linear-gradient(135deg, #0b162c 0%, #13294b 65%, #0c4a6e 100%);
+    color: #fff;
+    padding: 46px 48px 40px;
+  }
+  .badge {
+    display: inline-block; padding: 4px 10px; border-radius: 999px;
+    background: rgba(56,189,248,.18); border: 1px solid rgba(56,189,248,.45);
+    color: #bae6fd; font-size: 11px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase;
+  }
+  .cover h1 { margin: 14px 0 8px; font-size: 34px; letter-spacing: -.4px; line-height: 1.15; }
+  .cover .lead { font-size: 16px; color: #cbd5e1; max-width: 720px; margin: 0 0 26px; }
+  .kpis {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+  }
+  .kpi {
+    background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.15);
+    border-radius: 8px; padding: 12px 14px;
+  }
+  .kpi .val { font-size: 21px; font-weight: 800; color: #38bdf8; }
+  .kpi .lbl { font-size: 11.5px; color: #e2e8f0; margin-top: 2px; }
+  .meta-strip {
+    background: #081020; color: #94a3b8; font-size: 11.5px;
+    padding: 10px 48px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+  }
+  .content { padding: 34px 48px 46px; }
+  h2 {
+    margin: 28px 0 10px; font-size: 19px; color: var(--navy);
+    border-bottom: 2px solid var(--blue); padding-bottom: 5px;
+  }
+  h2:first-child { margin-top: 0; }
+  h3 { margin: 16px 0 6px; font-size: 14.5px; color: #0c4a6e; }
+  p { margin: 0 0 10px; }
+  ul, ol { margin: 6px 0 12px; padding-left: 20px; }
+  li { margin-bottom: 5px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 12px 0; }
+  .card {
+    background: var(--soft); border: 1px solid var(--line);
+    border-radius: 8px; padding: 13px 15px;
+  }
+  .card strong { color: var(--navy); }
+  .callout {
+    background: #f0f9ff; border-left: 4px solid var(--blue);
+    padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 14px 0;
+  }
+  .callout.ok { background: var(--okbg); border-left-color: var(--teal); color: var(--oktx); }
+  .callout.warn { background: #fffbeb; border-left-color: #d97706; color: #78350f; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0 16px; font-size: 12.2px; }
+  th, td { border: 1px solid var(--line); padding: 7px 9px; text-align: left; vertical-align: top; }
+  th { background: #f1f5f9; color: var(--navy); font-weight: 700; }
+  tr:nth-child(even) td { background: #fafcff; }
+  td.num, th.num { text-align: right; white-space: nowrap; }
+  .hl { font-weight: 700; color: #0369a1; }
+  .oktag { display: inline-block; padding: 1px 7px; border-radius: 999px; background: var(--okbg); color: var(--oktx); font-weight: 700; font-size: 11px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.8px; background: #f1f5f9; padding: 1px 4px; border-radius: 4px; }
+  .qa { margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px dashed var(--line); }
+  .qa:last-child { border-bottom: 0; }
+  .qa .q { font-weight: 700; color: var(--navy); margin-bottom: 4px; }
+  .pb { break-before: page; page-break-before: always; }
+  .footer {
+    margin-top: 28px; padding-top: 12px; border-top: 1px solid var(--line);
+    font-size: 11.5px; color: var(--muted); display: flex; justify-content: space-between;
+  }
+  @page { size: A4; margin: 12mm; }
+  @media print {
+    body { background: #fff; font-size: 11.5px; }
+    .toolbar { display: none !important; }
+    .sheet { margin: 0; max-width: none; box-shadow: none; border-radius: 0; }
+    .cover { -webkit-print-color-adjust: exact; print-color-adjust: exact; padding: 28px 30px 24px; }
+    .meta-strip, .callout, .card, th, .oktag { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .content { padding: 20px 24px; }
+    tr, .card, .qa, .callout { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<div class="toolbar">
+  <div><strong>SealFrame v0.5.1</strong> — Dossier Commerciale &amp; Tecnico B2B (Italiano)</div>
+  <button onclick="window.print()">Stampa / Salva come PDF</button>
+</div>
+
+<div class="sheet">
+  <!-- COPERTINA -->
+  <div class="cover">
+    <span class="badge">Soluzione Proprietaria B2B · EU CRA Ready · Zero Copyleft</span>
+    <h1>SEALFRAME</h1>
+    <p class="lead">
+      Infrastruttura OTA ultra-compatta, auto-riparante e verificata crittograficamente per flotte
+      <strong>Industrial IoT, Robotica, Automazione ed Edge AI</strong> — progettata per la conformità
+      al <strong>Regolamento Europeo Cyber Resilience Act (UE 2024/2847)</strong>.
+    </p>
+    <div class="kpis">
+      <div class="kpi"><div class="val">123 KB</div><div class="lbl">Binario Edge Agent C11<br>(pacchetto .deb completo: 144 KB)</div></div>
+      <div class="kpi"><div class="val">5,86 MiB</div><div class="lbl">RAM picco server per servire<br>512 MiB su device da 256 MiB</div></div>
+      <div class="kpi"><div class="val">-99,83%</div><div class="lbl">Banda su patch 4 KiB / 32 MiB<br>(99,88% dedup anche su shift)</div></div>
+      <div class="kpi"><div class="val">10,26M</div><div class="lbl">Test libFuzzer+ASan+UBSan<br>0 crash · 0 UB · 0 memory leak</div></div>
+    </div>
+  </div>
+  <div class="meta-strip">
+    <span>Versione tecnica verificata: <strong>v0.5.1 (Commercial RC)</strong></span>
+    <span>Distribuzione: <strong>Closed-Source B2B / NDA / On-Premises &amp; Air-Gapped</strong></span>
+    <span>Data: <strong>2026-11-26</strong></span>
+  </div>
+
+  <div class="content">
+    <!-- SEZIONE 1 -->
+    <h2>1. Executive Summary &amp; Il Problema Reale delle Flotte Edge</h2>
+    <p>
+      Le aziende industriali e AI che gestiscono flotte di robot, gateway, PLC Linux o nodi Edge AI
+      sostengono oggi quattro rischi operativi ed economici critici:
+    </p>
+    <div class="grid2">
+      <div class="card"><strong>1. Spreco di banda 4G/5G/Satellitare</strong><br>Aggiornare modelli AI o firmware da 500 MB–50 GB con immagini intere o layer container pesanti satura i link e moltiplica i costi di connettività.</div>
+      <div class="card"><strong>2. Dispositivi bloccati ("brick") sul campo</strong><br>Un aggiornamento che modifica file e database locale SQLite in modo non atomico lascia il dispositivo inutilizzabile richiedendo interventi fisici on-site.</div>
+      <div class="card"><strong>3. Vulnerabilità Supply-Chain (chiave singola)</strong><br>Se una singola chiave di build CI/CD viene compromessa, l'attaccante può distribuire codice malevolo all'intera flotta senza ostacoli.</div>
+      <div class="card"><strong>4. Obblighi EU Cyber Resilience Act (CRA)</strong><br>Il Regolamento UE 2024/2847 impone aggiornamenti sicuri, SBOM aggiornati, tracciabilità completa, notifiche ENISA/CSIRT entro 24h e supporto per almeno 5 anni.</div>
+    </div>
+
+    <div class="callout">
+      <strong>La risposta di SealFrame:</strong> un'unica piattaforma proprietaria scritta in <strong>puro ISO C11</strong>
+      (zero Java, zero Go, zero Docker, zero OpenSSL, zero dipendenze GPL) che integra distribuzione differenziale,
+      <strong>rollback atomico File + Modello AI + SQLite</strong>, <strong>Root Multi-Sig 2-su-3</strong>, trasporto ibrido
+      LAN/UDP/HTTP Range e <strong>Control Plane On-Premises con export Audit EU CRA</strong> in un pacchetto Debian
+      da soli <strong>144 KB</strong>.
+    </div>
+
+    <!-- SEZIONE 2 -->
+    <h2>2. Architettura &amp; Le 5 Innovazioni Tecniche Chiave</h2>
+    <p>
+      SealFrame è composto da tre elementi modulari che funzionano <strong>100% on-premises o air-gapped</strong> (nessun cloud proprietario obbligatorio):
+      (a) libreria SDK <code>libsealframe</code> + CLI <code>sf</code>,
+      (b) Edge Agent <code>sf-agent</code> (demone <code>systemd</code> hardened con <code>MemoryMax=32M</code> e <code>ProtectSystem=strict</code>),
+      (c) Enterprise Control Plane On-Premises con dashboard web, HTTPS/TLS 1.2+, verifica Ed25519 sugli heartbeat e reportistica CRA.
+    </p>
+    <ol>
+      <li><strong>Content DNA (BLAKE3 Merkle 16 KiB) &amp; Resume Esatto:</strong> ogni blocco da 16 KiB viene verificato crittograficamente prima di toccare il disco. In caso di caduta di rete o <code>SIGKILL</code>, il download riparte dal chunk esatto senza riscaricare né scrivere un solo byte corrotto.</li>
+      <li><strong>Morph Autonomo + FastCDC (99,88% dedup anche su shift):</strong> il protocollo seleziona automaticamente tra <code>REF</code> (0 byte di payload se l'oggetto è già presente), <code>DELTA</code> (Zstd LDM) e chunking content-defined FastCDC resistente allo spostamento di byte.</li>
+      <li><strong>Particle Bundle Atomico (<code>FPB1</code>: File + Pesi AI + Database SQLite):</strong> applica file, modelli AI e changeset logici SQLite insieme; se il <code>--health-cmd</code> applicativo fallisce o va in timeout (watchdog <code>SIGKILL</code>), <code>sf-agent</code> <strong>inverte automaticamente anche le righe SQLite</strong> (<code>sqlite3changeset_invert</code>) ripristinando bit-per-bit la versione sana.</li>
+      <li><strong>Root Multi-Sig Offline 2-su-3 (<code>FPR1</code>):</strong> separa le chiavi Root (custodite offline/HSM) dalla chiave di rilascio CI/CD. Una chiave compromessa viene revocata e ruotata da remoto con doppio quorum senza mai bloccare la flotta.</li>
+      <li><strong>Trasporto Ibrido LAN-First + UDP Resiliente (<code>FP-NET</code> / <code>FP-UDP1</code>):</strong> l'agente prova prima un peer cifrato in fabbrica sulla LAN (X25519 + XChaCha20-Poly1305) per azzerare il traffico WAN, con fallback trasparente su HTTP/1.1 <code>206 Partial Content</code> Range; su reti mobili/instabili <code>FP-UDP1</code> gestisce fino al 25% di perdita pacchetti e migrazione IP live (Wi-Fi ↔ 4G).</li>
+    </ol>
+
+    <!-- SEZIONE 3 -->
+    <div class="pb"></div>
+    <h2>3. Vantaggi Concreti rispetto ai Sistemi Attuali</h2>
+    <p>
+      Confronto tra i valori <strong>misurati</strong> di SealFrame (<code>v0.5.1</code> Debian 13 <code>amd64</code>) e le architetture documentate delle piattaforme OTA e dei tool di sincronizzazione più diffusi:
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th>Capacità / Impronta</th>
+          <th>SealFrame <code>v0.5.1</code><br><em>(misurato)</em></th>
+          <th>Docker / OCI<br><em>(ref. arch.)</em></th>
+          <th>Mender / RAUC<br><em>(ref. arch.)</em></th>
+          <th>OSTree<br><em>(ref. arch.)</em></th>
+          <th><code>rsync</code> / <code>scp</code><br><em>(tool standard)</em></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Dimensione binario Agent</strong></td>
+          <td class="hl">123 KB (C11)</td>
+          <td>50–100+ MB (Go)</td>
+          <td>0,5–25 MB</td>
+          <td>2–5 MB (+ GLib)</td>
+          <td>Non è un agent OTA</td>
+        </tr>
+        <tr>
+          <td><strong>RAM live Agent</strong></td>
+          <td class="hl">0,5–11,5 MiB (<code>MemoryMax=32M</code>)</td>
+          <td>80–250+ MiB</td>
+          <td>5–60 MiB</td>
+          <td>15–40 MiB</td>
+          <td>N/A</td>
+        </tr>
+        <tr>
+          <td><strong>Rollback atomico File + SQLite</strong></td>
+          <td><span class="oktag">Sì nativo</span></td>
+          <td>No (volumi separati)</td>
+          <td>Solo partizione A/B</td>
+          <td>Solo filesystem</td>
+          <td>No</td>
+        </tr>
+        <tr>
+          <td><strong>Root Multi-Sig 2-su-3 offline</strong></td>
+          <td><span class="oktag">Sì nativo (FPR1)</span></td>
+          <td>Esterno (Cosign)</td>
+          <td>PKI X.509 / no quorum</td>
+          <td>No quorum</td>
+          <td>No</td>
+        </tr>
+        <tr>
+          <td><strong>Deduplica Shift / Cross-File</strong></td>
+          <td><span class="oktag">Sì (99,88% FastCDC)</span></td>
+          <td>Solo per layer</td>
+          <td>No / limitata</td>
+          <td>Solo file interi</td>
+          <td>Solo 1-a-1</td>
+        </tr>
+        <tr>
+          <td><strong>Swarm LAN + UDP Anti-Loss</strong></td>
+          <td><span class="oktag">Sì (FPN1 + FPU1)</span></td>
+          <td>No</td>
+          <td>No</td>
+          <td>No</td>
+          <td>No</td>
+        </tr>
+        <tr>
+          <td><strong>Audit EU CRA + SBOM integrati</strong></td>
+          <td><span class="oktag">Chiavi in mano</span></td>
+          <td>Esterno</td>
+          <td>Parziale / Enterprise</td>
+          <td>No</td>
+          <td>No</td>
+        </tr>
+        <tr>
+          <td><strong>Dipendenze &amp; Licenza</strong></td>
+          <td class="hl">Proprietario · 0 GPL</td>
+          <td>Stack complesso</td>
+          <td>Apache / LGPL / GPL</td>
+          <td>LGPL</td>
+          <td>GPLv3 (<code>rsync</code>)</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- SEZIONE 4 -->
+    <h2>4. Benchmark Reali Misurati su Hardware Fisico Vincolato</h2>
+    <p>
+      Tutti i test di rete sono stati eseguiti fisicamente su rete reale <strong>Ethernet ↔ Wi-Fi</strong> tra un server
+      volutamente estremo — <strong>Proxmox LXC con CPU Intel Pentium P6100 del 2010 (1 core, senza AVX né AES-NI),
+      256 MiB di RAM totali e HDD meccanico</strong> — e una workstation Linux moderna.
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th>Scenario Misurato</th>
+          <th>SealFrame (<code>v0.5.1</code>)</th>
+          <th>Comparatore Standard</th>
+          <th>Risultato &amp; Lettura Onesta</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Multi-RAM 512 MiB</strong><br><em>(File = 2× RAM del server!)</em></td>
+          <td class="hl">29,8 MiB/s · Peak RSS server 5,86 MiB</td>
+          <td>App con load in RAM → OOM</td>
+          <td>Dimostra streaming <code>pread()</code> a memoria costante anche su device da 256 MiB RAM.</td>
+        </tr>
+        <tr>
+          <td><strong><code>SIGKILL</code> a 134 MiB + Resume</strong></td>
+          <td class="hl">8.529 chunk saltati (0 B corrotti)</td>
+          <td><code>scp</code> riparte da 0%</td>
+          <td>Ripresa esatta verificata SHA-256 bit-exact su rete fisica.</td>
+        </tr>
+        <tr>
+          <td><strong>Hashing Integrità 64 MiB (P6100)</strong></td>
+          <td class="hl">0,36 s (177,8 MiB/s · 2,7 MiB RAM)</td>
+          <td><code>sha256sum</code>: 0,45 s (3,7 MiB RAM)</td>
+          <td><strong>+25% più veloce, -28% RAM</strong> (in pure-C senza SIMD) + albero Merkle 16 KiB.</td>
+        </tr>
+        <tr>
+          <td><strong>Patch 4 KiB su Firmware 32 MiB</strong></td>
+          <td class="hl">56,5 KiB su rete (<code>0,17%</code>)</td>
+          <td><code>zstd</code>: 3,65 MiB · <code>gzip</code>: 25,9 MiB</td>
+          <td><strong>65×–458× meno dati</strong> rispetto a pacchetti compressi interi.</td>
+        </tr>
+        <tr>
+          <td><strong>Shift +137 B su 32 MiB</strong></td>
+          <td class="hl">99,88% dedup (solo 2 chunk nuovi)</td>
+          <td><code>rsync</code>: 76,8 KiB · Blocchi fissi: ~0%</td>
+          <td>FastCDC in <code>42 ms</code> (762 MiB/s), RSS fisso <code>12,4 MiB</code>.</td>
+        </tr>
+        <tr>
+          <td><strong>Trasferimento Freddo 64 MiB LAN</strong></td>
+          <td class="hl">29,7 MiB/s (Server RSS 3,30 MiB)</td>
+          <td><code>rsync -e ssh</code>: 28,1 · <code>scp</code>: 31,7 MiB/s</td>
+          <td><strong>Batte <code>rsync</code></strong> ed è entro il 6,7% da <code>scp</code> aggiungendo Merkle + resume.</td>
+        </tr>
+        <tr>
+          <td><strong>Sync Identico (No-Op 32 MiB)</strong></td>
+          <td class="hl">0,028 s · 511 B su rete</td>
+          <td><code>rsync --checksum</code>: 0,627 s · 75,5 KiB</td>
+          <td><strong>22× più veloce e 147× meno banda</strong> di <code>rsync --checksum</code>.</td>
+        </tr>
+        <tr>
+          <td><strong>Patch 4 KiB live su LAN veloce</strong></td>
+          <td>57,0 KiB · 1,501 s</td>
+          <td><code>rsync</code>: ~75,4 KiB · 0,877 s</td>
+          <td><strong>-24% banda</strong> per SealFrame; <code>rsync</code> è più rapido in CPU su LAN veloce (su 4G/WAN vince la banda o il delta pre-calcolato).</td>
+        </tr>
+        <tr>
+          <td><strong>UDP Cifrato <code>FP-UDP1</code> (32 MiB)</strong></td>
+          <td class="hl">18,2 MiB/s · 0 retrans · 3,30 MiB RSS</td>
+          <td><code>scp</code> TCP: 16,0 MiB/s (2,005 s)</td>
+          <td>Sopravvive al <strong>25% packet loss + cambio IP live</strong> (test Chaos: 19 ms).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- SEZIONE 5 -->
+    <div class="pb"></div>
+    <h2>5. Sicurezza Verificata &amp; Conformità EU Cyber Resilience Act (CRA)</h2>
+    <p>
+      Il <strong>Regolamento (UE) 2024/2847 (CRA)</strong> impone requisiti stringenti a chiunque immetta sul mercato
+      prodotti con elementi digitali. SealFrame integra nativamente gli artefatti tecnici richiesti:
+    </p>
+    <div class="grid2">
+      <div class="card">
+        <strong>Hardening Binario &amp; Verifica ELF</strong><br>
+        Compilazione <code>-Wall -Wextra -Werror -pedantic</code> (0 warning su GCC 16 e Clang 23) con <strong>PIE, Full RELRO, NX Stack, Stack Canary, <code>_FORTIFY_SOURCE=3</code></strong> verificati ad ogni build con <code>make security-check</code>. Zero OpenSSL/X.509.
+      </div>
+      <div class="card">
+        <strong>Fuzzing Industriale Continuo</strong><br>
+        Harness nativo <strong>Clang <code>libFuzzer + ASan + UBSan</code></strong> su tutti i 7 parser binari e verificatori: <strong>10.263.534 esecuzioni</strong> coverage-guided (641k exec/s) → <strong>0 crash, 0 buffer overflow, 0 UB, 0 leak</strong>.
+      </div>
+      <div class="card">
+        <strong>SBOM CycloneDX 1.5 &amp; Zero Copyleft</strong><br>
+        Generazione automatica di <code>sbom.cdx.json</code> con SHA-256 binari e tracciamento delle sole 4 librerie permissive (BLAKE3 1.8.2 vendorizzato CC0/Apache-2.0, libsodium ISC, zstd BSD-3, SQLite3 Public Domain).
+      </div>
+      <div class="card">
+        <strong>Fascicolo Tecnico &amp; Audit Export</strong><br>
+        Include Threat Model STRIDE (Allegato VII), Manuale Integratore (Allegato II), Policy CVD + playbook notifica ENISA/CSIRT Italia 24h/72h/14g (Art. 14) ed export <strong>Report Audit CRA JSON + HTML/PDF</strong> dal Control Plane.
+      </div>
+    </div>
+
+    <!-- SEZIONE 6 -->
+    <h2>6. Risposte Dirette alle 7 Domande Critiche di CTO &amp; CISO</h2>
+    <div class="qa"><div class="q">1. Perché non usare semplicemente Docker / Kubernetes Edge?</div>Docker/k3s richiedono 150–400+ MB RAM, trasferiscono layer pesanti e non garantiscono rollback atomico coordinato con database SQLite locali. <code>sf-agent</code> pesa ~123 KB, gira entro <code>MemoryMax=32M</code> e gestisce file, modelli AI e SQLite insieme.</div>
+    <div class="qa"><div class="q">2. SealFrame sostituisce o affianca Mender / RAUC?</div>Può fare entrambe le cose: su molti sistemi embedded può <strong>affiancare</strong> un OS A/B (Mender/RAUC per kernel/OS, SealFrame per modelli AI multi-GB, configurazioni e stato SQLite senza raddoppiare la flash).</div>
+    <div class="qa"><div class="q">3. Perché non <code>rsync</code> su SSH o <code>curl</code> + script custom?</div><code>rsync</code>/<code>curl</code> non offrono Multi-Sig 2-su-3, anti-downgrade, revoca permanente, verifica Merkle per chunk né rollback atomico SQLite. Su No-Op <code>FP-NET</code> è 22× più veloce; inoltre <code>rsync</code> è GPLv3.</div>
+    <div class="qa"><div class="q">4. Come possiamo fidarci di un software C chiuso in produzione critica?</div>Tramite: verifica ELF indipendente sul binario consegnato, SBOM CycloneDX 1.5, evidenze <code>libFuzzer</code>/ASan riproducibili, <strong>Attestato di Pentest di terza parte sotto NDA</strong> <em>(gate v1.0)</em> e <strong>Source Code Escrow</strong> contrattuale UE.</div>
+    <div class="qa"><div class="q">5. Cosa succede se cade la rete o la corrente durante un aggiornamento?</div>La rete riprende esattamente al chunk 16 KiB verificato; un <code>SIGKILL</code> lascia intatta la versione precedente (verificato con 10 <code>SIGKILL</code> reali su HDD); se l'app fallisce il health-check scatta il rollback automatico (file + SQLite).</div>
+    <div class="qa"><div class="q">6. Cosa succede se la chiave di firma CI/CD viene compromessa?</div>Due custodi Root su tre firmano offline una rotazione <code>root.fpr</code> (<code>v+1</code>) che revoca permanentemente la chiave compromessa. I dispositivi la rigettano automaticamente (<code>FP_ERR_REVOKED</code>) senza perdere la continuità della catena.</div>
+    <div class="qa"><div class="q">7. Qual è lo stato di maturità reale oggi (<code>v0.5.1</code>) rispetto alla marcatura CE <code>v1.0.0</code>?</div><strong>Massima trasparenza:</strong> la piattaforma è completa e verificata fisicamente su <code>x86_64</code> (incluso pacchetto <code>.deb</code> installato su Proxmox 256 MiB RAM + HDD). Prima della firma legale EU DoC <code>v1.0.0</code> restano da completare: validazione su silicio fisico <strong>ARM64</strong> del cliente, test <strong>power-cut kernel (<code>dm-flakey</code>)</strong> sul filesystem target e <strong>pentest indipendente sotto NDA</strong>.</div>
+
+    <!-- SEZIONE 7 -->
+    <h2>7. Modello Commerciale B2B &amp; Proposta di Pilota PoC (30 Giorni)</h2>
+    <table>
+      <thead>
+        <tr><th>Tier Commerciale</th><th>Contenuto della Fornitura</th><th>Modello Licenza</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Edge Fleet License</strong></td>
+          <td>Pacchetti binari hardened (<code>.deb</code> / ARM64) di <code>sf-agent</code> + <code>sf</code> + Enterprise Control Plane On-Premises + Export Audit CRA + SBOM + aggiornamenti sicurezza 5 anni.</td>
+          <td>Canone annuale per dispositivo gestito (fasce a volume).</td>
+        </tr>
+        <tr>
+          <td><strong>OEM Embedded SDK</strong></td>
+          <td>Libreria proprietaria <code>libsealframe.a</code> / <code>libsealframe.so</code> + header C11 + supporto cross-compile + Fascicolo Tecnico CRA + attestato audit sotto NDA.</td>
+          <td>Licenza OEM annuale / royalty per linea di prodotto.</td>
+        </tr>
+        <tr>
+          <td><strong>Enterprise / Critical Infra</strong></td>
+          <td>Branch LTS 5–10 anni, integrazione HSM/TPM 2.0, modulo opzionale di ancoraggio trasparenza, <strong>Source Code Escrow UE</strong>.</td>
+          <td>Contratto enterprise pluriennale dedicato.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout ok">
+      <strong>Prossimo Passo Immediato — Demo Live (15 min) + Pilota PoC di 30 Giorni:</strong><br>
+      1) <strong>Demo Live (<code>demo_cto.sh</code>)</strong>: mostriamo in diretta rilascio <code>v1</code>, attacco supply-chain bloccato (<code>401</code> + firma rogue respinta), update rotto con rollback automatico e generazione del Report Audit EU CRA.<br>
+      2) <strong>Pilota sul campo (30 giorni)</strong>: installazione del <code>.deb</code> da 144 KB su <strong>5–20 dispositivi reali</strong> del cliente con misura congiunta di risparmio banda, stabilità e conformità CRA.
+    </div>
+
+    <div class="footer">
+      <span>SealFrame — Proprietary B2B Technical &amp; Commercial Dossier (<code>v0.5.1</code>)</span>
+      <span>Documento riservato — Uso commerciale B2B / NDA</span>
+    </div>
+  </div>
+</div>
+</body>
+</html>
