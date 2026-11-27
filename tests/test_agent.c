@@ -826,6 +826,186 @@ int main(void) {
             assert(rep.root_version == 43);
             printf("[PASS] TRUST-01 (P1-04): 40-step verified root rotation chain (v3 -> v43) synced cleanly!\n");
         }
+
+        /* Test M (4th Audit: P0-02 SQLite multi-event catch-up, SF-A02/P0-05 mixed INSTALL+REVOKE & double-REVOKE, SF-A05/P0-04) */
+        {
+            char m4tmpl[] = "/tmp/fp-ag-m4-XXXXXX";
+            char *mdir = mkdtemp(m4tmpl);
+            assert(mdir != NULL);
+            char mrepo[256], mev[300], mchan[300], mst[340], mroots[300], medge[256];
+            char mstore[300], mtarget[300], msrc_dbp[300], mdst_dbp[300], mroot_p[300], mhcmd[512];
+            snprintf(mrepo, sizeof(mrepo), "%s/repo", mdir);
+            snprintf(mev, sizeof(mev), "%s/events", mrepo);
+            snprintf(mchan, sizeof(mchan), "%s/channels", mrepo);
+            snprintf(mst, sizeof(mst), "%s/stable", mchan);
+            snprintf(mroots, sizeof(mroots), "%s/roots", mrepo);
+            snprintf(medge, sizeof(medge), "%s/edge", mdir);
+            snprintf(mstore, sizeof(mstore), "%s/store", medge);
+            snprintf(mtarget, sizeof(mtarget), "%s/live", medge);
+            snprintf(msrc_dbp, sizeof(msrc_dbp), "%s/src.db", mdir);
+            snprintf(mdst_dbp, sizeof(mdst_dbp), "%s/dst.db", medge);
+            snprintf(mroot_p, sizeof(mroot_p), "%s/root.fpr", medge);
+            assert(mkdir(mrepo, 0755) == 0 && mkdir(mev, 0755) == 0);
+            assert(mkdir(mchan, 0755) == 0 && mkdir(mst, 0755) == 0 && mkdir(mroots, 0755) == 0);
+            assert(mkdir(medge, 0755) == 0);
+
+            fp_keypair_t mrk, mrel;
+            assert(fp_keygen(&mrk) == FP_OK && fp_keygen(&mrel) == FP_OK);
+            fp_dna_t mrid;
+            assert(fp_random_id(&mrid) == FP_OK);
+            fp_root_doc_t mr;
+            memset(&mr, 0, sizeof(mr));
+            mr.version = 1; mr.root_version = 1; mr.root_threshold = 1; mr.repo_id = mrid;
+            mr.timestamp_unix = now - 60; mr.expires_unix = now + 86400;
+            mr.root_key_count = 1; memcpy(mr.root_keys[0], mrk.pk, FP_PK_LEN);
+            memcpy(mr.release_pk, mrel.pk, FP_PK_LEN);
+            assert(fp_root_add_sig(&mr, &mrk) == FP_OK);
+            assert(fp_root_encode(&mr, &rb, &rl) == FP_OK);
+            write_bytes_file(mroot_p, rb, rl);
+            snprintf(rp, sizeof(rp), "%s/root.fpr", mrepo);
+            write_bytes_file(rp, rb, rl);
+            free(rb);
+
+            fp_sql_ctx_t *msrc = NULL, *mdst = NULL;
+            assert(fp_sql_open(msrc_dbp, &msrc) == FP_OK && fp_sql_open(mdst_dbp, &mdst) == FP_OK);
+            assert(fp_sql_exec(msrc, "CREATE TABLE cfg(k INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+            assert(fp_sql_exec(mdst, "CREATE TABLE cfg(k INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+
+            const char *msqls[4] = {
+                "INSERT INTO cfg VALUES (1, 10);",
+                "INSERT INTO cfg VALUES (2, 20);",
+                "INSERT INTO cfg VALUES (3, 30);",
+                "INSERT INTO cfg VALUES (4, 40);"
+            };
+            const char *mcfgs[4] = { "V=1\n", "V=2\n", "V=3\n", "V=4\n" };
+            fp_dna_t mbdnas[4], mdigs[4];
+            uint64_t mbsz[4];
+            for (int i = 0; i < 4; i++) {
+                uint8_t *cs = NULL; size_t csl = 0;
+                assert(fp_sql_capture_changeset(msrc, "cfg", msqls[i], &cs, &csl) == FP_OK);
+                assert(fp_sql_state_digest(msrc, "cfg", &mdigs[i]) == FP_OK);
+                fp_bundle_t mb;
+                memset(&mb, 0, sizeof(mb));
+                mb.version = 1; mb.entry_count = 2;
+                mb.entries[0].role = FP_ROLE_FILE; mb.entries[0].mode = 0644; mb.entries[0].size = 4;
+                snprintf(mb.entries[0].path, sizeof(mb.entries[0].path), "ver.txt");
+                assert(fp_store_put_object(mrepo, (const uint8_t *)mcfgs[i], 4, &mb.entries[0].dna) == FP_OK);
+                mb.entries[1].role = FP_ROLE_SQLITE_CHANGESET; mb.entries[1].size = csl;
+                snprintf(mb.entries[1].path, sizeof(mb.entries[1].path), "cfg");
+                assert(fp_store_put_object(mrepo, cs, csl, &mb.entries[1].dna) == FP_OK);
+                free(cs);
+                assert(fp_bundle_pack(mrepo, &mb, &mbdnas[i]) == FP_OK);
+                assert(fp_store_has_object(mrepo, &mbdnas[i], &mbsz[i]));
+            }
+            fp_sql_close(msrc);
+            fp_sql_close(mdst);
+
+            /* Emit events 1 (INSTALL V1), 2 (INSTALL V2), 3 (INSTALL V3) */
+            fp_event_t mev1, mev2, mev3, mev4, mev5, mev6, mev7;
+            memset(&mev1, 0, sizeof(mev1)); memset(&mev2, 0, sizeof(mev2)); memset(&mev3, 0, sizeof(mev3));
+            mev1.action = FP_ACTION_INSTALL; mev1.repo_id = mrid; mev1.serial = 1;
+            mev1.timestamp_unix = now; mev1.expires_unix = now + 3600;
+            mev1.target_dna = mbdnas[0]; mev1.target_size = mbsz[0];
+            assert(fp_event_sign(&mev1, &mrel) == FP_OK);
+            assert(fp_event_encode(&mev1, &eb, &el) == FP_OK);
+            snprintf(rp, sizeof(rp), "%s/1.ev", mev); write_bytes_file(rp, eb, el);
+            snprintf(rp, sizeof(rp), "%s/latest.ev", mst); write_bytes_file(rp, eb, el);
+            free(eb);
+
+            srv.repo_dir = mrepo;
+            snprintf(mhcmd, sizeof(mhcmd), "test -f '%s/current/ver.txt'", mtarget);
+            fp_agent_cfg_t mcfg;
+            memset(&mcfg, 0, sizeof(mcfg));
+            mcfg.device_id = "edge-m4"; mcfg.repo_url = base_url; mcfg.channel = "stable";
+            mcfg.store_dir = mstore; mcfg.target_dir = mtarget; mcfg.db_path = mdst_dbp;
+            mcfg.root_path = mroot_p; mcfg.health_cmd = mhcmd; mcfg.health_timeout_sec = 5;
+
+            /* Sync serial 1 (V1) */
+            assert(fp_agent_sync_once(&mcfg, &rep) == FP_OK && rep.active_serial == 1);
+
+            /* Publish serial 2 (V2) AND serial 3 (V3) while agent is offline -> single sync MUST replay V2 then V3! */
+            mev2.action = FP_ACTION_INSTALL; mev2.repo_id = mrid; mev2.serial = 2;
+            mev2.prev_event_hash = mev1.event_hash; mev2.timestamp_unix = now; mev2.expires_unix = now + 3600;
+            mev2.target_dna = mbdnas[1]; mev2.target_size = mbsz[1];
+            assert(fp_event_sign(&mev2, &mrel) == FP_OK);
+            assert(fp_event_encode(&mev2, &eb, &el) == FP_OK);
+            snprintf(rp, sizeof(rp), "%s/2.ev", mev); write_bytes_file(rp, eb, el);
+            free(eb);
+
+            mev3.action = FP_ACTION_INSTALL; mev3.repo_id = mrid; mev3.serial = 3;
+            mev3.prev_event_hash = mev2.event_hash; mev3.timestamp_unix = now; mev3.expires_unix = now + 3600;
+            mev3.target_dna = mbdnas[2]; mev3.target_size = mbsz[2];
+            assert(fp_event_sign(&mev3, &mrel) == FP_OK);
+            assert(fp_event_encode(&mev3, &eb, &el) == FP_OK);
+            snprintf(rp, sizeof(rp), "%s/3.ev", mev); write_bytes_file(rp, eb, el);
+            snprintf(rp, sizeof(rp), "%s/latest.ev", mst); write_bytes_file(rp, eb, el);
+            free(eb);
+
+            assert(fp_agent_sync_once(&mcfg, &rep) == FP_OK && rep.active_serial == 3);
+            assert(fp_sql_open(mdst_dbp, &mdst) == FP_OK);
+            fp_dna_t cur_mdig;
+            assert(fp_sql_state_digest(mdst, "cfg", &cur_mdig) == FP_OK && fp_dna_equal(&cur_mdig, &mdigs[2]));
+            fp_sql_close(mdst);
+            printf("[PASS] P0-02: Offline multi-event SQLite catch-up (V1->V2->V3) applied every intermediate changeset\n");
+
+            /* SF-A02 / P0-05 Case 1: Catch up across [INSTALL V4, REVOKE V2] -> MUST deploy V4 (NOT deactivate!) */
+            memset(&mev4, 0, sizeof(mev4)); memset(&mev5, 0, sizeof(mev5));
+            mev4.action = FP_ACTION_INSTALL; mev4.repo_id = mrid; mev4.serial = 4;
+            mev4.prev_event_hash = mev3.event_hash; mev4.timestamp_unix = now; mev4.expires_unix = now + 3600;
+            mev4.target_dna = mbdnas[3]; mev4.target_size = mbsz[3];
+            assert(fp_event_sign(&mev4, &mrel) == FP_OK);
+            assert(fp_event_encode(&mev4, &eb, &el) == FP_OK);
+            snprintf(rp, sizeof(rp), "%s/4.ev", mev); write_bytes_file(rp, eb, el);
+            free(eb);
+
+            mev5.action = FP_ACTION_REVOKE; mev5.repo_id = mrid; mev5.serial = 5;
+            mev5.prev_event_hash = mev4.event_hash; mev5.timestamp_unix = now; mev5.expires_unix = now + 3600;
+            mev5.target_dna = mbdnas[1]; mev5.target_size = 0; /* revoke old V2 while V4 is active! */
+            snprintf(mev5.reason, sizeof(mev5.reason), "revoke-old-v2");
+            assert(fp_event_sign(&mev5, &mrel) == FP_OK);
+            assert(fp_event_encode(&mev5, &eb, &el) == FP_OK);
+            snprintf(rp, sizeof(rp), "%s/5.ev", mev); write_bytes_file(rp, eb, el);
+            snprintf(rp, sizeof(rp), "%s/latest.ev", mst); write_bytes_file(rp, eb, el);
+            free(eb);
+
+            assert(fp_agent_sync_once(&mcfg, &rep) == FP_OK);
+            assert(rep.outcome == FP_AGENT_UPDATED && rep.active_serial == 5);
+            assert(fp_dna_equal(&rep.active_bundle_dna, &mbdnas[3]));
+            char mcur[640], mrev[640];
+            snprintf(mcur, sizeof(mcur), "%s/current", mtarget);
+            snprintf(mrev, sizeof(mrev), "%s/.sf_revoked", mtarget);
+            assert(lstat(mcur, &st_chk) == 0 && lstat(mrev, &st_chk) != 0);
+            assert(fp_sql_open(mdst_dbp, &mdst) == FP_OK);
+            assert(fp_sql_state_digest(mdst, "cfg", &cur_mdig) == FP_OK && fp_dna_equal(&cur_mdig, &mdigs[3]));
+            fp_sql_close(mdst);
+            printf("[PASS] SF-A02/P0-05 (1): Catch-up [INSTALL V4 + REVOKE V2] deployed V4 without deactivating live target\n");
+
+            /* SF-A02 / P0-05 Case 2: Double revoke [REVOKE V4 (current!), REVOKE V1 (old)] -> MUST deactivate live target! */
+            memset(&mev6, 0, sizeof(mev6)); memset(&mev7, 0, sizeof(mev7));
+            mev6.action = FP_ACTION_REVOKE; mev6.repo_id = mrid; mev6.serial = 6;
+            mev6.prev_event_hash = mev5.event_hash; mev6.timestamp_unix = now; mev6.expires_unix = now + 3600;
+            mev6.target_dna = mbdnas[3]; mev6.target_size = 0; /* revoke ACTIVE V4! */
+            snprintf(mev6.reason, sizeof(mev6.reason), "revoke-active-v4");
+            assert(fp_event_sign(&mev6, &mrel) == FP_OK);
+            assert(fp_event_encode(&mev6, &eb, &el) == FP_OK);
+            snprintf(rp, sizeof(rp), "%s/6.ev", mev); write_bytes_file(rp, eb, el);
+            free(eb);
+
+            mev7.action = FP_ACTION_REVOKE; mev7.repo_id = mrid; mev7.serial = 7;
+            mev7.prev_event_hash = mev6.event_hash; mev7.timestamp_unix = now; mev7.expires_unix = now + 3600;
+            mev7.target_dna = mbdnas[0]; mev7.target_size = 0; /* revoke old V1 after revoking V4 */
+            snprintf(mev7.reason, sizeof(mev7.reason), "revoke-old-v1");
+            assert(fp_event_sign(&mev7, &mrel) == FP_OK);
+            assert(fp_event_encode(&mev7, &eb, &el) == FP_OK);
+            snprintf(rp, sizeof(rp), "%s/7.ev", mev); write_bytes_file(rp, eb, el);
+            snprintf(rp, sizeof(rp), "%s/latest.ev", mst); write_bytes_file(rp, eb, el);
+            free(eb);
+
+            assert(fp_agent_sync_once(&mcfg, &rep) == FP_OK);
+            assert(rep.outcome == FP_AGENT_REVOKED && rep.active_serial == 7);
+            assert(lstat(mcur, &st_chk) != 0 && lstat(mrev, &st_chk) == 0);
+            printf("[PASS] SF-A02/P0-05 (2): Double revoke [REVOKE active V4 + REVOKE old V1] deactivated live target!\n");
+        }
     }
 
     srv.stop = 1;

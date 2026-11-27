@@ -696,6 +696,79 @@ static void test_control_plane(const char *work) {
         else
             record_ok("CP-03", "Admin GET endpoints (fleet/approvals/CRA) enforce Bearer auth by default (401 unauth -> 200 auth)");
 
+        /* SF-A06: Cross-channel approvals (1 on canary + 1 on stable for serial 1) MUST NOT report quorum_met:true! */
+        {
+            fp_keypair_t ak1, ak2;
+            assert(fp_keygen(&ak1) == FP_OK && fp_keygen(&ak2) == FP_OK);
+            char pk1[65], pk2[65], sig1[129], sig2[129], eh_hex[65];
+            to_hex(ak1.pk, 32, pk1);
+            to_hex(ak2.pk, 32, pk2);
+            to_hex(ev1.event_hash.bytes, 32, eh_hex);
+
+            char body_buf[512];
+            snprintf(body_buf, sizeof(body_buf), "{\"approver\":\"alice\",\"pubkey\":\"%s\"}", pk1);
+            snprintf(req, sizeof(req),
+                     "POST /api/v1/approvers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                     "Content-Length: %zu\r\n\r\n%s", sec_tok, strlen(body_buf), body_buf);
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            assert(strncmp(resp, "HTTP/1.1 200", 12) == 0);
+
+            snprintf(body_buf, sizeof(body_buf), "{\"approver\":\"bob\",\"pubkey\":\"%s\"}", pk2);
+            snprintf(req, sizeof(req),
+                     "POST /api/v1/approvers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                     "Content-Length: %zu\r\n\r\n%s", sec_tok, strlen(body_buf), body_buf);
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            assert(strncmp(resp, "HTTP/1.1 200", 12) == 0);
+
+            char can1[256], can2[256];
+            uint8_t sraw1[64], sraw2[64];
+            snprintf(can1, sizeof(can1), "SF_APPROVAL_V1|canary|1|%s", eh_hex);
+            snprintf(can2, sizeof(can2), "SF_APPROVAL_V1|stable|1|%s", eh_hex);
+            crypto_sign_ed25519_detached(sraw1, NULL, (const uint8_t *)can1, strlen(can1), ak1.sk);
+            crypto_sign_ed25519_detached(sraw2, NULL, (const uint8_t *)can2, strlen(can2), ak2.sk);
+            to_hex(sraw1, 64, sig1);
+            to_hex(sraw2, 64, sig2);
+
+            snprintf(body_buf, sizeof(body_buf),
+                     "{\"channel\":\"canary\",\"serial\":1,\"approver\":\"alice\",\"reason\":\"ok\",\"signature\":\"%s\"}", sig1);
+            snprintf(req, sizeof(req),
+                     "POST /api/v1/approvals HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                     "Content-Length: %zu\r\n\r\n%s", sec_tok, strlen(body_buf), body_buf);
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            assert(strncmp(resp, "HTTP/1.1 200", 12) == 0);
+
+            snprintf(body_buf, sizeof(body_buf),
+                     "{\"channel\":\"stable\",\"serial\":1,\"approver\":\"bob\",\"reason\":\"ok\",\"signature\":\"%s\"}", sig2);
+            snprintf(req, sizeof(req),
+                     "POST /api/v1/approvals HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                     "Content-Length: %zu\r\n\r\n%s", sec_tok, strlen(body_buf), body_buf);
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            assert(strncmp(resp, "HTTP/1.1 200", 12) == 0);
+
+            snprintf(req, sizeof(req),
+                     "GET /api/v1/approvals HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n\r\n", sec_tok);
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            if (strncmp(resp, "HTTP/1.1 200", 12) != 0 ||
+                strstr(resp, "\"quorum_met\":true") != NULL ||
+                strstr(resp, "\"channel\":\"canary\"") == NULL ||
+                strstr(resp, "\"channel\":\"stable\"") == NULL) {
+                record_finding("HIGH", "SF-A06", "GET /api/v1/approvals conflated canary+stable approvals into quorum_met:true");
+            } else {
+                record_ok("SF-A06", "GET /api/v1/approvals groups by (channel, serial, event_hash) and rejects cross-channel quorum");
+            }
+
+            /* SF-A07: Dashboard HTML must pass Bearer token in loadData() and handle 401 cleanly */
+            snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            if (strncmp(resp, "HTTP/1.1 200", 12) != 0 ||
+                strstr(resp, "Authorization") == NULL ||
+                strstr(resp, "r.status === 401") == NULL) {
+                record_finding("MEDIUM", "SF-A07", "Dashboard HTML loadData() missing Bearer header or 401 handling");
+            } else {
+                record_ok("SF-A07", "Dashboard HTML loadData() sends Admin Bearer header and handles 401 cleanly");
+            }
+        }
+
         /* SEC-07: sf-llama-bridge --role server without --peer-pk or --allow-any-peer MUST fail closed */
         char bkey[600];
         snprintf(bkey, sizeof(bkey), "%s/bridge_sec07.key", work);

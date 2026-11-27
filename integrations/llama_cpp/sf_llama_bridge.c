@@ -83,27 +83,26 @@ enum {
     BR_TAG_CHUNK_HDR = 10,
     BR_TAG_CHUNK_DAT = 11,
     BR_TAG_RPC_ZERO  = 12, /* cmd(1) | expect_resp(1) | pref_len(4 BE) | data_len(4 BE) | prefix */
-    BR_TAG_HELLO     = 13, /* "SFLB"(4) | ver(2 BE) | hdr_len(2 BE) | cmd_max(2 BE) | caps(4 BE) | cast(1) | strict(1) | topk(2 BE) | rsv(2) */
+    BR_TAG_HELLO     = 13, /* "SFLB"(4) | ver(2 BE) | hdr_len(2 BE) | cmd_max(2 BE) | caps(4 BE) | cast(1) | strict(1) | topk(2 BE) | abi_blake3_128(16) */
     BR_TAG_CLOSE     = 99
 };
 
 #define BR_PROTO_VER     4u
 #define BR_GGML_CMD_MAX  16u
 #define BR_CAP_ALL       0x000000FFu /* SFT1|TOPK|ZSTD|DEDUP|ZERO|PIPE0RTT|ALLOC_CACHE|OUTLIER_GUARD */
+#define BR_HELLO_LEN     34u
+#define BR_ABI_DIGEST_LEN 16u
 
-/* AI-02: Full normative ABI schema digest (BLAKE3 over protocol ver, tensor layout, command table, dtypes) */
-static uint16_t br_abi_fingerprint(void) {
+/* AI-02: Full 128-bit normative ABI schema digest (BLAKE3 over protocol ver, tensor layout, command table, dtypes) */
+static void br_abi_digest(uint8_t out[BR_ABI_DIGEST_LEN]) {
     static const char schema[] =
         "SFLB_ABI_V4|TENSOR_LEN=296|NAME_OFF=228|NAME_LEN=64|CMD_MAX=16|"
         "CMDS=ALLOC0:ALIGN1:MAX2:BASE3:FREE4:CLR5:SET6:SETH7:GET8:CPY9:CMP10:MEM11:INIT12:ASZ13:HLO14:CNT15:RCMP16|"
         "F32=0|CAPS=000000FF";
-    uint8_t digest[32];
     blake3_hasher h;
     blake3_hasher_init(&h);
     blake3_hasher_update(&h, schema, sizeof(schema) - 1u);
-    blake3_hasher_finalize(&h, digest, sizeof(digest));
-    uint16_t fp = (uint16_t)(((uint16_t)digest[0] << 8) | digest[1]);
-    return fp ? fp : 1u;
+    blake3_hasher_finalize(&h, out, BR_ABI_DIGEST_LEN);
 }
 
 /* AI-03: Normative ggml-rpc command validator — never trust peer-declared expect_resp blindly! */
@@ -672,9 +671,9 @@ static fp_err_t run_client_session(int local_cli_fd, sf_split_transport_t tr,
         st->wire_cast = FP_WIRE_CAST_NONE;
         st->logits_topk = 0u;
     }
-    /* One-shot 20 B protocol compatibility preamble (0 RTT added, 0 per-token overhead) */
+    /* One-shot 34 B protocol compatibility preamble with 128-bit BLAKE3 ABI digest (0 RTT added, 0 per-token overhead) */
     {
-        uint8_t hlo[20];
+        uint8_t hlo[BR_HELLO_LEN];
         memcpy(hlo, "SFLB", 4);
         put_be16(hlo + 4, (uint16_t)BR_PROTO_VER);
         put_be16(hlo + 6, (uint16_t)st->rpc_tensor_hdr_len);
@@ -683,7 +682,7 @@ static fp_err_t run_client_session(int local_cli_fd, sf_split_transport_t tr,
         hlo[14] = (uint8_t)st->wire_cast;
         hlo[15] = (uint8_t)(st->strict_lossless ? 1u : 0u);
         put_be16(hlo + 16, st->logits_topk);
-        put_be16(hlo + 18, br_abi_fingerprint());
+        br_abi_digest(hlo + 18);
         fp_err_t herr = tun_send(tr, ts, us, BR_TAG_HELLO, hlo, sizeof(hlo), NULL);
         if (herr != FP_OK) return herr;
     }
@@ -986,16 +985,17 @@ static fp_err_t run_server_session(int backend_fd, sf_split_transport_t tr,
         if (err != FP_OK) return err;
         if (tag == BR_TAG_CLOSE) { free(msg); return FP_OK; }
         if (tag == BR_TAG_HELLO) {
-            if (hello_done || mlen != 20u || memcmp(msg, "SFLB", 4) != 0) {
+            if (hello_done || mlen != BR_HELLO_LEN || memcmp(msg, "SFLB", 4) != 0) {
                 free(msg);
                 return FP_ERR_POLICY;
             }
             uint16_t pver = get_be16(msg + 4);
             uint16_t hlen = get_be16(msg + 6);
             uint16_t cmax = get_be16(msg + 8);
-            uint16_t afp  = get_be16(msg + 18);
+            uint8_t exp_abi[BR_ABI_DIGEST_LEN];
+            br_abi_digest(exp_abi);
             if (pver != BR_PROTO_VER || hlen != (uint16_t)st->rpc_tensor_hdr_len ||
-                cmax > BR_GGML_CMD_MAX || afp != br_abi_fingerprint()) {
+                cmax > BR_GGML_CMD_MAX || sodium_memcmp(msg + 18, exp_abi, BR_ABI_DIGEST_LEN) != 0) {
                 free(msg);
                 return FP_ERR_POLICY;
             }
