@@ -445,6 +445,131 @@ static void test_tx06_tx07_multistep_and_initial_sql_rollback(void) {
     fp_sql_close(dst_db);
 }
 
+static void test_m4_mixed_rollback_and_sql_namespace_guards(void) {
+    char tmp[] = "/tmp/sf_m4_bundle_XXXXXX";
+    assert(mkdtemp(tmp) != NULL);
+    char store[256], target[256], src_p[256], dst_p[256];
+    snprintf(store, sizeof(store), "%s/store", tmp);
+    snprintf(target, sizeof(target), "%s/target", tmp);
+    snprintf(src_p, sizeof(src_p), "%s/src.db", tmp);
+    snprintf(dst_p, sizeof(dst_p), "%s/dst.db", tmp);
+
+    fp_sql_ctx_t *src_db = NULL, *dst_db = NULL;
+    assert(fp_sql_open(src_p, &src_db) == FP_OK);
+    assert(fp_sql_open(dst_p, &dst_db) == FP_OK);
+    assert(fp_sql_exec(src_db, "CREATE TABLE kv(k INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+    assert(fp_sql_exec(dst_db, "CREATE TABLE kv(k INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+    assert(fp_sql_exec(src_db, "CREATE TABLE secret(id INTEGER PRIMARY KEY, val TEXT);") == FP_OK);
+    assert(fp_sql_exec(dst_db, "CREATE TABLE secret(id INTEGER PRIMARY KEY, val TEXT);") == FP_OK);
+
+    fp_dna_t empty_dig;
+    assert(fp_sql_state_digest(src_db, "kv", &empty_dig) == FP_OK);
+
+    /* SEC-01: Case-insensitive reservation of entire _fp_* SQLite internal namespace */
+    {
+        const char *bad_tbls[4] = { "_fp_progress", "_FP_PROGRESS", "_Fp_Sql_History", "_FP_custom" };
+        for (int i = 0; i < 4; i++) {
+            fp_bundle_t bad;
+            memset(&bad, 0, sizeof(bad));
+            bad.version = 1; bad.entry_count = 1;
+            bad.entries[0].role = FP_ROLE_SQLITE_CHANGESET;
+            bad.entries[0].size = 4;
+            snprintf(bad.entries[0].path, sizeof(bad.entries[0].path), "%s", bad_tbls[i]);
+            uint8_t *enc = NULL; size_t elen = 0;
+            assert(fp_bundle_encode(&bad, &enc, &elen) == FP_ERR_POLICY);
+        }
+        printf("[PASS] SEC-01: Case-insensitive _fp_* SQLite internal namespace rejected in bundle encode\n");
+    }
+
+    /* SEC-02: Changeset touching unauthorized table (`secret` while entry declares `kv`) rejected fail-closed */
+    {
+        uint8_t *cs = NULL; size_t csl = 0;
+        assert(fp_sql_capture_changeset(src_db, "secret",
+                                        "INSERT INTO secret VALUES (1, 'pwned');", &cs, &csl) == FP_OK);
+        fp_bundle_t b_evil;
+        memset(&b_evil, 0, sizeof(b_evil));
+        b_evil.version = 1; b_evil.entry_count = 1;
+        b_evil.entries[0].role = FP_ROLE_SQLITE_CHANGESET;
+        b_evil.entries[0].size = csl;
+        snprintf(b_evil.entries[0].path, sizeof(b_evil.entries[0].path), "kv"); /* claims kv, mutates secret! */
+        assert(fp_store_put_object(store, cs, csl, &b_evil.entries[0].dna) == FP_OK);
+        free(cs);
+        fp_dna_t evil_dna;
+        assert(fp_bundle_pack(store, &b_evil, &evil_dna) == FP_OK);
+
+        fp_dna_t sec_before, sec_after;
+        assert(fp_sql_state_digest(dst_db, "secret", &sec_before) == FP_OK);
+        assert(fp_bundle_apply(store, &evil_dna, target, dst_db, 1, 0) == FP_ERR_POLICY);
+        assert(fp_sql_state_digest(dst_db, "secret", &sec_after) == FP_OK);
+        assert(fp_dna_equal(&sec_before, &sec_after));
+        uint64_t pseq = 99; char pdna[65];
+        assert(fp_sql_get_progress(dst_db, &pseq, pdna) == FP_OK && pseq == 0 && pdna[0] == '\0');
+        printf("[PASS] SEC-02: Changeset mutating undeclared table rejected preflight (FP_ERR_POLICY)\n");
+    }
+
+    /* P0-01 / SF-A03: Mixed sequence V1(SQL=100) -> V2(SQL=200) -> V3(file-only!), then rollback V3 -> V1! */
+    fp_dna_t b1_dna, b2_dna, b3_dna, dig1, dig2, cur_dig;
+    {
+        uint8_t *cs1 = NULL, *cs2 = NULL; size_t l1 = 0, l2 = 0;
+        assert(fp_sql_capture_changeset(src_db, "kv", "INSERT INTO kv VALUES (1, 100);", &cs1, &l1) == FP_OK);
+        assert(fp_sql_state_digest(src_db, "kv", &dig1) == FP_OK);
+        assert(fp_sql_capture_changeset(src_db, "kv", "UPDATE kv SET v=200 WHERE k=1;", &cs2, &l2) == FP_OK);
+        assert(fp_sql_state_digest(src_db, "kv", &dig2) == FP_OK);
+
+        fp_bundle_t b1, b2, b3;
+        memset(&b1, 0, sizeof(b1)); memset(&b2, 0, sizeof(b2)); memset(&b3, 0, sizeof(b3));
+        b1.version = 1; b1.entry_count = 2;
+        b1.entries[0].role = FP_ROLE_FILE; b1.entries[0].mode = 0644; b1.entries[0].size = 3;
+        snprintf(b1.entries[0].path, sizeof(b1.entries[0].path), "f.txt");
+        assert(fp_store_put_object(store, (const uint8_t *)"V1\n", 3, &b1.entries[0].dna) == FP_OK);
+        b1.entries[1].role = FP_ROLE_SQLITE_CHANGESET; b1.entries[1].size = l1;
+        snprintf(b1.entries[1].path, sizeof(b1.entries[1].path), "kv");
+        assert(fp_store_put_object(store, cs1, l1, &b1.entries[1].dna) == FP_OK);
+        assert(fp_bundle_pack(store, &b1, &b1_dna) == FP_OK);
+
+        b2.version = 1; b2.entry_count = 2;
+        b2.entries[0].role = FP_ROLE_FILE; b2.entries[0].mode = 0644; b2.entries[0].size = 3;
+        snprintf(b2.entries[0].path, sizeof(b2.entries[0].path), "f.txt");
+        assert(fp_store_put_object(store, (const uint8_t *)"V2\n", 3, &b2.entries[0].dna) == FP_OK);
+        b2.entries[1].role = FP_ROLE_SQLITE_CHANGESET; b2.entries[1].size = l2;
+        snprintf(b2.entries[1].path, sizeof(b2.entries[1].path), "kv");
+        assert(fp_store_put_object(store, cs2, l2, &b2.entries[1].dna) == FP_OK);
+        assert(fp_bundle_pack(store, &b2, &b2_dna) == FP_OK);
+
+        /* V3 is FILE-ONLY (no SQLite changeset entry at all!) */
+        b3.version = 1; b3.entry_count = 1;
+        b3.entries[0].role = FP_ROLE_FILE; b3.entries[0].mode = 0644; b3.entries[0].size = 3;
+        snprintf(b3.entries[0].path, sizeof(b3.entries[0].path), "f.txt");
+        assert(fp_store_put_object(store, (const uint8_t *)"V3\n", 3, &b3.entries[0].dna) == FP_OK);
+        assert(fp_bundle_pack(store, &b3, &b3_dna) == FP_OK);
+        free(cs1); free(cs2);
+
+        assert(fp_bundle_apply(store, &b1_dna, target, dst_db, 1, 0) == FP_OK);
+        assert(fp_bundle_apply(store, &b2_dna, target, dst_db, 2, 0) == FP_OK);
+        assert(fp_bundle_apply(store, &b3_dna, target, dst_db, 3, 0) == FP_OK);
+
+        char fpath[384];
+        snprintf(fpath, sizeof(fpath), "%s/current/f.txt", target);
+        assert_file_eq(fpath, (const uint8_t *)"V3\n", 3);
+        assert(fp_sql_state_digest(dst_db, "kv", &cur_dig) == FP_OK && fp_dna_equal(&cur_dig, &dig2));
+
+        /* Rollback from file-only V3 back to V1 MUST invert V2's SQLite changeset AND flip file to V1! */
+        assert(fp_bundle_rollback(store, &b3_dna, &b1_dna, target, dst_db) == FP_OK);
+        assert_file_eq(fpath, (const uint8_t *)"V1\n", 3);
+        assert(fp_sql_state_digest(dst_db, "kv", &cur_dig) == FP_OK && fp_dna_equal(&cur_dig, &dig1));
+
+        /* Re-apply V2 -> V3 and rollback all the way to prev=NULL -> empty SQLite baseline! */
+        assert(fp_bundle_apply(store, &b2_dna, target, dst_db, 4, 0) == FP_OK);
+        assert(fp_bundle_apply(store, &b3_dna, target, dst_db, 5, 0) == FP_OK);
+        assert(fp_bundle_rollback(store, &b3_dna, NULL, target, dst_db) == FP_OK);
+        assert(fp_sql_state_digest(dst_db, "kv", &cur_dig) == FP_OK && fp_dna_equal(&cur_dig, &empty_dig));
+        printf("[PASS] P0-01/SF-A03: Mixed V1(SQL)->V2(SQL)->V3(file-only) rollback to V1 & NULL restored exact SQLite+files\n");
+    }
+
+    fp_sql_close(src_db);
+    fp_sql_close(dst_db);
+}
+
 int main(void) {
     assert(fp_init() == FP_OK);
     test_bundle_security_validation();
@@ -452,6 +577,7 @@ int main(void) {
     test_p1_streaming_gc_and_merkle_index();
     test_m0_m1_hardening();
     test_tx06_tx07_multistep_and_initial_sql_rollback();
+    test_m4_mixed_rollback_and_sql_namespace_guards();
     printf("ALL M3 PARTICLE BUNDLE & SQLITE SESSION TESTS PASSED.\n");
     return 0;
 }

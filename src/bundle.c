@@ -99,7 +99,8 @@ static int safe_ident(const char *name) {
     if (!name || name[0] == '\0') return 0;
     size_t len = strnlen(name, 128);
     if (len == 0 || len >= 128) return 0;
-    if (strcmp(name, "_fp_progress") == 0 || strcmp(name, "_fp_sql_history") == 0) return 0;
+    /* SEC-01: Reserve entire `_fp_` internal namespace case-insensitively (matches SQLite semantics) */
+    if (sqlite3_strnicmp(name, "_fp_", 4) == 0) return 0;
     for (size_t i = 0; i < len; i++) {
         char c = name[i];
         int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -555,11 +556,35 @@ static fp_err_t atomic_flip_current(const char *target_dir, const char *gen_rel)
     return sync_dir_path(target_dir);
 }
 
-/* SQLite changeset callbacks */
+/* SQLite changeset callbacks & preflight strict table validator (SEC-01, SEC-02) */
 static int filter_table(void *ctx, const char *zTab) {
     const char *allowed = (const char *)ctx;
-    if (strcmp(zTab, "_fp_progress") == 0 || strcmp(zTab, "_fp_sql_history") == 0) return 0;
+    if (!zTab || sqlite3_strnicmp(zTab, "_fp_", 4) == 0) return 0;
     return sqlite3_stricmp(zTab, allowed) == 0;
+}
+
+static fp_err_t validate_changeset_table(const uint8_t *cs, size_t cs_len, const char *allowed_table) {
+    if (!cs || cs_len == 0 || !allowed_table || !safe_ident(allowed_table)) return FP_ERR_INVALID;
+    sqlite3_changeset_iter *iter = NULL;
+    if (sqlite3changeset_start(&iter, (int)cs_len, (void *)cs) != SQLITE_OK || !iter) {
+        return FP_ERR_INTEGRITY;
+    }
+    fp_err_t err = FP_OK;
+    int rc;
+    while ((rc = sqlite3changeset_next(iter)) == SQLITE_ROW) {
+        const char *zTab = NULL;
+        int nCol = 0, op = 0, indirect = 0;
+        if (sqlite3changeset_op(iter, &zTab, &nCol, &op, &indirect) != SQLITE_OK ||
+            !zTab || sqlite3_strnicmp(zTab, "_fp_", 4) == 0 ||
+            sqlite3_stricmp(zTab, allowed_table) != 0) {
+            err = FP_ERR_POLICY;
+            break;
+        }
+    }
+    int frc = sqlite3changeset_finalize(iter);
+    if (err != FP_OK) return err;
+    if (rc != SQLITE_DONE || frc != SQLITE_OK) return FP_ERR_INTEGRITY;
+    return FP_OK;
 }
 
 static int conflict_abort(void *ctx, int eConflict, sqlite3_changeset_iter *pIter) {
@@ -676,7 +701,7 @@ static int acquire_target_lock(const char *target_dir) {
     char lpath[PATH_MAX];
     int n = snprintf(lpath, sizeof(lpath), "%s/.sf_lifecycle.lock", target_dir);
     if (n < 0 || (size_t)n >= sizeof(lpath)) return -1;
-    int fd = open(lpath, O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
+    int fd = open(lpath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
     while (flock(fd, LOCK_EX) != 0) {
         if (errno == EINTR) continue;
@@ -1062,15 +1087,21 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
                 err = err != FP_OK ? err : FP_ERR_INTEGRITY;
                 goto cleanup;
             }
+            /* SEC-02: Reject any changeset touching unauthorized or internal `_fp_*` tables before mutation */
+            err = validate_changeset_table(cs_blobs[i], cs_lens[i], b.entries[i].path);
+            if (err != FP_OK) goto cleanup;
         }
     }
 
     char dna_hex[65];
     fp_hex_encode(bundle_dna->bytes, FP_DNA_LEN, dna_hex);
 
-    /* Check SQLite progress BEFORE staging so an already-committed generation is never re-staged */
+    /* P0-01 / SF-A03: Track EVERY applied generation in SQLite `_fp_progress` + `_fp_sql_history`
+     * whenever `sql_ctx != NULL` (including file-only no-op generations!) so mixed rollbacks V3->V1
+     * always walk the exact SQLite history chain! */
+    int track_sql = (sql_ctx != NULL);
     int sql_already_committed = 0;
-    if (has_sql) {
+    if (track_sql) {
         uint64_t cur_seq = 0;
         char cur_dna[65];
         err = read_progress(sql_ctx, &cur_seq, cur_dna);
@@ -1084,18 +1115,18 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
     }
 
     /* Record STAGING intent and publish immutable sealed generation dir (does NOT touch `current`!) */
-    err = tx_journal_write(target_dir, "STAGING", expected_seq, dna_hex, has_sql);
+    err = tx_journal_write(target_dir, "STAGING", expected_seq, dna_hex, track_sql);
     if (err != FP_OK) goto cleanup;
 
     err = stage_bundle_files(store_dir, &b, target_dir, dna_hex);
     if (err != FP_OK) goto cleanup;
 
     /* Persist ACTIVATION_PENDING journal BEFORE SQLite COMMIT so any crash after COMMIT recovers forward */
-    err = tx_journal_write(target_dir, "ACTIVATION_PENDING", expected_seq, dna_hex, has_sql);
+    err = tx_journal_write(target_dir, "ACTIVATION_PENDING", expected_seq, dna_hex, track_sql);
     if (err != FP_OK) goto cleanup;
 
-    /* Apply SQLite changesets in ONE atomic WAL transaction */
-    if (has_sql && !sql_already_committed) {
+    /* Apply SQLite changesets & record generation checkpoint in ONE atomic WAL transaction */
+    if (track_sql && !sql_already_committed) {
         if (sqlite3_exec(sql_ctx->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
             err = FP_ERR_IO;
             goto cleanup;
@@ -1154,7 +1185,7 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
         raise(SIGKILL); /* Fault 3: OS SIGKILL AFTER `current` flip, BEFORE journal COMMITTED */
     }
 
-    err = tx_journal_write(target_dir, "COMMITTED", expected_seq, dna_hex, has_sql);
+    err = tx_journal_write(target_dir, "COMMITTED", expected_seq, dna_hex, track_sql);
 
 cleanup:
     for (uint16_t i = 0; i < FP_BUNDLE_MAX_ENTRIES; i++) free(cs_blobs[i]);
@@ -1233,8 +1264,10 @@ fp_err_t fp_bundle_rollback(const char *store_dir,
             /* Already at target SQLite state (e.g. crash recovery / idempotent retry) */
             need_sql_rb = 0;
             target_seq = pre_seq;
-        } else if (cur_has_sql || strcmp(pre_dna, cur_hex) == 0) {
-            if (pre_seq == 0 || strcmp(pre_dna, cur_hex) != 0) {
+        } else if (pre_seq > 0) {
+            /* P0-01 / SF-A03: Always walk `_fp_sql_history` backward from actual DB head (`pre_seq`, `pre_dna`)
+             * whenever DB is not yet at `prev_hex` (handles both SQL and mixed file-only generations!). */
+            if (cur_has_sql && strcmp(pre_dna, cur_hex) != 0) {
                 release_target_lock(lfd);
                 return FP_ERR_CHAIN;
             }

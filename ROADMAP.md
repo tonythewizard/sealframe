@@ -41,8 +41,9 @@ This roadmap tracks completed hardening milestones and planned work to develop m
 
 ## Phase B — Transport & Control Plane Hardening (`v0.9`)
 
-1. **Control Plane TLS / Authenticated Transport**
+1. **Control Plane TLS, Root-Signed Approvers & Signed Channel Promotions**
    - Provide built-in authenticated transport for `sf-cp` (either `FP-NET` encrypted reverse-proxy bridge or minimal mTLS integration) + short-lived scoped operator tokens replacing the single static `admin.token`.
+   - Anchor approver key sets in root-signed manifests (separating approver management from CP admin Bearer compromise) and emit Ed25519-signed channel promotion receipts verified end-to-end by `sf-agent`.
 2. **Strict Fail-Closed Peer Authentication Mode**
    - Add explicit `allow_any_peer` opt-in flag across `FP-NET` and `FP-UDP1` APIs so passing `NULL` peer keys fails closed by default unless explicitly authorized for public content mirrors.
 3. **Handshake Formalization (Noise IK/XX Evaluation)**

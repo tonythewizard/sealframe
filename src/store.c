@@ -138,7 +138,7 @@ static int acquire_store_lock(const char *root) {
     char lock_path[PATH_MAX];
     int n = snprintf(lock_path, sizeof(lock_path), "%s/.lock", root);
     if (n < 0 || (size_t)n >= sizeof(lock_path)) return -1;
-    int fd = open(lock_path, O_CREAT | O_RDWR, 0600);
+    int fd = open(lock_path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
     if (flock(fd, LOCK_EX) != 0) {
         close(fd);
@@ -423,37 +423,36 @@ fp_err_t fp_store_validate_transition(const fp_store_state_t *current,
                                       fp_store_state_t *out_next) {
     if (!current || !ev) return FP_ERR_INVALID;
 
-    fp_store_state_t next = *current;
-    if (next.serial > 0) {
-        if (!fp_dna_equal(&next.repo_id, &ev->repo_id)) {
+    /* Validate completely read-only against `current` first (avoids 64 KiB stack/copy overhead!) */
+    if (current->serial > 0) {
+        if (!fp_dna_equal(&current->repo_id, &ev->repo_id)) {
             return FP_ERR_POLICY;
         }
-    } else {
-        next.repo_id = ev->repo_id;
-        memcpy(next.signer_pk, ev->signer_pk, FP_PK_LEN);
     }
 
-    if (ev->serial != next.serial + 1u ||
-        !fp_dna_equal(&ev->prev_event_hash, &next.last_event_hash)) {
+    if (ev->serial != current->serial + 1u ||
+        !fp_dna_equal(&ev->prev_event_hash, &current->last_event_hash)) {
         return FP_ERR_CHAIN;
     }
 
+    int add_revoked = 0;
+    int clear_current = 0;
+    int add_installed = 0;
     if (ev->action == FP_ACTION_REVOKE) {
-        if (!dna_in_list(next.revoked, next.revoked_count, &ev->target_dna)) {
-            if (next.revoked_count >= FP_MAX_HISTORY) {
+        if (!dna_in_list(current->revoked, current->revoked_count, &ev->target_dna)) {
+            if (current->revoked_count >= FP_MAX_HISTORY) {
                 return FP_ERR_BOUNDS;
             }
-            next.revoked[next.revoked_count++] = ev->target_dna;
+            add_revoked = 1;
         }
-        if (next.has_current && fp_dna_equal(&next.current_dna, &ev->target_dna)) {
-            next.has_current = 0;
-            memset(&next.current_dna, 0, sizeof(next.current_dna));
+        if (current->has_current && fp_dna_equal(&current->current_dna, &ev->target_dna)) {
+            clear_current = 1;
         }
     } else if (ev->action == FP_ACTION_INSTALL || ev->action == FP_ACTION_ROLLBACK) {
-        if (dna_in_list(next.revoked, next.revoked_count, &ev->target_dna)) {
+        if (dna_in_list(current->revoked, current->revoked_count, &ev->target_dna)) {
             return FP_ERR_REVOKED;
         }
-        int known = dna_in_list(next.installed, next.installed_count, &ev->target_dna);
+        int known = dna_in_list(current->installed, current->installed_count, &ev->target_dna);
         if (ev->action == FP_ACTION_INSTALL && known) {
             return FP_ERR_POLICY;
         }
@@ -461,50 +460,75 @@ fp_err_t fp_store_validate_transition(const fp_store_state_t *current,
             return FP_ERR_POLICY;
         }
         if (!known) {
-            if (next.installed_count >= FP_MAX_HISTORY) {
+            if (current->installed_count >= FP_MAX_HISTORY) {
                 return FP_ERR_BOUNDS;
             }
-            next.installed[next.installed_count++] = ev->target_dna;
+            add_installed = 1;
         }
-        next.has_current = 1;
-        next.current_dna = ev->target_dna;
     } else {
         return FP_ERR_INVALID;
     }
 
-    next.serial = ev->serial;
-    next.last_event_hash = ev->event_hash;
-    if (out_next) *out_next = next;
+    if (out_next) {
+        if (out_next != current) {
+            memcpy(out_next, current, sizeof(*current));
+        }
+        if (out_next->serial == 0) {
+            out_next->repo_id = ev->repo_id;
+            memcpy(out_next->signer_pk, ev->signer_pk, FP_PK_LEN);
+        }
+        if (ev->action == FP_ACTION_REVOKE) {
+            if (add_revoked) {
+                out_next->revoked[out_next->revoked_count++] = ev->target_dna;
+            }
+            if (clear_current) {
+                out_next->has_current = 0;
+                memset(&out_next->current_dna, 0, sizeof(out_next->current_dna));
+            }
+        } else {
+            if (add_installed) {
+                out_next->installed[out_next->installed_count++] = ev->target_dna;
+            }
+            out_next->has_current = 1;
+            out_next->current_dna = ev->target_dna;
+        }
+        out_next->serial = ev->serial;
+        out_next->last_event_hash = ev->event_hash;
+    }
     return FP_OK;
 }
 
-fp_err_t fp_store_apply_event(const char *root, const fp_event_t *ev,
-                              const uint8_t expected_pk[FP_PK_LEN],
-                              const fp_dna_t *expected_repo,
-                              uint64_t now_unix,
-                              const uint8_t *payload_data, size_t payload_len) {
-    if (!root || !ev || !expected_pk || !expected_repo) return FP_ERR_INVALID;
-
-    fp_err_t err = fp_event_verify(ev, expected_pk, expected_repo, now_unix);
-    if (err != FP_OK) return err;
-
+/* Single-lock atomic state transition & optional authorized key rotation (P1-04) */
+static fp_err_t apply_event_locked(const char *root, const fp_event_t *ev,
+                                   const uint8_t *rotate_signer_pk,
+                                   const fp_dna_t *rotate_repo_id,
+                                   const uint8_t *payload_data, size_t payload_len) {
     int lfd = acquire_store_lock(root);
     if (lfd < 0) return FP_ERR_IO;
 
     fp_store_state_t st;
-    err = load_state_unlocked(root, &st);
+    fp_err_t err = load_state_unlocked(root, &st);
     if (err != FP_OK) {
         close(lfd);
         return err;
     }
 
-    if (st.serial > 0 && sodium_memcmp(st.signer_pk, ev->signer_pk, FP_PK_LEN) != 0) {
+    if (rotate_signer_pk) {
+        if (st.serial > 0) {
+            if (!fp_dna_equal(&st.repo_id, rotate_repo_id)) {
+                close(lfd);
+                return FP_ERR_POLICY;
+            }
+            /* Update in-memory copy ONLY; committed atomically with the validated event! */
+            memcpy(st.signer_pk, rotate_signer_pk, FP_PK_LEN);
+        }
+    } else if (st.serial > 0 && sodium_memcmp(st.signer_pk, ev->signer_pk, FP_PK_LEN) != 0) {
         close(lfd);
         return FP_ERR_POLICY;
     }
 
-    fp_store_state_t next_st;
-    err = fp_store_validate_transition(&st, ev, &next_st);
+    /* Validate & advance in-place (zero 64 KiB copy!) */
+    err = fp_store_validate_transition(&st, ev, &st);
     if (err != FP_OK) {
         close(lfd);
         return err;
@@ -570,10 +594,10 @@ fp_err_t fp_store_apply_event(const char *root, const fp_event_t *ev,
     free(ev_bytes);
     if (err != FP_OK) { close(lfd); return err; }
 
-    /* Advance state atomically */
+    /* Advance state (including any rotated signer_pk) in ONE single atomic rename */
     uint8_t *st_bytes = NULL;
     size_t st_len = 0;
-    err = encode_state(&next_st, &st_bytes, &st_len);
+    err = encode_state(&st, &st_bytes, &st_len);
     if (err != FP_OK) { close(lfd); return err; }
 
     char st_path[PATH_MAX];
@@ -589,6 +613,19 @@ fp_err_t fp_store_apply_event(const char *root, const fp_event_t *ev,
     return err;
 }
 
+fp_err_t fp_store_apply_event(const char *root, const fp_event_t *ev,
+                              const uint8_t expected_pk[FP_PK_LEN],
+                              const fp_dna_t *expected_repo,
+                              uint64_t now_unix,
+                              const uint8_t *payload_data, size_t payload_len) {
+    if (!root || !ev || !expected_pk || !expected_repo) return FP_ERR_INVALID;
+
+    fp_err_t err = fp_event_verify(ev, expected_pk, expected_repo, now_unix);
+    if (err != FP_OK) return err;
+
+    return apply_event_locked(root, ev, NULL, NULL, payload_data, payload_len);
+}
+
 fp_err_t fp_store_apply_event_with_root(const char *root_dir, const fp_event_t *ev,
                                         const fp_root_doc_t *trusted_root,
                                         uint64_t now_unix,
@@ -597,35 +634,6 @@ fp_err_t fp_store_apply_event_with_root(const char *root_dir, const fp_event_t *
     fp_err_t err = fp_event_verify_with_root(ev, trusted_root, now_unix);
     if (err != FP_OK) return err;
 
-    /* If store already exists with an older rotated release key, authorize the key rotation
-     * inside the store lock by updating signer_pk to trusted_root->release_pk (same repo_id). */
-    int lfd = acquire_store_lock(root_dir);
-    if (lfd < 0) return FP_ERR_IO;
-    fp_store_state_t st;
-    err = load_state_unlocked(root_dir, &st);
-    if (err == FP_OK && st.serial > 0) {
-        if (!fp_dna_equal(&st.repo_id, &trusted_root->repo_id)) {
-            close(lfd);
-            return FP_ERR_POLICY;
-        }
-        if (sodium_memcmp(st.signer_pk, trusted_root->release_pk, FP_PK_LEN) != 0) {
-            memcpy(st.signer_pk, trusted_root->release_pk, FP_PK_LEN);
-            uint8_t *st_bytes = NULL;
-            size_t st_len = 0;
-            err = encode_state(&st, &st_bytes, &st_len);
-            if (err == FP_OK) {
-                char st_path[PATH_MAX];
-                int n = snprintf(st_path, sizeof(st_path), "%s/state.bin", root_dir);
-                if (n < 0 || (size_t)n >= sizeof(st_path)) err = FP_ERR_BOUNDS;
-                else err = atomic_write_file(root_dir, st_path, st_bytes, st_len);
-                free(st_bytes);
-            }
-        }
-    }
-    close(lfd);
-    if (err != FP_OK) return err;
-
-    return fp_store_apply_event(root_dir, ev, trusted_root->release_pk,
-                                &trusted_root->repo_id, now_unix,
-                                payload_data, payload_len);
+    return apply_event_locked(root_dir, ev, trusted_root->release_pk,
+                              &trusted_root->repo_id, payload_data, payload_len);
 }

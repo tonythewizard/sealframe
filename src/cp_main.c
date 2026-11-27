@@ -975,9 +975,13 @@ static int db_append_audit(sqlite3 *db, const char *dev_id, const char *ip, cons
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) return -1;
+    /* CP-01: Never prune governance/promotion/enrollment audit records during heartbeat rotation */
     (void)sqlite3_exec(
         db,
-        "DELETE FROM audit_log WHERE id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT 50000);",
+        "DELETE FROM audit_log "
+        "WHERE channel NOT IN ('governance','enrollment') "
+        "AND outcome NOT IN ('CHANNEL_SET','EMERGENCY_ROLLBACK','QUORUM_MET','DEVICE_ENROLLED','APPROVER_ADDED') "
+        "AND id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT 50000);",
         NULL, NULL, NULL);
     return 0;
 }
@@ -1319,22 +1323,38 @@ static int cp_set_channel_serial(cp_state_t *st, const char *ch, int64_t serial,
         }
     }
 
-    /* SEC-05: Single authoritative channel publication (GET /repo/latest.ev serves channels/stable/latest.ev directly!) */
+    /* SEC-05 + CP-02: Stage audit record inside SQLite transaction BEFORE flipping latest.ev;
+     * if audit write fails, never publish latest.ev; if file write fails, rollback audit! */
     char utc[32], detail[256];
     utc_now(utc);
     snprintf(detail, sizeof(detail), "%s: channel '%s' -> serial #%lld", reason, ch, (long long)serial);
-    if (mkdir_p(cdir) != 0 || copy_file_atomic(src, dst) != 0) {
+    if (sqlite3_exec(st->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
         pthread_mutex_unlock(&st->mu);
         *out_http_status = 500;
-        snprintf(msg, msg_cap, "failed to write channel latest.ev");
+        snprintf(msg, msg_cap, "database transaction begin failed");
         return -1;
     }
     if (db_append_audit(st->db, "CONTROL_PLANE", "admin", ch,
                         is_emergency_rollback ? "EMERGENCY_ROLLBACK" : "CHANNEL_SET",
                         serial, detail, 1, utc) != 0) {
+        (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
         pthread_mutex_unlock(&st->mu);
         *out_http_status = 500;
-        snprintf(msg, msg_cap, "channel updated but audit log write failed");
+        snprintf(msg, msg_cap, "audit log write failed; channel not modified");
+        return -1;
+    }
+    if (mkdir_p(cdir) != 0 || copy_file_atomic(src, dst) != 0) {
+        (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+        pthread_mutex_unlock(&st->mu);
+        *out_http_status = 500;
+        snprintf(msg, msg_cap, "failed to write channel latest.ev");
+        return -1;
+    }
+    if (sqlite3_exec(st->db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+        pthread_mutex_unlock(&st->mu);
+        *out_http_status = 500;
+        snprintf(msg, msg_cap, "channel updated but audit log commit failed");
         return -1;
     }
     pthread_mutex_unlock(&st->mu);
@@ -1406,52 +1426,92 @@ static void append_devices_json(sqlite3 *db, sbuf_t *b, int *tot, int *healthy, 
     sb_putc(b, ']');
 }
 
-static void append_approvals_json(sqlite3 *db, sbuf_t *b, int64_t filter_serial) {
-    if (filter_serial <= 0) sb_putc(b, '[');
+/* SF-A06: Group approvals strictly by (channel, serial, event_hash) and count distinct verified approver pubkeys */
+static void append_approvals_json(sqlite3 *db, sbuf_t *b, const char *filter_channel,
+                                  int64_t filter_serial, const char *filter_event_hash) {
+    int single = (filter_serial > 0 && filter_channel && filter_channel[0] &&
+                  filter_event_hash && filter_event_hash[0]);
+    if (!single) sb_putc(b, '[');
     sqlite3_stmt *s1 = NULL;
-    const char *q1 = filter_serial > 0
-        ? "SELECT DISTINCT serial, threshold FROM approvals WHERE serial=? ORDER BY serial;"
-        : "SELECT DISTINCT serial, threshold FROM approvals ORDER BY serial;";
+    const char *q1 = single
+        ? "SELECT DISTINCT channel, serial, event_hash, threshold FROM approvals "
+          "WHERE channel=? AND serial=? AND event_hash=? ORDER BY serial, channel, event_hash;"
+        : "SELECT DISTINCT channel, serial, event_hash, threshold FROM approvals "
+          "ORDER BY serial, channel, event_hash;";
     int first_s = 1;
     if (sqlite3_prepare_v2(db, q1, -1, &s1, NULL) == SQLITE_OK) {
-        if (filter_serial > 0) sqlite3_bind_int64(s1, 1, filter_serial);
+        if (single) {
+            sqlite3_bind_text(s1, 1, filter_channel, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(s1, 2, filter_serial);
+            sqlite3_bind_text(s1, 3, filter_event_hash, -1, SQLITE_TRANSIENT);
+        }
         while (sqlite3_step(s1) == SQLITE_ROW) {
-            if (!first_s && filter_serial <= 0) sb_putc(b, ',');
+            if (!first_s && !single) sb_putc(b, ',');
             first_s = 0;
-            int64_t ser = sqlite3_column_int64(s1, 0);
-            int thr = sqlite3_column_int(s1, 1);
+            const char *ch_s = (const char *)sqlite3_column_text(s1, 0);
+            int64_t ser = sqlite3_column_int64(s1, 1);
+            const char *eh_s = (const char *)sqlite3_column_text(s1, 2);
+            int thr = sqlite3_column_int(s1, 3);
+            if (!ch_s) ch_s = "";
+            if (!eh_s) eh_s = "";
 
             sqlite3_stmt *s2 = NULL;
             sbuf_t app_map;
             sb_init(&app_map, 128);
             sb_putc(&app_map, '{');
-            int cnt = 0;
+            int listed = 0;
             if (sqlite3_prepare_v2(
                     db,
-                    "SELECT approver, approved_utc, reason FROM approvals WHERE serial=? ORDER BY approver;",
+                    "SELECT a.approver, a.approved_utc, a.reason FROM approvals a "
+                    "JOIN approvers r ON a.approver = r.approver AND a.approver_pubkey = r.pubkey "
+                    "WHERE a.channel=? AND a.serial=? AND a.event_hash=? AND length(a.approver_pubkey) = 64 "
+                    "ORDER BY a.approver;",
                     -1, &s2, NULL) == SQLITE_OK) {
-                sqlite3_bind_int64(s2, 1, ser);
+                sqlite3_bind_text(s2, 1, ch_s, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(s2, 2, ser);
+                sqlite3_bind_text(s2, 3, eh_s, -1, SQLITE_TRANSIENT);
                 while (sqlite3_step(s2) == SQLITE_ROW) {
-                    if (cnt > 0) sb_putc(&app_map, ',');
+                    if (listed > 0) sb_putc(&app_map, ',');
                     sb_json_str(&app_map, (const char *)sqlite3_column_text(s2, 0));
                     sb_puts(&app_map, ":{\"approved_utc\":");
                     sb_json_str(&app_map, (const char *)sqlite3_column_text(s2, 1));
                     sb_puts(&app_map, ",\"reason\":");
                     sb_json_str(&app_map, (const char *)sqlite3_column_text(s2, 2));
                     sb_putc(&app_map, '}');
-                    cnt++;
+                    listed++;
                 }
                 sqlite3_finalize(s2);
             }
             sb_putc(&app_map, '}');
-            sb_printf(b, "{\"serial\":%lld,\"threshold\":%d,\"approvers\":%s,\"quorum_met\":%s}",
-                      (long long)ser, thr, app_map.data ? app_map.data : "{}",
-                      (cnt >= thr) ? "true" : "false");
+
+            int distinct_keys = 0;
+            sqlite3_stmt *s3 = NULL;
+            if (sqlite3_prepare_v2(
+                    db,
+                    "SELECT COUNT(DISTINCT r.pubkey) FROM approvals a "
+                    "JOIN approvers r ON a.approver = r.approver AND a.approver_pubkey = r.pubkey "
+                    "WHERE a.channel=? AND a.serial=? AND a.event_hash=? AND length(a.approver_pubkey) = 64;",
+                    -1, &s3, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(s3, 1, ch_s, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(s3, 2, ser);
+                sqlite3_bind_text(s3, 3, eh_s, -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(s3) == SQLITE_ROW) distinct_keys = sqlite3_column_int(s3, 0);
+                sqlite3_finalize(s3);
+            }
+
+            sb_puts(b, "{\"channel\":");
+            sb_json_str(b, ch_s);
+            sb_printf(b, ",\"serial\":%lld,\"event_hash\":", (long long)ser);
+            sb_json_str(b, eh_s);
+            sb_printf(b, ",\"threshold\":%d,\"verified_keys\":%d,\"approvers\":%s,\"quorum_met\":%s}",
+                      thr, distinct_keys, app_map.data ? app_map.data : "{}",
+                      (distinct_keys >= thr) ? "true" : "false");
             sb_free(&app_map);
         }
         sqlite3_finalize(s1);
     }
-    if (filter_serial <= 0) sb_putc(b, ']');
+    if (single && first_s) sb_puts(b, "null");
+    if (!single) sb_putc(b, ']');
 }
 
 static int cmp_str_ptr(const void *a, const void *b) {
@@ -1574,7 +1634,7 @@ static void cp_build_cra_json(cp_state_t *st, sbuf_t *out) {
 
     pthread_mutex_lock(&st->mu);
     sb_puts(&body, ",\"release_approvals\":");
-    append_approvals_json(st->db, &body, 0);
+    append_approvals_json(st->db, &body, NULL, 0, NULL);
 
     sbuf_t devs_buf;
     sb_init(&devs_buf, 1024);
@@ -1807,7 +1867,16 @@ static const char *const DASHBOARD_CHUNKS[] = {
     "  loadData();\n"
     "}\n"
     "async function loadData(){\n"
-    "  const r = await fetch('/api/v1/audit/cra'); const d = await r.json();\n"
+    "  const tok = document.getElementById('tok').value.trim();\n"
+    "  const hdrs = tok ? {'Authorization':'Bearer '+tok} : {};\n"
+    "  const r = await fetch('/api/v1/audit/cra', {headers: hdrs});\n"
+    "  if (r.status === 401){\n"
+    "    document.getElementById('kpis').innerHTML = '';\n"
+    "    document.getElementById('rows').innerHTML = '<tr><td colspan=\"9\" style=\"color:var(--warn)\">Admin Bearer token required: enter token above and click Refresh Fleet.</td></tr>';\n"
+    "    return;\n"
+    "  }\n"
+    "  if (!r.ok){ document.getElementById('msg').textContent = 'HTTP ' + r.status; return; }\n"
+    "  const d = await r.json();\n"
     "  document.getElementById('kpis').innerHTML = `\n"
     "    <div class=\"card\"><div class=\"sub\">Managed Devices</div><div class=\"kpi\">${Number(d.fleet_summary.total_devices)||0}</div></div>\n"
     "    <div class=\"card\"><div class=\"sub\">Healthy / Compliant</div><div class=\"kpi\" style=\"color:var(--ok)\">${Number(d.fleet_summary.compliant_healthy)||0}</div></div>\n"
@@ -2119,7 +2188,7 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
             sb_init(&jb, 512);
             sb_puts(&jb, "{\"approvals\":");
             pthread_mutex_lock(&st->mu);
-            append_approvals_json(st->db, &jb, 0);
+            append_approvals_json(st->db, &jb, NULL, 0, NULL);
             pthread_mutex_unlock(&st->mu);
             sb_putc(&jb, '}');
             send_json(cfd, 200, jb.data);
@@ -2569,7 +2638,7 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 sbuf_t resp;
                 sb_init(&resp, 256);
                 sb_puts(&resp, "{\"ok\":true,\"approval\":");
-                append_approvals_json(st->db, &resp, serial);
+                append_approvals_json(st->db, &resp, ch, serial, ev_hash_hex);
                 sb_putc(&resp, '}');
                 pthread_mutex_unlock(&st->mu);
                 send_json(cfd, 200, resp.data);
