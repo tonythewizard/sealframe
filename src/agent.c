@@ -238,11 +238,32 @@ static int is_hex64_str(const char *s) {
     return 1;
 }
 
+static int is_zero_hex64_str(const char *s) {
+    if (!s || strlen(s) != 64u) return 0;
+    for (size_t i = 0; i < 64u; i++) {
+        if (s[i] != '0') return 0;
+    }
+    return 1;
+}
+
+static int parse_u64_strict(const char *s, uint64_t *out) {
+    if (!s || !s[0] || !out) return -1;
+    uint64_t v = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p < '0' || *p > '9') return -1;
+        uint64_t d = (uint64_t)(*p - '0');
+        if (v > (UINT64_MAX - d) / 10u) return -1;
+        v = v * 10u + d;
+    }
+    *out = v;
+    return 0;
+}
+
 static int acquire_denyset_lock(const char *store_dir) {
     char lpath[PATH_MAX];
     if (snprintf(lpath, sizeof(lpath), "%s/.revoked_dnas.lock", store_dir) >= (int)sizeof(lpath)) return -1;
     (void)mkdir(store_dir, 0700);
-    int fd = open(lpath, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    int fd = open(lpath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
     while (flock(fd, LOCK_EX) != 0) {
         if (errno != EINTR) { close(fd); return -1; }
@@ -479,29 +500,65 @@ static ota_parse_status_t parse_ota_lifecycle(const char *target_dir, ota_lifecy
     ssize_t n = read(fd, buf, sizeof(buf) - 1u);
     close(fd);
     if (n <= 0 || (size_t)n >= sizeof(buf) - 1u) return OTA_ST_CORRUPTED;
+    for (ssize_t i = 0; i < n; i++) {
+        if (buf[i] == '\0') return OTA_ST_CORRUPTED;
+    }
     buf[n] = '\0';
 
-    char magic[16], extra[16];
-    unsigned long long oseq = 0, sseq = 0, qseq = 0;
-    int got = sscanf(buf, "%15s %31s %llu %64s %d %64s %llu %llu %15s",
-                     magic, out->state, &oseq, out->new_hex, &out->has_prev, out->prev_hex,
-                     &sseq, &qseq, extra);
-    if (got != 6 && got != 7 && got != 8) return OTA_ST_CORRUPTED;
-    if (strcmp(magic, "SFOTA1") != 0 || oseq == 0) return OTA_ST_CORRUPTED;
-    if (got == 8 && qseq == 0) return OTA_ST_CORRUPTED;
-    if (strcmp(out->state, "HEALTH_PENDING") != 0 &&
-        strcmp(out->state, "HEALTH_RUNNING") != 0 &&
-        strcmp(out->state, "ROLLBACK_HEALTH_PENDING") != 0 &&
-        strcmp(out->state, "LEDGER_PENDING") != 0) {
+    /* A8-P1-03: Strict line & token validation (reject trailing garbage, embedded newlines, invalid ranges). */
+    size_t len = (size_t)n;
+    if (len > 0 && buf[len - 1u] == '\n') buf[--len] = '\0';
+    if (len > 0 && buf[len - 1u] == '\r') buf[--len] = '\0';
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] == '\n' || buf[i] == '\r' || buf[i] == '\t') return OTA_ST_CORRUPTED;
+    }
+    if (len == 0 || buf[0] == ' ' || buf[len - 1u] == ' ') return OTA_ST_CORRUPTED;
+
+    char *toks[9];
+    int ntok = 0;
+    char *p = buf;
+    while (*p) {
+        if (ntok >= 9) return OTA_ST_CORRUPTED;
+        toks[ntok++] = p;
+        while (*p && *p != ' ') p++;
+        if (*p == ' ') {
+            *p++ = '\0';
+            if (*p == ' ' || *p == '\0') return OTA_ST_CORRUPTED;
+        }
+    }
+    if (ntok != 6 && ntok != 7 && ntok != 8) return OTA_ST_CORRUPTED;
+    if (strcmp(toks[0], "SFOTA1") != 0) return OTA_ST_CORRUPTED;
+
+    if (strcmp(toks[1], "HEALTH_PENDING") != 0 &&
+        strcmp(toks[1], "HEALTH_RUNNING") != 0 &&
+        strcmp(toks[1], "ROLLBACK_HEALTH_PENDING") != 0 &&
+        strcmp(toks[1], "LEDGER_PENDING") != 0) {
         return OTA_ST_CORRUPTED;
     }
-    if ((out->has_prev != 0 && out->has_prev != 1) ||
-        !is_hex64_str(out->new_hex) || !is_hex64_str(out->prev_hex)) {
-        return OTA_ST_CORRUPTED;
+    uint64_t oseq = 0, hp = 0, sseq = 0, qseq = 0;
+    if (parse_u64_strict(toks[2], &oseq) != 0 || oseq == 0) return OTA_ST_CORRUPTED;
+    if (!is_hex64_str(toks[3])) return OTA_ST_CORRUPTED;
+    if (parse_u64_strict(toks[4], &hp) != 0 || (hp != 0u && hp != 1u)) return OTA_ST_CORRUPTED;
+    if (!is_hex64_str(toks[5])) return OTA_ST_CORRUPTED;
+    if (ntok >= 7) {
+        if (parse_u64_strict(toks[6], &sseq) != 0 || sseq == 0) return OTA_ST_CORRUPTED;
+    } else {
+        sseq = oseq;
     }
-    out->serial = (uint64_t)oseq;
-    out->start_serial = (got >= 7) ? (uint64_t)sseq : (uint64_t)oseq;
-    out->q_serial = (got == 8) ? (uint64_t)qseq : (uint64_t)oseq;
+    if (ntok == 8) {
+        if (parse_u64_strict(toks[7], &qseq) != 0 || qseq == 0) return OTA_ST_CORRUPTED;
+    } else {
+        qseq = oseq;
+    }
+    if (sseq > oseq || qseq < sseq || qseq > oseq) return OTA_ST_CORRUPTED;
+
+    snprintf(out->state, sizeof(out->state), "%s", toks[1]);
+    memcpy(out->new_hex, toks[3], 65);
+    out->has_prev = (int)hp;
+    memcpy(out->prev_hex, toks[5], 65);
+    out->serial = oseq;
+    out->start_serial = sseq;
+    out->q_serial = qseq;
     return OTA_ST_VALID;
 }
 
@@ -606,6 +663,22 @@ static fp_err_t verify_system_invariants(const fp_agent_cfg_t *cfg, const fp_dna
 }
 
 static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
+    /* 0. A8-P0-04: Unconditional boot-time revocation fence BEFORE bundle recovery or journal parsing!
+     * Even if .sf_tx_journal or .sf_ota_state is present or corrupted, a revoked `current` symlink
+     * is ALWAYS unlinked first! */
+    {
+        char boot_cur[65];
+        if (read_current_gen_hex(cfg->target_dir, boot_cur)) {
+            fp_dna_t boot_dna;
+            if (fp_hex_decode(boot_cur, boot_dna.bytes, FP_DNA_LEN) == FP_OK &&
+                deny_set_contains(cfg->store_dir, &boot_dna)) {
+                fp_err_t ferr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
+                                                       "REVOKED_BOOT_FENCE=1\n");
+                if (ferr != FP_OK) return ferr;
+            }
+        }
+    }
+
     /* 1. Resume any interrupted REVOKE deactivation BEFORE checking remote serials (P0-04) */
     char rpend[PATH_MAX];
     if (snprintf(rpend, sizeof(rpend), "%s/.sf_revoke_pending", cfg->target_dir) < (int)sizeof(rpend)) {
@@ -631,22 +704,24 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
         return rerr;
     }
 
+    /* Re-enforce boot fence in case fp_bundle_recover() reconciled a journal targeting a revoked DNA */
+    {
+        char post_cur[65];
+        if (read_current_gen_hex(cfg->target_dir, post_cur)) {
+            fp_dna_t post_dna;
+            if (fp_hex_decode(post_cur, post_dna.bytes, FP_DNA_LEN) == FP_OK &&
+                deny_set_contains(cfg->store_dir, &post_dna)) {
+                fp_err_t ferr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
+                                                       "REVOKED_BOOT_FENCE=1\n");
+                if (ferr != FP_OK) { fp_sql_close(rec_sql); return ferr; }
+            }
+        }
+    }
+
     /* 3. Inspect .sf_ota_state strictly (P1-02 fail-closed, P0-01/P0-02/P0-03 idempotent R(R(S))=R(S)) */
     ota_lifecycle_t ol;
     ota_parse_status_t os = parse_ota_lifecycle(cfg->target_dir, &ol);
     if (os == OTA_ST_NONE) {
-        /* A7-P0-02: Enforce durable revocation deny-set at boot even with no active .sf_ota_state! */
-        char boot_cur[65];
-        if (read_current_gen_hex(cfg->target_dir, boot_cur)) {
-            fp_dna_t boot_dna;
-            if (fp_hex_decode(boot_cur, boot_dna.bytes, FP_DNA_LEN) == FP_OK &&
-                deny_set_contains(cfg->store_dir, &boot_dna)) {
-                fp_err_t ferr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
-                                                       "REVOKED_BOOT_FENCE=1\n");
-                fp_sql_close(rec_sql);
-                return ferr;
-            }
-        }
         fp_sql_close(rec_sql);
         return FP_OK;
     }
@@ -718,15 +793,31 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
             cleanup_pending_events(cfg->store_dir, ol.start_serial, ol.serial);
             rerr = clear_ota_lifecycle(cfg->target_dir);
         } else {
-            int any_applied = has_live || (rec_sql && (sql_seq > 0 || sql_dna[0] != '\0'));
-            if (any_applied) {
-                /* R1 + P1-01: Initial install (single or multi-step) crashed after apply -> invert ALL SQLite steps & unlink current! */
-                rerr = fp_bundle_rollback(cfg->store_dir, &actual_dna, NULL, cfg->target_dir, rec_sql);
+            /* A8-P0-05: `!ol.has_prev` does NOT mean the SQLite DB was empty (e.g. V1(SQL) was revoked
+             * and committed earlier, leaving SQLite at V1 while `current` is absent!). If `ol.prev_hex`
+             * carries a non-zero SQLite baseline DNA, revert SQLite back to that baseline via sql_only
+             * without activating `current`! */
+            int has_sql_base = !is_zero_hex64_str(ol.prev_hex);
+            if (has_sql_base) {
+                if (rec_sql && (sql_seq > 0 || sql_dna[0] != '\0') && strcmp(sql_dna, ol.prev_hex) != 0) {
+                    rerr = fp_bundle_rollback_sql_only(cfg->store_dir, &actual_dna, &pdna,
+                                                       cfg->target_dir, rec_sql);
+                    if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
+                }
+                rerr = deactivate_live_target(cfg->target_dir, ".sf_revoked", "REVOKED_OFFLINE_RECOVERY=1\n");
                 if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
                 if (quarantine) save_failed_serial(cfg->store_dir, ol.q_serial, 0);
             } else {
-                rerr = deactivate_live_target(cfg->target_dir, NULL, NULL);
-                if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
+                int any_applied = has_live || (rec_sql && (sql_seq > 0 || sql_dna[0] != '\0'));
+                if (any_applied) {
+                    /* R1 + P1-01: Initial install (single or multi-step) crashed after apply -> invert ALL SQLite steps & unlink current! */
+                    rerr = fp_bundle_rollback(cfg->store_dir, &actual_dna, NULL, cfg->target_dir, rec_sql);
+                    if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
+                    if (quarantine) save_failed_serial(cfg->store_dir, ol.q_serial, 0);
+                } else {
+                    rerr = deactivate_live_target(cfg->target_dir, NULL, NULL);
+                    if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
+                }
             }
             cleanup_pending_events(cfg->store_dir, ol.start_serial, ol.serial);
             rerr = clear_ota_lifecycle(cfg->target_dir);
@@ -1367,41 +1458,57 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         }
     }
 
-    /* P0-03 & P0-05: Persist ALL authenticated FP_ACTION_REVOKE targets into the monotonic durable deny-set
-     * BEFORE any target/DB mutation or early exit! */
+    /* P0-03, P0-05, A7-P0-02 & A8-P0-04: Immediate ENOSPC-safe revocation fencing & durable deny-set!
+     * If the currently active release is revoked in this chain (or already in `.revoked_dnas`),
+     * unlink `current` FIRST (requires zero disk space!) and persist its deny-set entry BEFORE
+     * processing any other revocations or replacement downloads so no I/O error on a later entry
+     * or marker file can ever leave a revoked active release live! */
+    int active_revoked_in_chain = 0;
+    if (st.has_current) {
+        if (deny_set_contains(cfg->store_dir, &st.current_dna)) {
+            active_revoked_in_chain = 1;
+        } else {
+            for (uint64_t i = 0; i < chain_len; i++) {
+                if (chain[i].action == FP_ACTION_REVOKE &&
+                    fp_dna_equal(&chain[i].target_dna, &st.current_dna)) {
+                    active_revoked_in_chain = 1;
+                    break;
+                }
+            }
+        }
+    }
+    if (active_revoked_in_chain) {
+        char rev_marker[128];
+        snprintf(rev_marker, sizeof(rev_marker), "REVOKED_SERIAL=%llu\n", (unsigned long long)latest_ev.serial);
+        /* deactivate_live_target() unlinks `<target_dir>/current` BEFORE attempting marker write! */
+        fp_err_t ferr = deactivate_live_target(cfg->target_dir, ".sf_revoked", rev_marker);
+        fp_err_t derr = deny_set_add_dna(cfg->store_dir, &st.current_dna);
+        if (ferr != FP_OK || derr != FP_OK) {
+            err = (derr != FP_OK) ? derr : ferr;
+            free(chain); free(chain_ridx);
+            rep.outcome = FP_AGENT_REVOKED;
+            rep.active_serial = 0;
+            memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
+            snprintf(rep.detail, sizeof(rep.detail),
+                     "active release revoked at serial %llu; current unlinked but durable persist failed (%s)",
+                     (unsigned long long)latest_ev.serial, fp_strerror(err));
+            goto done;
+        }
+    }
     for (uint64_t i = 0; i < chain_len; i++) {
         if (chain[i].action == FP_ACTION_REVOKE) {
             err = deny_set_add_dna(cfg->store_dir, &chain[i].target_dna);
             if (err != FP_OK) {
                 free(chain); free(chain_ridx);
+                if (active_revoked_in_chain) {
+                    rep.outcome = FP_AGENT_REVOKED;
+                    rep.active_serial = 0;
+                    memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
+                }
                 snprintf(rep.detail, sizeof(rep.detail), "failed to persist revocation deny-set (%s)", fp_strerror(err));
                 goto done;
             }
         }
-    }
-
-    /* A7-P0-02: Immediate revocation fencing — if the currently active release is now revoked in the
-     * durable deny-set, fence/deactivate `current` IMMEDIATELY before any replacement download or early
-     * exit so a 404/network/ENOSPC/SIGKILL can NEVER leave a revoked release live! */
-    if (st.has_current && deny_set_contains(cfg->store_dir, &st.current_dna)) {
-        char rpend[PATH_MAX], rev_marker[128];
-        snprintf(rev_marker, sizeof(rev_marker), "REVOKED_SERIAL=%llu\n", (unsigned long long)latest_ev.serial);
-        if (snprintf(rpend, sizeof(rpend), "%s/.sf_revoke_pending", cfg->target_dir) >= (int)sizeof(rpend)) {
-            free(chain); free(chain_ridx); err = FP_ERR_BOUNDS; goto done;
-        }
-        (void)mkdir(cfg->target_dir, 0755);
-        err = write_file_atomic(rpend, (const uint8_t *)rev_marker, strlen(rev_marker));
-        if (err == FP_OK) {
-            err = deactivate_live_target(cfg->target_dir, ".sf_revoked", rev_marker);
-        }
-        if (err != FP_OK) {
-            free(chain); free(chain_ridx);
-            snprintf(rep.detail, sizeof(rep.detail),
-                     "active release revoked at serial %llu but immediate fencing failed (%s)",
-                     (unsigned long long)latest_ev.serial, fp_strerror(err));
-            goto done;
-        }
-        if (unlink(rpend) == 0) (void)sync_parent_dir(rpend);
     }
 
     /* 6. Handle final-state deactivation (!target_st.has_current) OR pure historical revoke (active DNA unchanged)
@@ -1568,14 +1675,31 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         }
     }
 
-    /* 8. Open optional SQLite DB & apply Particle Bundle(s) atomically under unified HEALTH_PENDING lifecycle (P0-02/03/04) */
+    /* 8. Open optional SQLite DB & record its true baseline checkpoint independently of `st.has_current` (A8-P0-05) */
     fp_sql_ctx_t *sql = NULL;
+    uint64_t sql_base_seq = 0;
+    char sql_base_hex[65];
+    sql_base_hex[0] = '\0';
+    fp_dna_t sql_base_dna;
+    memset(&sql_base_dna, 0, sizeof(sql_base_dna));
+    int has_sql_base = 0;
     if (cfg->db_path && cfg->db_path[0]) {
         err = fp_sql_open(cfg->db_path, &sql);
         if (err != FP_OK) {
             free(chain); free(chain_ridx);
             snprintf(rep.detail, sizeof(rep.detail), "cannot open SQLite DB (%s)", fp_strerror(err));
             goto done;
+        }
+        err = fp_sql_get_progress(sql, &sql_base_seq, sql_base_hex);
+        if (err != FP_OK) {
+            fp_sql_close(sql);
+            free(chain); free(chain_ridx);
+            snprintf(rep.detail, sizeof(rep.detail), "cannot read SQLite baseline (%s)", fp_strerror(err));
+            goto done;
+        }
+        if (sql_base_seq > 0 && is_hex64_str(sql_base_hex) &&
+            fp_hex_decode(sql_base_hex, sql_base_dna.bytes, FP_DNA_LEN) == FP_OK) {
+            has_sql_base = 1;
         }
     }
 
@@ -1638,16 +1762,20 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         }
     }
 
-    /* F2 + P0-03 + R3 + A7-P1-03: Persist verified event chain AND direction-aware lifecycle marker BEFORE any mutation
-     * so offline recovery can complete LEDGER_PENDING even when the repository is unreachable! */
+    /* F2 + P0-03 + R3 + A7-P1-03 + A8-P0-05: Persist verified event chain AND direction-aware lifecycle marker.
+     * When `!st.has_current` but SQLite has a committed baseline (`has_sql_base`, e.g. prior V1 revoked),
+     * record `has_prev=0` + `prev_dna=sql_base_dna` so offline recovery reverts SQLite to `sql_base_dna`
+     * without reactivating `current`! */
     uint64_t chain_first_serial = chain[0].serial;
     uint64_t eff_q_serial = final_target_serial ? final_target_serial : latest_ev.serial;
+    const fp_dna_t *ota_prev_dna = st.has_current ? &st.current_dna
+                                                  : (has_sql_base ? &sql_base_dna : &st.current_dna);
     err = persist_pending_events(cfg->store_dir, chain, chain_len);
     if (err == FP_OK) {
         err = write_ota_lifecycle(cfg->target_dir,
                                   is_explicit_rollback ? "ROLLBACK_HEALTH_PENDING" : "HEALTH_PENDING",
                                   latest_ev.serial, chain_first_serial, eff_q_serial, &final_target_dna,
-                                  st.has_current ? 1 : 0, &st.current_dna);
+                                  st.has_current ? 1 : 0, ota_prev_dna);
     }
     if (err != FP_OK) {
         fp_sql_close(sql);
@@ -1656,12 +1784,27 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         goto done;
     }
 
-    /* P0-01 + P0-02 + A7-P0-03: Replay ALL non-revoke SQLite transitions in exact chronological order!
-     * Intermediate steps execute in SQL-only isolation (`fp_bundle_apply_sql_only` / `fp_bundle_rollback_sql_only`)
-     * so `<target_dir>/current` is NEVER flipped to intermediate, failed, or revoked releases! */
+    /* P0-01 + P0-02 + A7-P0-03 + A8-P0-03: Replay ALL non-revoke SQLite transitions atomically!
+     * For multi-step INSTALL chains on SQLite, execute ALL intermediate + final migrations inside
+     * ONE SINGLE atomic SQLite WAL transaction (`fp_bundle_apply_chain`) so concurrent WAL readers
+     * NEVER observe intermediate or revoked SQL states and `<target_dir>/current` flips once! */
     fp_dna_t running_dna = st.current_dna;
     int running_has = st.has_current ? 1 : 0;
-    if (sql != NULL && chain_len > 1u) {
+    if (sql != NULL && chain_len > 1u && !is_explicit_rollback) {
+        fp_bundle_step_t steps[64];
+        size_t step_cnt = 0;
+        for (uint64_t i = 0; i < chain_len; i++) {
+            if (chain[i].action == FP_ACTION_INSTALL) {
+                if (step_cnt >= 64u) { err = FP_ERR_BOUNDS; break; }
+                steps[step_cnt].bundle_dna = chain[i].target_dna;
+                steps[step_cnt].expected_seq = chain[i].serial;
+                step_cnt++;
+            }
+        }
+        if (err == FP_OK && step_cnt > 0u) {
+            err = fp_bundle_apply_chain(cfg->store_dir, steps, step_cnt, cfg->target_dir, sql);
+        }
+    } else if (sql != NULL && chain_len > 1u) {
         uint64_t final_step_idx = chain_len;
         for (uint64_t i = chain_len; i > 0; i--) {
             if (chain[i - 1u].action != FP_ACTION_REVOKE) {
@@ -1729,7 +1872,8 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
             uint64_t sq = 0;
             sql_dna[0] = '\0';
             if (fp_sql_get_progress(sql, &sq, sql_dna) != FP_OK ||
-                (st.has_current ? (strcmp(sql_dna, prev_hex) != 0) : (sq != 0 || sql_dna[0] != '\0'))) {
+                (has_sql_base ? (sq != sql_base_seq || strcmp(sql_dna, sql_base_hex) != 0)
+                              : (sq != 0 || sql_dna[0] != '\0'))) {
                 mutated = 1;
             }
         }
@@ -1759,7 +1903,7 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     if (!is_explicit_rollback) {
         err = write_ota_lifecycle(cfg->target_dir, "HEALTH_RUNNING",
                                   latest_ev.serial, chain_first_serial, eff_q_serial,
-                                  &final_target_dna, st.has_current ? 1 : 0, &st.current_dna);
+                                  &final_target_dna, st.has_current ? 1 : 0, ota_prev_dna);
         if (err != FP_OK) {
             fp_sql_close(sql);
             free(chain); free(chain_ridx);
@@ -1832,9 +1976,22 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
             goto done;
         }
         if (!st.has_current) {
-            /* P1-01: Revert initial SQLite changesets AND deactivate current atomically! */
-            fp_err_t derr = fp_bundle_rollback(cfg->store_dir, &final_target_dna, NULL,
-                                               cfg->target_dir, sql);
+            /* P1-01 + A8-P0-05: Distinguish truly empty initial install (`!has_sql_base`) from a node
+             * whose prior generation was revoked & committed (`has_sql_base == 1`)!
+             * When `has_sql_base == 1`, revert SQLite ONLY back to `sql_base_dna` (NEVER wipe V1!)
+             * while keeping `current` deactivated + `.sf_revoked`! */
+            fp_err_t derr = FP_OK;
+            if (sql != NULL && has_sql_base) {
+                derr = fp_bundle_rollback_sql_only(cfg->store_dir, &final_target_dna,
+                                                   &sql_base_dna, cfg->target_dir, sql);
+                if (derr == FP_OK) {
+                    derr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
+                                                  "REVOKED_NO_HEALTHY_FALLBACK=1\n");
+                }
+            } else {
+                derr = fp_bundle_rollback(cfg->store_dir, &final_target_dna, NULL,
+                                          cfg->target_dir, sql);
+            }
             fp_sql_close(sql);
             free(chain); free(chain_ridx);
             if (derr == FP_OK) {
@@ -1842,11 +1999,13 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
                 cleanup_pending_events(cfg->store_dir, chain_first_serial, latest_ev.serial);
                 (void)clear_ota_lifecycle(cfg->target_dir);
             }
-            rep.outcome = FP_AGENT_INITIAL_INSTALL_FAILED;
+            rep.outcome = has_sql_base ? FP_AGENT_REVOKED : FP_AGENT_INITIAL_INSTALL_FAILED;
             rep.active_serial = 0;
             memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
             snprintf(rep.detail, sizeof(rep.detail),
-                     "initial install health-check failed (exit=%d) on serial %llu; target %s",
+                     has_sql_base
+                         ? "replacement health-check failed (exit=%d) on serial %llu; SQLite restored to baseline & target deactivated"
+                         : "initial install health-check failed (exit=%d) on serial %llu; target %s",
                      hrc, (unsigned long long)q_serial,
                      derr == FP_OK ? "reverted & deactivated" : "rollback error");
             err = (derr == FP_OK) ? FP_ERR_POLICY : derr;

@@ -41,6 +41,7 @@ typedef struct {
     char            keryx_comm[65];
     char            keryx_tag[17];
     int             derivations_verified;
+    int             evil_mode; /* A8-SEC-04 (CHAIN-01): 1=wrong id, 2=empty tx_id, 3=spoofed substring */
     uint8_t         expected_signer_pk[32];
 } mock_rpc_t;
 
@@ -134,7 +135,13 @@ static void *mock_rpc_thread(void *arg) {
         extract_str(body, "method", method, sizeof(method));
         pthread_mutex_lock(&m->mu);
 
-        if (strcmp(method, "sealframe_anchorPublish") == 0) {
+        if (m->evil_mode == 1) {
+            send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":\"gen_tx_bad_id\"}");
+        } else if (m->evil_mode == 2) {
+            send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"\"}");
+        } else if (m->evil_mode == 3) {
+            send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"verified\":\"true\",\"note\":\"\\\"verified\\\":true\"}}");
+        } else if (strcmp(method, "sealframe_anchorPublish") == 0) {
             extract_str(body, "commitment", m->generic_comm, sizeof(m->generic_comm));
             send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"gen_tx_0001\"}");
         } else if (strcmp(method, "sealframe_anchorVerify") == 0) {
@@ -310,6 +317,30 @@ int main(void) {
     }
 
     assert(rpc.derivations_verified == 2);
+
+    /* --- 3b. A8-SEC-04 (CHAIN-01): Strict JSON-RPC 2.0 negative tests (wrong id, empty tx_id, spoofed substring) --- */
+    {
+        sf_chain_cfg_t ecfg;
+        memset(&ecfg, 0, sizeof(ecfg));
+        ecfg.kind = SF_CHAIN_GENERIC;
+        ecfg.rpc_url = rpc_url;
+        ecfg.io_timeout_ms = 5000;
+        sf_chain_ctx_t ectx;
+        fp_anchor_ops_t eops;
+        assert(sf_chain_adapter_init(&ectx, &ecfg, &eops) == FP_OK);
+
+        pthread_mutex_lock(&rpc.mu); rpc.evil_mode = 1; pthread_mutex_unlock(&rpc.mu);
+        assert(eops.publish(eops.user_ctx, &comm) == FP_ERR_INTEGRITY);
+
+        pthread_mutex_lock(&rpc.mu); rpc.evil_mode = 2; pthread_mutex_unlock(&rpc.mu);
+        assert(eops.publish(eops.user_ctx, &comm) == FP_ERR_INTEGRITY);
+
+        pthread_mutex_lock(&rpc.mu); rpc.evil_mode = 3; pthread_mutex_unlock(&rpc.mu);
+        assert(eops.verify(eops.user_ctx, &comm) == FP_ERR_INTEGRITY);
+
+        pthread_mutex_lock(&rpc.mu); rpc.evil_mode = 0; pthread_mutex_unlock(&rpc.mu);
+        printf("[PASS] A8-SEC-04 (CHAIN-01): Strict JSON-RPC 2.0 rejects wrong id, empty tx_id & spoofed substrings!\n");
+    }
 
     /* --- 4. Pure-C11 RFC 6455 WebSocket wRPC-JSON client test --- */
     {
