@@ -11,7 +11,9 @@ ExecStart=/usr/local/bin/sf-cp \
     --port ${SF_CP_PORT} \
     --data-dir ${SF_CP_DATA_DIR} \
     --sbom ${SF_CP_SBOM} \
-    --require-signed-heartbeat
+    --require-signed-heartbeat \
+    --require-enrolled \
+    --require-quorum
 Restart=on-failure
 RestartSec=5s
 

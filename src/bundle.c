@@ -10,9 +10,11 @@
 #include <limits.h>
 #include <signal.h>
 #include <sqlite3.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -20,9 +22,12 @@
 #define PATH_MAX 4096
 #endif
 
-/* SQLite changesets are bounded to 64 MiB; FP_ROLE_FILE entries stream in O(1) RAM (no 64 MiB cap!) */
-#define BUNDLE_MAX_CHANGESET (64u << 20)
-#define BUNDLE_STREAM_BUF    65536u
+/* SQLite changesets are bounded per-entry AND in aggregate; FP_ROLE_FILE streams in 64 KiB O(1) RAM */
+#define BUNDLE_MAX_CHANGESET        (16u << 20)
+#define BUNDLE_MAX_TOTAL_CHANGESETS (32u << 20)
+#define BUNDLE_STREAM_BUF           65536u
+
+static _Atomic uint64_t g_bundle_tmp_seq = 0;
 
 struct fp_sql_ctx {
     sqlite3      *db;
@@ -590,13 +595,60 @@ static fp_err_t load_and_verify_bundle(const char *store_dir, const fp_dna_t *bu
     return err;
 }
 
-/* --- Persistent Crash-Recovery Transaction Journal (.sf_tx_journal) --- */
+/* --- Target Lifecycle Lock (.sf_lifecycle.lock) + Fail-Closed Crash-Recovery Journal --- */
+
+static int acquire_target_lock(const char *target_dir) {
+    if (mkdir_p(target_dir) != FP_OK) return -1;
+    char lpath[PATH_MAX];
+    int n = snprintf(lpath, sizeof(lpath), "%s/.sf_lifecycle.lock", target_dir);
+    if (n < 0 || (size_t)n >= sizeof(lpath)) return -1;
+    int fd = open(lpath, O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    while (flock(fd, LOCK_EX) != 0) {
+        if (errno == EINTR) continue;
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void release_target_lock(int fd) {
+    if (fd >= 0) {
+        (void)flock(fd, LOCK_UN);
+        close(fd);
+    }
+}
+
+typedef enum {
+    TXJ_NOT_FOUND = 0,
+    TXJ_VALID     = 1,
+    TXJ_CORRUPTED = 2,
+    TXJ_IO_ERROR  = 3
+} tx_journal_status_t;
+
+static int is_valid_hex64(const char *s) {
+    if (!s || strlen(s) != 64u) return 0;
+    for (size_t i = 0; i < 64u; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0;
+    }
+    return 1;
+}
+
+static int is_valid_tx_state(const char *st) {
+    return strcmp(st, "STAGING") == 0 ||
+           strcmp(st, "ACTIVATION_PENDING") == 0 ||
+           strcmp(st, "ROLLBACK_PENDING") == 0 ||
+           strcmp(st, "COMMITTED") == 0;
+}
 
 static fp_err_t tx_journal_write(const char *target_dir, const char *state,
                                  uint64_t seq, const char *dna_hex, int has_sql) {
     if (mkdir_p(target_dir) != FP_OK) return FP_ERR_IO;
+    uint64_t uq = atomic_fetch_add(&g_bundle_tmp_seq, 1) + 1u;
     char tmp[PATH_MAX], dst[PATH_MAX];
-    int n1 = snprintf(tmp, sizeof(tmp), "%s/.sf_tx_journal.tmp.%ld", target_dir, (long)getpid());
+    int n1 = snprintf(tmp, sizeof(tmp), "%s/.sf_tx_journal.tmp.%ld.%llu",
+                      target_dir, (long)getpid(), (unsigned long long)uq);
     int n2 = snprintf(dst, sizeof(dst), "%s/.sf_tx_journal", target_dir);
     if (n1 < 0 || (size_t)n1 >= sizeof(tmp) || n2 < 0 || (size_t)n2 >= sizeof(dst)) {
         return FP_ERR_BOUNDS;
@@ -605,7 +657,6 @@ static fp_err_t tx_journal_write(const char *target_dir, const char *state,
     int ln = snprintf(line, sizeof(line), "SFTX1 %s %llu %s %d\n",
                       state, (unsigned long long)seq, dna_hex, has_sql ? 1 : 0);
     if (ln <= 0 || (size_t)ln >= sizeof(line)) return FP_ERR_BOUNDS;
-    unlink(tmp);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
     if (fd < 0) return FP_ERR_IO;
     size_t pos = 0;
@@ -623,55 +674,135 @@ static fp_err_t tx_journal_write(const char *target_dir, const char *state,
     return sync_dir_path(target_dir);
 }
 
-static int tx_journal_read(const char *target_dir, char state_out[32],
-                           uint64_t *seq_out, char dna_out[65], int *has_sql_out) {
+static tx_journal_status_t tx_journal_read(const char *target_dir, char state_out[32],
+                                           uint64_t *seq_out, char dna_out[65], int *has_sql_out) {
     char path[PATH_MAX];
     int n = snprintf(path, sizeof(path), "%s/.sf_tx_journal", target_dir);
-    if (n < 0 || (size_t)n >= sizeof(path)) return 0;
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    char magic[16], st[32], dna[65];
+    if (n < 0 || (size_t)n >= sizeof(path)) return TXJ_IO_ERROR;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        return errno == ENOENT ? TXJ_NOT_FOUND : TXJ_IO_ERROR;
+    }
+    char buf[512];
+    ssize_t r = read(fd, buf, sizeof(buf) - 1u);
+    close(fd);
+    if (r <= 0 || (size_t)r >= sizeof(buf) - 1u) return TXJ_CORRUPTED;
+    buf[r] = '\0';
+
+    char magic[16], st[32], dna[65], extra[8];
     unsigned long long seq = 0;
-    int hsql = 0;
-    int got = fscanf(f, "%15s %31s %llu %64s %d", magic, st, &seq, dna, &hsql);
-    fclose(f);
-    if (got != 5 || strcmp(magic, "SFTX1") != 0 || strlen(dna) != 64u) return 0;
+    int hsql = -1;
+    int got = sscanf(buf, "%15s %31s %llu %64s %d %7s", magic, st, &seq, dna, &hsql, extra);
+    if (got != 5 || strcmp(magic, "SFTX1") != 0 || !is_valid_tx_state(st) ||
+        !is_valid_hex64(dna) || (hsql != 0 && hsql != 1)) {
+        return TXJ_CORRUPTED;
+    }
     snprintf(state_out, 32, "%s", st);
     *seq_out = (uint64_t)seq;
     snprintf(dna_out, 65, "%s", dna);
-    *has_sql_out = hsql ? 1 : 0;
-    return 1;
+    *has_sql_out = hsql;
+    return TXJ_VALID;
 }
 
-/* Verify whether an already-sealed immutable generation directory has intact files. */
-static int verify_sealed_generation(const fp_bundle_t *b, const char *gen_dir) {
-    char seal[PATH_MAX];
-    int sn = snprintf(seal, sizeof(seal), "%s/.sf_gen_sealed", gen_dir);
-    if (sn < 0 || (size_t)sn >= sizeof(seal)) return 0;
-    struct stat sb;
-    if (lstat(seal, &sb) != 0 || !S_ISREG(sb.st_mode)) return 0;
-    for (uint16_t i = 0; i < b->entry_count; i++) {
+/* Open a nested relative file inside an already-opened directory fd using O_NOFOLLOW at every component. */
+static int open_rel_readonly_nofollow(int root_fd, const char *rel_path) {
+    if (!safe_rel_path(rel_path)) return -1;
+    int cur = dup(root_fd);
+    if (cur < 0) return -1;
+    const char *p = rel_path;
+    for (;;) {
+        const char *slash = strchr(p, '/');
+        if (!slash) {
+            int ffd = openat(cur, p, O_RDONLY | O_NOFOLLOW);
+            close(cur);
+            return ffd;
+        }
+        size_t clen = (size_t)(slash - p);
+        if (clen == 0 || clen >= FP_BUNDLE_MAX_PATH) { close(cur); return -1; }
+        char comp[FP_BUNDLE_MAX_PATH];
+        memcpy(comp, p, clen);
+        comp[clen] = '\0';
+        int next = openat(cur, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        close(cur);
+        if (next < 0) return -1;
+        cur = next;
+        p = slash + 1;
+    }
+}
+
+/* Cryptographically verify an immutable sealed generation directory:
+ * checks `.sf_gen_sealed` contents == dna_hex, openat(O_NOFOLLOW) traversal, file mode,
+ * exact size, and streaming BLAKE3 Content DNA of EVERY FP_ROLE_FILE entry! */
+static int verify_sealed_generation(const fp_bundle_t *b, const char *gen_dir,
+                                    const char *expected_dna_hex) {
+    int gfd = open(gen_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (gfd < 0) return 0;
+
+    int sfd = openat(gfd, ".sf_gen_sealed", O_RDONLY | O_NOFOLLOW);
+    if (sfd < 0) { close(gfd); return 0; }
+    char seal_buf[72];
+    ssize_t sr = read(sfd, seal_buf, sizeof(seal_buf) - 1u);
+    close(sfd);
+    if (sr != 64) { close(gfd); return 0; }
+    seal_buf[64] = '\0';
+    if (expected_dna_hex && memcmp(seal_buf, expected_dna_hex, 64u) != 0) {
+        close(gfd);
+        return 0;
+    }
+
+    uint8_t *buf = malloc(BUNDLE_STREAM_BUF);
+    if (!buf) { close(gfd); return 0; }
+
+    int ok = 1;
+    for (uint16_t i = 0; i < b->entry_count && ok; i++) {
         if (b->entries[i].role != FP_ROLE_FILE) continue;
-        char fpath[PATH_MAX];
-        int fn = snprintf(fpath, sizeof(fpath), "%s/%s", gen_dir, b->entries[i].path);
-        if (fn < 0 || (size_t)fn >= sizeof(fpath)) return 0;
-        if (lstat(fpath, &sb) != 0 || !S_ISREG(sb.st_mode) ||
-            (uint64_t)sb.st_size != b->entries[i].size) {
-            return 0;
+        int ffd = open_rel_readonly_nofollow(gfd, b->entries[i].path);
+        if (ffd < 0) { ok = 0; break; }
+        struct stat sb;
+        mode_t exp_mode = (mode_t)(b->entries[i].mode ? (b->entries[i].mode & 0777u) : 0644u);
+        if (fstat(ffd, &sb) != 0 || !S_ISREG(sb.st_mode) ||
+            (uint64_t)sb.st_size != b->entries[i].size ||
+            (sb.st_mode & 0777u) != exp_mode) {
+            close(ffd);
+            ok = 0;
+            break;
+        }
+        fp_dna_stream_t ds;
+        fp_dna_stream_init(&ds);
+        uint64_t total = 0;
+        for (;;) {
+            ssize_t r = read(ffd, buf, BUNDLE_STREAM_BUF);
+            if (r < 0) { if (errno == EINTR) continue; ok = 0; break; }
+            if (r == 0) break;
+            if (fp_dna_stream_update(&ds, buf, (size_t)r) != FP_OK) { ok = 0; break; }
+            total += (uint64_t)r;
+        }
+        close(ffd);
+        if (ok) {
+            fp_dna_t actual;
+            uint64_t vsz = 0;
+            if (fp_dna_stream_finish(&ds, &actual, &vsz) != FP_OK ||
+                total != b->entries[i].size || vsz != b->entries[i].size ||
+                !fp_dna_equal(&actual, &b->entries[i].dna)) {
+                ok = 0;
+            }
         }
     }
-    return 1;
+    free(buf);
+    close(gfd);
+    return ok;
 }
 
-/* Immutable generation staging: if gen/<dna> is already sealed & verified, never mutate in place.
+/* Immutable generation staging: if gen/<dna> is already sealed & cryptographically verified, never mutate in place.
  * Otherwise stage into a unique temporary dir, seal it, and atomically rename into gen/<dna>. */
 static fp_err_t stage_bundle_files(const char *store_dir, const fp_bundle_t *b,
                                    const char *target_dir, const char *dna_hex) {
+    uint64_t uq = atomic_fetch_add(&g_bundle_tmp_seq, 1) + 1u;
     char gen_root[PATH_MAX], gen_dir[PATH_MAX], stage_dir[PATH_MAX];
     int rn = snprintf(gen_root, sizeof(gen_root), "%s/gen", target_dir);
     int gn = snprintf(gen_dir, sizeof(gen_dir), "%s/gen/%s", target_dir, dna_hex);
-    int tn = snprintf(stage_dir, sizeof(stage_dir), "%s/gen/.stage-%s-%ld",
-                      target_dir, dna_hex, (long)getpid());
+    int tn = snprintf(stage_dir, sizeof(stage_dir), "%s/gen/.stage-%s-%ld-%llu",
+                      target_dir, dna_hex, (long)getpid(), (unsigned long long)uq);
     if (rn < 0 || (size_t)rn >= sizeof(gen_root) ||
         gn < 0 || (size_t)gn >= sizeof(gen_dir) ||
         tn < 0 || (size_t)tn >= sizeof(stage_dir)) {
@@ -679,12 +810,12 @@ static fp_err_t stage_bundle_files(const char *store_dir, const fp_bundle_t *b,
     }
     if (mkdir_p(gen_root) != FP_OK) return FP_ERR_IO;
 
-    /* Immutable generation fast path: never overwrite an already-sealed active generation! */
-    if (verify_sealed_generation(b, gen_dir)) {
+    /* Immutable generation fast path: cryptographically verified before reuse! */
+    if (verify_sealed_generation(b, gen_dir, dna_hex)) {
         return FP_OK;
     }
 
-    if (mkdir_p(stage_dir) != FP_OK) return FP_ERR_IO;
+    if (mkdir(stage_dir, 0755) != 0) return FP_ERR_IO;
     int stage_fd = open(stage_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
     if (stage_fd < 0) return FP_ERR_IO;
 
@@ -704,16 +835,14 @@ static fp_err_t stage_bundle_files(const char *store_dir, const fp_bundle_t *b,
     close(stage_fd);
     if (!sync_ok) return serr != FP_OK ? serr : FP_ERR_IO;
 
-    /* Publish generation directory atomically; if a concurrent/prior partial dir exists,
-     * only replace if unsealed (never overwrite a sealed generation). */
+    /* Publish generation directory atomically; if a corrupt/unsealed dir exists at gen_dir, move aside first */
     if (rename(stage_dir, gen_dir) != 0) {
-        if (verify_sealed_generation(b, gen_dir)) {
+        if (verify_sealed_generation(b, gen_dir, dna_hex)) {
             return FP_OK;
         }
-        /* Move unsealed/stale directory aside then publish cleanly */
         char stale[PATH_MAX];
-        int stn = snprintf(stale, sizeof(stale), "%s/gen/.stale-%s-%ld",
-                           target_dir, dna_hex, (long)getpid());
+        int stn = snprintf(stale, sizeof(stale), "%s/gen/.stale-%s-%ld-%llu",
+                           target_dir, dna_hex, (long)getpid(), (unsigned long long)uq);
         if (stn < 0 || (size_t)stn >= sizeof(stale)) return FP_ERR_BOUNDS;
         (void)rename(gen_dir, stale);
         if (rename(stage_dir, gen_dir) != 0) return FP_ERR_IO;
@@ -721,19 +850,20 @@ static fp_err_t stage_bundle_files(const char *store_dir, const fp_bundle_t *b,
     return sync_dir_path(gen_root);
 }
 
-fp_err_t fp_bundle_recover(const char *store_dir, const char *target_dir,
-                           fp_sql_ctx_t *sql_ctx) {
-    if (!store_dir || !target_dir) return FP_ERR_INVALID;
+static fp_err_t bundle_recover_locked(const char *store_dir, const char *target_dir,
+                                      fp_sql_ctx_t *sql_ctx) {
     char state[32], dna_hex[65];
     uint64_t jseq = 0;
     int has_sql = 0;
-    if (!tx_journal_read(target_dir, state, &jseq, dna_hex, &has_sql)) {
-        return FP_OK; /* No pending journal */
-    }
+    tx_journal_status_t js = tx_journal_read(target_dir, state, &jseq, dna_hex, &has_sql);
+    if (js == TXJ_NOT_FOUND) return FP_OK;
+    if (js == TXJ_IO_ERROR) return FP_ERR_IO;
+    if (js == TXJ_CORRUPTED) return FP_ERR_INTEGRITY; /* Fail-closed: preserve corrupt journal evidence! */
+
     if (strcmp(state, "COMMITTED") == 0) {
         return FP_OK;
     }
-    if (strcmp(state, "ACTIVATION_PENDING") == 0) {
+    if (strcmp(state, "ACTIVATION_PENDING") == 0 || strcmp(state, "ROLLBACK_PENDING") == 0) {
         int db_committed = 0;
         if (has_sql) {
             if (!sql_ctx) return FP_ERR_INVALID;
@@ -746,7 +876,7 @@ fp_err_t fp_bundle_recover(const char *store_dir, const char *target_dir,
             }
         }
         if (db_committed) {
-            /* SQLite already committed before crash: complete forward activation deterministically! */
+            /* SQLite already committed (apply or rollback) before crash: reconcile symlink forward! */
             char gen_dir[PATH_MAX], rel[128];
             int gn = snprintf(gen_dir, sizeof(gen_dir), "%s/gen/%s", target_dir, dna_hex);
             if (gn < 0 || (size_t)gn >= sizeof(gen_dir)) return FP_ERR_BOUNDS;
@@ -755,7 +885,7 @@ fp_err_t fp_bundle_recover(const char *store_dir, const char *target_dir,
             fp_bundle_t b;
             fp_err_t err = load_and_verify_bundle(store_dir, &bdna, &b);
             if (err != FP_OK) return err;
-            if (!verify_sealed_generation(&b, gen_dir)) {
+            if (!verify_sealed_generation(&b, gen_dir, dna_hex)) {
                 err = stage_bundle_files(store_dir, &b, target_dir, dna_hex);
                 if (err != FP_OK) return err;
             }
@@ -768,19 +898,31 @@ fp_err_t fp_bundle_recover(const char *store_dir, const char *target_dir,
         char jpath[PATH_MAX];
         int jn = snprintf(jpath, sizeof(jpath), "%s/.sf_tx_journal", target_dir);
         if (jn > 0 && (size_t)jn < sizeof(jpath)) {
-            unlink(jpath);
+            if (unlink(jpath) != 0 && errno != ENOENT) return FP_ERR_IO;
             (void)sync_dir_path(target_dir);
         }
         return FP_OK;
     }
-    /* STAGING or unknown incomplete intent: clean up journal marker safely */
-    char jpath[PATH_MAX];
-    int jn = snprintf(jpath, sizeof(jpath), "%s/.sf_tx_journal", target_dir);
-    if (jn > 0 && (size_t)jn < sizeof(jpath)) {
-        unlink(jpath);
-        (void)sync_dir_path(target_dir);
+    if (strcmp(state, "STAGING") == 0) {
+        char jpath[PATH_MAX];
+        int jn = snprintf(jpath, sizeof(jpath), "%s/.sf_tx_journal", target_dir);
+        if (jn > 0 && (size_t)jn < sizeof(jpath)) {
+            if (unlink(jpath) != 0 && errno != ENOENT) return FP_ERR_IO;
+            (void)sync_dir_path(target_dir);
+        }
+        return FP_OK;
     }
-    return FP_OK;
+    return FP_ERR_INTEGRITY;
+}
+
+fp_err_t fp_bundle_recover(const char *store_dir, const char *target_dir,
+                           fp_sql_ctx_t *sql_ctx) {
+    if (!store_dir || !target_dir) return FP_ERR_INVALID;
+    int lfd = acquire_target_lock(target_dir);
+    if (lfd < 0) return FP_ERR_IO;
+    fp_err_t err = bundle_recover_locked(store_dir, target_dir, sql_ctx);
+    release_target_lock(lfd);
+    return err;
 }
 
 fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
@@ -788,16 +930,33 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
                          uint64_t expected_seq, int fault_mode) {
     if (!store_dir || !bundle_dna || !target_dir) return FP_ERR_INVALID;
 
+    int lfd = acquire_target_lock(target_dir);
+    if (lfd < 0) return FP_ERR_IO;
+
     /* Reconcile any prior interrupted transaction deterministically before starting */
-    fp_err_t rec_err = fp_bundle_recover(store_dir, target_dir, sql_ctx);
-    if (rec_err != FP_OK) return rec_err;
+    fp_err_t rec_err = bundle_recover_locked(store_dir, target_dir, sql_ctx);
+    if (rec_err != FP_OK) { release_target_lock(lfd); return rec_err; }
 
     fp_bundle_t b;
     fp_err_t err = load_and_verify_bundle(store_dir, bundle_dna, &b);
-    if (err != FP_OK) return err;
+    if (err != FP_OK) { release_target_lock(lfd); return err; }
 
-    /* Pre-verify ALL member atoms before mutating anything */
+    /* Pre-verify aggregate changeset memory budget BEFORE allocating any buffers (RES-02) */
     int has_sql = 0;
+    uint64_t total_cs_bytes = 0;
+    for (uint16_t i = 0; i < b.entry_count; i++) {
+        if (b.entries[i].role == FP_ROLE_SQLITE_CHANGESET) {
+            has_sql = 1;
+            if (b.entries[i].size > BUNDLE_MAX_CHANGESET ||
+                total_cs_bytes > BUNDLE_MAX_TOTAL_CHANGESETS - b.entries[i].size) {
+                release_target_lock(lfd);
+                return FP_ERR_BOUNDS;
+            }
+            total_cs_bytes += b.entries[i].size;
+        }
+    }
+    if (has_sql && !sql_ctx) { release_target_lock(lfd); return FP_ERR_INVALID; }
+
     uint8_t *cs_blobs[FP_BUNDLE_MAX_ENTRIES];
     size_t   cs_lens[FP_BUNDLE_MAX_ENTRIES];
     memset(cs_blobs, 0, sizeof(cs_blobs));
@@ -805,7 +964,6 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
 
     for (uint16_t i = 0; i < b.entry_count; i++) {
         if (b.entries[i].role == FP_ROLE_SQLITE_CHANGESET) {
-            has_sql = 1;
             err = fp_store_get_object(store_dir, &b.entries[i].dna, BUNDLE_MAX_CHANGESET,
                                       &cs_blobs[i], &cs_lens[i]);
             if (err != FP_OK || cs_lens[i] != b.entries[i].size) {
@@ -813,10 +971,6 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
                 goto cleanup;
             }
         }
-    }
-    if (has_sql && !sql_ctx) {
-        err = FP_ERR_INVALID;
-        goto cleanup;
     }
 
     char dna_hex[65];
@@ -909,6 +1063,7 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
 
 cleanup:
     for (uint16_t i = 0; i < FP_BUNDLE_MAX_ENTRIES; i++) free(cs_blobs[i]);
+    release_target_lock(lfd);
     return err;
 }
 
@@ -919,28 +1074,61 @@ fp_err_t fp_bundle_rollback(const char *store_dir,
     if (!store_dir || !current_bundle_dna || !prev_bundle_dna || !target_dir) {
         return FP_ERR_INVALID;
     }
+    int lfd = acquire_target_lock(target_dir);
+    if (lfd < 0) return FP_ERR_IO;
+
+    fp_err_t err = bundle_recover_locked(store_dir, target_dir, sql_ctx);
+    if (err != FP_OK) { release_target_lock(lfd); return err; }
+
     fp_bundle_t cur_b, prev_b;
-    fp_err_t err = load_and_verify_bundle(store_dir, current_bundle_dna, &cur_b);
-    if (err != FP_OK) return err;
+    err = load_and_verify_bundle(store_dir, current_bundle_dna, &cur_b);
+    if (err != FP_OK) { release_target_lock(lfd); return err; }
     err = load_and_verify_bundle(store_dir, prev_bundle_dna, &prev_b);
-    if (err != FP_OK) return err;
+    if (err != FP_OK) { release_target_lock(lfd); return err; }
 
     char cur_hex[65], prev_hex[65];
     fp_hex_encode(current_bundle_dna->bytes, FP_DNA_LEN, cur_hex);
     fp_hex_encode(prev_bundle_dna->bytes, FP_DNA_LEN, prev_hex);
 
-    /* Ensure previous generation files are present and verified */
+    /* Ensure previous generation files are present and cryptographically verified */
     err = stage_bundle_files(store_dir, &prev_b, target_dir, prev_hex);
-    if (err != FP_OK) return err;
+    if (err != FP_OK) { release_target_lock(lfd); return err; }
 
     int has_sql = 0;
+    uint64_t total_cs = 0;
     for (uint16_t i = 0; i < cur_b.entry_count; i++) {
-        if (cur_b.entries[i].role == FP_ROLE_SQLITE_CHANGESET) { has_sql = 1; break; }
+        if (cur_b.entries[i].role == FP_ROLE_SQLITE_CHANGESET) {
+            has_sql = 1;
+            if (cur_b.entries[i].size > BUNDLE_MAX_CHANGESET ||
+                total_cs > BUNDLE_MAX_TOTAL_CHANGESETS - cur_b.entries[i].size) {
+                release_target_lock(lfd);
+                return FP_ERR_BOUNDS;
+            }
+            total_cs += cur_b.entries[i].size;
+        }
     }
 
+    uint64_t target_seq = 0;
     if (has_sql) {
-        if (!sql_ctx) return FP_ERR_INVALID;
+        if (!sql_ctx) { release_target_lock(lfd); return FP_ERR_INVALID; }
+        uint64_t pre_seq = 0;
+        char pre_dna[65];
+        err = read_progress(sql_ctx, &pre_seq, pre_dna);
+        if (err != FP_OK) { release_target_lock(lfd); return err; }
+        if (pre_seq == 0 || strcmp(pre_dna, cur_hex) != 0) {
+            release_target_lock(lfd);
+            return FP_ERR_CHAIN;
+        }
+        target_seq = pre_seq - 1u;
+    }
+
+    /* P0-01: Persist ROLLBACK_PENDING intent BEFORE SQLite COMMIT so any crash recovers forward! */
+    err = tx_journal_write(target_dir, "ROLLBACK_PENDING", target_seq, prev_hex, has_sql);
+    if (err != FP_OK) { release_target_lock(lfd); return err; }
+
+    if (has_sql) {
         if (sqlite3_exec(sql_ctx->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+            release_target_lock(lfd);
             return FP_ERR_IO;
         }
         uint64_t seq = 0;
@@ -971,7 +1159,8 @@ fp_err_t fp_bundle_rollback(const char *store_dir,
             if (rc != SQLITE_OK) { err = FP_ERR_INTEGRITY; break; }
         }
         if (err == FP_OK) {
-            err = write_progress(sql_ctx, seq - 1u, prev_hex);
+            target_seq = seq - 1u;
+            err = write_progress(sql_ctx, target_seq, prev_hex);
         }
         if (err == FP_OK) {
             if (sqlite3_exec(sql_ctx->db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
@@ -980,20 +1169,16 @@ fp_err_t fp_bundle_rollback(const char *store_dir,
         } else {
             (void)sqlite3_exec(sql_ctx->db, "ROLLBACK", NULL, NULL, NULL);
         }
-        if (err != FP_OK) return err;
+        if (err != FP_OK) { release_target_lock(lfd); return err; }
     }
 
     char rel[128];
     snprintf(rel, sizeof(rel), "gen/%s", prev_hex);
     err = atomic_flip_current(target_dir, rel);
     if (err == FP_OK) {
-        uint64_t done_seq = 0;
-        if (has_sql && sql_ctx) {
-            char tmp_dna[65];
-            (void)read_progress(sql_ctx, &done_seq, tmp_dna);
-        }
-        err = tx_journal_write(target_dir, "COMMITTED", done_seq, prev_hex, has_sql);
+        err = tx_journal_write(target_dir, "COMMITTED", target_seq, prev_hex, has_sql);
     }
+    release_target_lock(lfd);
     return err;
 }
 
@@ -1037,11 +1222,14 @@ fp_err_t fp_bundle_gc(const char *target_dir, uint32_t keep_last, uint32_t *out_
     if (out_removed) *out_removed = 0;
     if (!target_dir || !target_dir[0]) return FP_ERR_INVALID;
 
-    /* Read active generation from <target_dir>/current symlink so it is NEVER removed */
+    int lfd = acquire_target_lock(target_dir);
+    if (lfd < 0) return FP_ERR_IO;
+
+    /* Protect active generation (`current`) AND any generation referenced by `.sf_tx_journal` */
     char cur_link[PATH_MAX], active_target[PATH_MAX], active_gen[128];
     active_gen[0] = '\0';
     int n = snprintf(cur_link, sizeof(cur_link), "%s/current", target_dir);
-    if (n < 0 || (size_t)n >= sizeof(cur_link)) return FP_ERR_BOUNDS;
+    if (n < 0 || (size_t)n >= sizeof(cur_link)) { release_target_lock(lfd); return FP_ERR_BOUNDS; }
     ssize_t rl = readlink(cur_link, active_target, sizeof(active_target) - 1u);
     if (rl > 0) {
         active_target[rl] = '\0';
@@ -1049,18 +1237,33 @@ fp_err_t fp_bundle_gc(const char *target_dir, uint32_t keep_last, uint32_t *out_
         snprintf(active_gen, sizeof(active_gen), "%.127s", slash ? slash + 1 : active_target);
     }
 
+    char jstate[32], jdna[65];
+    uint64_t jseq = 0;
+    int jsql = 0;
+    jdna[0] = '\0';
+    tx_journal_status_t js = tx_journal_read(target_dir, jstate, &jseq, jdna, &jsql);
+    if (js == TXJ_CORRUPTED || js == TXJ_IO_ERROR) {
+        release_target_lock(lfd);
+        return js == TXJ_CORRUPTED ? FP_ERR_INTEGRITY : FP_ERR_IO;
+    }
+
     char gen_root[PATH_MAX];
     n = snprintf(gen_root, sizeof(gen_root), "%s/gen", target_dir);
-    if (n < 0 || (size_t)n >= sizeof(gen_root)) return FP_ERR_BOUNDS;
+    if (n < 0 || (size_t)n >= sizeof(gen_root)) { release_target_lock(lfd); return FP_ERR_BOUNDS; }
     int gfd = open(gen_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-    if (gfd < 0) return errno == ENOENT ? FP_OK : FP_ERR_IO;
+    if (gfd < 0) {
+        int e = errno;
+        release_target_lock(lfd);
+        return e == ENOENT ? FP_OK : FP_ERR_IO;
+    }
 
     DIR *dir = fdopendir(gfd);
-    if (!dir) { close(gfd); return FP_ERR_IO; }
+    if (!dir) { close(gfd); release_target_lock(lfd); return FP_ERR_IO; }
 
     gc_gen_entry_t *gens = NULL;
     size_t gcnt = 0, gcap = 0;
     uint32_t removed = 0;
+    int io_err = 0;
 
     struct dirent *de;
     while ((de = readdir(dir)) != NULL) {
@@ -1068,16 +1271,18 @@ fp_err_t fp_bundle_gc(const char *target_dir, uint32_t keep_last, uint32_t *out_
         if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0) continue;
         if (strncmp(nm, ".stage-", 7) == 0 || strncmp(nm, ".stale-", 7) == 0) {
             if (rm_rf_at(gfd, nm, 0) == 0) removed++;
+            else io_err = 1;
             continue;
         }
         if (active_gen[0] && strcmp(nm, active_gen) == 0) continue;
+        if (jdna[0] && strcmp(nm, jdna) == 0) continue;
         if (strlen(nm) == 64u) {
             struct stat sb;
             if (fstatat(gfd, nm, &sb, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(sb.st_mode)) {
                 if (gcnt == gcap) {
                     size_t ncap = gcap ? gcap * 2u : 16u;
                     gc_gen_entry_t *ng = realloc(gens, ncap * sizeof(*ng));
-                    if (!ng) { free(gens); closedir(dir); return FP_ERR_NOMEM; }
+                    if (!ng) { free(gens); closedir(dir); release_target_lock(lfd); return FP_ERR_NOMEM; }
                     gens = ng; gcap = ncap;
                 }
                 snprintf(gens[gcnt].name, sizeof(gens[gcnt].name), "%.127s", nm);
@@ -1091,11 +1296,13 @@ fp_err_t fp_bundle_gc(const char *target_dir, uint32_t keep_last, uint32_t *out_
         qsort(gens, gcnt, sizeof(*gens), cmp_gc_gen_desc);
         for (size_t i = (size_t)keep_last; i < gcnt; i++) {
             if (rm_rf_at(gfd, gens[i].name, 0) == 0) removed++;
+            else io_err = 1;
         }
     }
     free(gens);
-    (void)fsync(gfd);
+    if (fsync(gfd) != 0) io_err = 1;
     closedir(dir);
+    release_target_lock(lfd);
     if (out_removed) *out_removed = removed;
-    return FP_OK;
+    return io_err ? FP_ERR_IO : FP_OK;
 }

@@ -72,7 +72,7 @@ E1=$($FP emit --key "$WORK/keys/rel.sk" --repo "$REPO_ID" --serial 1 --action in
 E2=$($FP emit --key "$WORK/keys/rel.sk" --repo "$REPO_ID" --serial 2 --prev "$E1" --action install --input "$WORK/cp/repo/objects/$B2" --ttl 3600 --out "$WORK/cp/repo/events/2.ev" | sed -n 's/.*event=\([0-9a-f]\{64\}\).*/\1/p')
 $FP emit --key "$WORK/keys/rel.sk" --repo "$REPO_ID" --serial 3 --prev "$E2" --action install --input "$WORK/cp/repo/objects/$B3" --ttl 3600 --out "$WORK/cp/repo/events/3.ev" >/dev/null
 
-"$CP" --bind 127.0.0.1 --port "$PORT" --data-dir "$WORK/cp" --sbom "$SBOM" --require-signed-heartbeat >"$WORK/cp.log" 2>&1 &
+"$CP" --bind 127.0.0.1 --port "$PORT" --data-dir "$WORK/cp" --sbom "$SBOM" --allow-insecure-dev --require-signed-heartbeat >"$WORK/cp.log" 2>&1 &
 CP_PID=$!
 sleep 0.4
 TOKEN=$(cat "$WORK/cp/admin.token")

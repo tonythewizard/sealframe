@@ -270,11 +270,104 @@ static void test_p1_streaming_gc_and_merkle_index(void) {
     printf("[PASS] P1-05: Persistent FPM1 Merkle index (cached hit + O(1)-RAM disk proofs + tamper rejection)\n");
 }
 
+static void test_m0_m1_hardening(void) {
+    char tmpl[] = "/tmp/fp-m0m1-bundle-XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    assert(dir != NULL);
+
+    char store[256], target[256];
+    snprintf(store, sizeof(store), "%s/store", dir);
+    snprintf(target, sizeof(target), "%s/live", dir);
+
+    const uint8_t v1_data[] = "SEALED-GENERATION-V1-PAYLOAD";
+    const uint8_t v2_data[] = "SEALED-GENERATION-V2-PAYLOAD";
+    fp_bundle_t b1, b2;
+    memset(&b1, 0, sizeof(b1));
+    memset(&b2, 0, sizeof(b2));
+    b1.version = 1; b1.entry_count = 1;
+    b1.entries[0].role = FP_ROLE_FILE; b1.entries[0].mode = 0644; b1.entries[0].size = sizeof(v1_data);
+    snprintf(b1.entries[0].path, sizeof(b1.entries[0].path), "bin/app");
+    assert(fp_store_put_object(store, v1_data, sizeof(v1_data), &b1.entries[0].dna) == FP_OK);
+    fp_dna_t d1, d2;
+    assert(fp_bundle_pack(store, &b1, &d1) == FP_OK);
+
+    b2 = b1;
+    b2.entries[0].size = sizeof(v2_data);
+    assert(fp_store_put_object(store, v2_data, sizeof(v2_data), &b2.entries[0].dna) == FP_OK);
+    assert(fp_bundle_pack(store, &b2, &d2) == FP_OK);
+
+    assert(fp_bundle_apply(store, &d1, target, NULL, 1, 0) == FP_OK);
+
+    /* P0-03: Flip 1 bit inside sealed generation (same size!) -> re-apply must detect & restage from CAS */
+    char d1_hex[65], d2_hex[65], gen1_file[512], cur_file[512];
+    fp_hex_encode(d1.bytes, FP_DNA_LEN, d1_hex);
+    fp_hex_encode(d2.bytes, FP_DNA_LEN, d2_hex);
+    snprintf(gen1_file, sizeof(gen1_file), "%s/gen/%s/bin/app", target, d1_hex);
+    snprintf(cur_file, sizeof(cur_file), "%s/current/bin/app", target);
+    FILE *f = fopen(gen1_file, "r+b");
+    assert(f != NULL);
+    int b0 = fgetc(f);
+    assert(b0 != EOF);
+    assert(fseek(f, 0, SEEK_SET) == 0);
+    fputc(b0 ^ 0x01, f);
+    fclose(f);
+    assert(fp_bundle_apply(store, &d1, target, NULL, 1, 0) == FP_OK);
+    assert_file_eq(cur_file, v1_data, sizeof(v1_data));
+    printf("[PASS] P0-03: Sealed generation 1-bit tamper detected via BLAKE3 DNA and restaged from CAS\n");
+
+    /* P1-02: Corrupted .sf_tx_journal must fail closed WITHOUT deleting evidence */
+    char jpath[512];
+    snprintf(jpath, sizeof(jpath), "%s/.sf_tx_journal", target);
+    f = fopen(jpath, "wb");
+    assert(f != NULL);
+    fputs("SFTXJ1 CORRUPTED_ENTRY\n", f);
+    fclose(f);
+    assert(fp_bundle_recover(store, target, NULL) == FP_ERR_INTEGRITY);
+    struct stat sb;
+    assert(lstat(jpath, &sb) == 0); /* Evidence preserved! */
+    assert(unlink(jpath) == 0);
+    printf("[PASS] P1-02: Corrupted .sf_tx_journal fails closed (FP_ERR_INTEGRITY) and preserves journal\n");
+
+    /* Apply v2 so both gen/d1 and gen/d2 exist, then test P0-07 GC journal protection & P0-01 ROLLBACK_PENDING */
+    assert(fp_bundle_apply(store, &d2, target, NULL, 2, 0) == FP_OK);
+    assert_file_eq(cur_file, v2_data, sizeof(v2_data));
+
+    /* Set up a SQLite DB whose _fp_progress already committed rollback to (seq=1, d1_hex) before crash! */
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/recover.db", dir);
+    fp_sql_ctx_t *rdb = NULL;
+    assert(fp_sql_open(db_path, &rdb) == FP_OK);
+    assert(fp_sql_exec(rdb, "CREATE TABLE t(id INTEGER PRIMARY KEY);") == FP_OK);
+    /* Write _fp_progress directly as if fp_bundle_rollback committed SQLite right before SIGKILL */
+    char up_sql[256];
+    snprintf(up_sql, sizeof(up_sql),
+             "UPDATE _fp_progress SET seq=1, bundle_dna='%s' WHERE id=1;", d1_hex);
+    assert(fp_sql_exec(rdb, up_sql) == FP_OK);
+
+    /* P0-07: Pending journal target gen/d1 must NOT be deleted by fp_bundle_gc(keep_extra=0) */
+    f = fopen(jpath, "wb");
+    assert(f != NULL);
+    fprintf(f, "SFTX1 ROLLBACK_PENDING 1 %s 1\n", d1_hex);
+    fclose(f);
+    uint32_t removed = 99;
+    assert(fp_bundle_gc(target, 0, &removed) == FP_OK);
+    char gen1_dir[512];
+    snprintf(gen1_dir, sizeof(gen1_dir), "%s/gen/%s", target, d1_hex);
+    assert(stat(gen1_dir, &sb) == 0);
+
+    /* P0-01: fp_bundle_recover() sees DB committed (1, d1_hex) and reconciles symlink forward to d1! */
+    assert(fp_bundle_recover(store, target, rdb) == FP_OK);
+    assert_file_eq(cur_file, v1_data, sizeof(v1_data));
+    fp_sql_close(rdb);
+    printf("[PASS] P0-01/P0-07: GC protects journaled generation & ROLLBACK_PENDING reconciles forward\n");
+}
+
 int main(void) {
     assert(fp_init() == FP_OK);
     test_bundle_security_validation();
     test_composite_atomic_sigkill_and_rollback();
     test_p1_streaming_gc_and_merkle_index();
+    test_m0_m1_hardening();
     printf("ALL M3 PARTICLE BUNDLE & SQLITE SESSION TESTS PASSED.\n");
     return 0;
 }
