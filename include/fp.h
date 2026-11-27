@@ -467,6 +467,13 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
                          const char *target_dir, fp_sql_ctx_t *sql_ctx,
                          uint64_t expected_seq, int fault_mode);
 
+/* Isolated SQL-only bundle apply/rollback (A7-P0-03 / A7-P0-04):
+ * Applies or reverts SQLite changesets + `_fp_sql_history` + `_fp_progress` atomically
+ * WITHOUT staging generation files and WITHOUT flipping `<target_dir>/current`. */
+fp_err_t fp_bundle_apply_sql_only(const char *store_dir, const fp_dna_t *bundle_dna,
+                                  const char *target_dir, fp_sql_ctx_t *sql_ctx,
+                                  uint64_t expected_seq);
+
 /* Deterministic crash-recovery for any incomplete composite bundle transaction
  * recorded in `<target_dir>/.sf_tx_journal`. Reconciles forward if SQLite already
  * committed, or cleans up safely if interrupted prior to commit. */
@@ -477,6 +484,11 @@ fp_err_t fp_bundle_rollback(const char *store_dir,
                             const fp_dna_t *current_bundle_dna,
                             const fp_dna_t *prev_bundle_dna,
                             const char *target_dir, fp_sql_ctx_t *sql_ctx);
+
+fp_err_t fp_bundle_rollback_sql_only(const char *store_dir,
+                                     const fp_dna_t *current_bundle_dna,
+                                     const fp_dna_t *prev_bundle_dna,
+                                     const char *target_dir, fp_sql_ctx_t *sql_ctx);
 
 /* Safe garbage collection of stale/unreferenced generations in `<target_dir>/gen/`.
  * Never removes the generation referenced by `<target_dir>/current`, keeps the most recent

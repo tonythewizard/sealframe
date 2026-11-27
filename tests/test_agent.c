@@ -1688,6 +1688,302 @@ int main(void) {
                     assert(lstat(p03otap, &st_chk) != 0);
                     assert(lstat(p03cur, &st_chk) != 0 && lstat(p03rev, &st_chk) == 0);
                     printf("[PASS] TX-02/TX-03 (P0-03/P0-05): Monotonic deny-set prevents V1 reactivation on first health FAIL & offline crash!\n");
+
+                    /* A7-P0-02/03/04/05 & A7-P1-02: 7th Audit Regression Suite (REV-01/02, REV-05, REV-06, TX-01) */
+                    {
+                        char a7tmpl[] = "/tmp/fp-ag-a7-XXXXXX";
+                        char *a7dir = mkdtemp(a7tmpl);
+                        assert(a7dir != NULL);
+
+                        /* --- REV-01 / REV-02 / A7-P1-02: Immediate pre-download fencing + boot fence + UP_TO_DATE deny-set --- */
+                        char r1repo[256], r1ev[300], r1ch[300], r1st[340], r1edge[256];
+                        char r1store[300], r1target[300], r1root[300], r1cur[360], r1rev[360];
+                        snprintf(r1repo, sizeof(r1repo), "%s/r1_repo", a7dir);
+                        snprintf(r1ev, sizeof(r1ev), "%s/events", r1repo);
+                        snprintf(r1ch, sizeof(r1ch), "%s/channels", r1repo);
+                        snprintf(r1st, sizeof(r1st), "%s/stable", r1ch);
+                        snprintf(r1edge, sizeof(r1edge), "%s/r1_edge", a7dir);
+                        snprintf(r1store, sizeof(r1store), "%s/store", r1edge);
+                        snprintf(r1target, sizeof(r1target), "%s/live", r1edge);
+                        snprintf(r1root, sizeof(r1root), "%s/root.fpr", r1edge);
+                        snprintf(r1cur, sizeof(r1cur), "%s/current", r1target);
+                        snprintf(r1rev, sizeof(r1rev), "%s/.sf_revoked", r1target);
+                        assert(mkdir(r1repo, 0755) == 0 && mkdir(r1ev, 0755) == 0 &&
+                               mkdir(r1ch, 0755) == 0 && mkdir(r1st, 0755) == 0 && mkdir(r1edge, 0755) == 0);
+                        assert(fp_root_encode(&nr, &rb, &rl) == FP_OK);
+                        write_bytes_file(r1root, rb, rl);
+                        snprintf(rp, sizeof(rp), "%s/root.fpr", r1repo); write_bytes_file(rp, rb, rl); free(rb);
+
+                        fp_bundle_t fb1, fb2;
+                        memset(&fb1, 0, sizeof(fb1)); memset(&fb2, 0, sizeof(fb2));
+                        fb1.version = 1; fb1.entry_count = 1; fb1.entries[0].role = FP_ROLE_FILE;
+                        fb1.entries[0].mode = 0644; fb1.entries[0].size = 5;
+                        snprintf(fb1.entries[0].path, sizeof(fb1.entries[0].path), "app.cfg");
+                        assert(fp_store_put_object(r1repo, (const uint8_t *)"OK=1\n", 5, &fb1.entries[0].dna) == FP_OK);
+                        fb2 = fb1; fb2.entries[0].size = 5;
+                        assert(fp_store_put_object(r1repo, (const uint8_t *)"OK=2\n", 5, &fb2.entries[0].dna) == FP_OK);
+                        fp_dna_t fbd1, fbd2; uint64_t fbs1 = 0, fbs2 = 0;
+                        assert(fp_bundle_pack(r1repo, &fb1, &fbd1) == FP_OK && fp_store_has_object(r1repo, &fbd1, &fbs1));
+                        assert(fp_bundle_pack(r1repo, &fb2, &fbd2) == FP_OK && fp_store_has_object(r1repo, &fbd2, &fbs2));
+
+                        fp_event_t fe1, fe2, fe3;
+                        memset(&fe1, 0, sizeof(fe1)); memset(&fe2, 0, sizeof(fe2)); memset(&fe3, 0, sizeof(fe3));
+                        fe1.action = FP_ACTION_INSTALL; fe1.repo_id = nrid; fe1.serial = 1;
+                        fe1.timestamp_unix = now; fe1.expires_unix = now + 3600;
+                        fe1.target_dna = fbd1; fe1.target_size = fbs1;
+                        assert(fp_event_sign(&fe1, &nrel) == FP_OK);
+                        assert(fp_event_encode(&fe1, &eb, &el) == FP_OK);
+                        snprintf(rp, sizeof(rp), "%s/1.ev", r1ev); write_bytes_file(rp, eb, el);
+                        snprintf(rp, sizeof(rp), "%s/latest.ev", r1st); write_bytes_file(rp, eb, el); free(eb);
+
+                        srv.repo_dir = r1repo;
+                        fp_agent_cfg_t r1cfg;
+                        memset(&r1cfg, 0, sizeof(r1cfg));
+                        r1cfg.device_id = "edge-r1"; r1cfg.repo_url = base_url; r1cfg.channel = "stable";
+                        r1cfg.store_dir = r1store; r1cfg.target_dir = r1target;
+                        r1cfg.root_path = r1root; r1cfg.health_cmd = "true"; r1cfg.health_timeout_sec = 5;
+                        assert(fp_agent_sync_once(&r1cfg, &rep) == FP_OK && rep.active_serial == 1);
+                        assert(lstat(r1cur, &st_chk) == 0);
+
+                        /* Publish [2: REVOKE V1, 3: INSTALL V2] and DELETE V2 object from repo -> 404 on download! */
+                        fe2.action = FP_ACTION_REVOKE; fe2.repo_id = nrid; fe2.serial = 2;
+                        fe2.prev_event_hash = fe1.event_hash; fe2.timestamp_unix = now; fe2.expires_unix = now + 3600;
+                        fe2.target_dna = fbd1; fe2.target_size = 0;
+                        snprintf(fe2.reason, sizeof(fe2.reason), "fence-v1");
+                        assert(fp_event_sign(&fe2, &nrel) == FP_OK);
+                        assert(fp_event_encode(&fe2, &eb, &el) == FP_OK);
+                        snprintf(rp, sizeof(rp), "%s/2.ev", r1ev); write_bytes_file(rp, eb, el); free(eb);
+
+                        fe3.action = FP_ACTION_INSTALL; fe3.repo_id = nrid; fe3.serial = 3;
+                        fe3.prev_event_hash = fe2.event_hash; fe3.timestamp_unix = now; fe3.expires_unix = now + 3600;
+                        fe3.target_dna = fbd2; fe3.target_size = fbs2;
+                        assert(fp_event_sign(&fe3, &nrel) == FP_OK);
+                        assert(fp_event_encode(&fe3, &eb, &el) == FP_OK);
+                        snprintf(rp, sizeof(rp), "%s/3.ev", r1ev); write_bytes_file(rp, eb, el);
+                        snprintf(rp, sizeof(rp), "%s/latest.ev", r1st); write_bytes_file(rp, eb, el); free(eb);
+
+                        char fbd2h[65], del_obj[400];
+                        fp_hex_encode(fbd2.bytes, FP_DNA_LEN, fbd2h);
+                        snprintf(del_obj, sizeof(del_obj), "%s/objects/%s", r1repo, fbd2h);
+                        assert(unlink(del_obj) == 0);
+
+                        /* Download of V2 fails (404), BUT V1 MUST ALREADY BE FENCED (current removed + .sf_revoked)! */
+                        assert(fp_agent_sync_once(&r1cfg, &rep) != FP_OK);
+                        assert(lstat(r1cur, &st_chk) != 0 && lstat(r1rev, &st_chk) == 0);
+
+                        /* REV-02: Recreate symlink to revoked V1 manually with NO .sf_ota_state -> offline boot fence MUST remove it! */
+                        char fbd1h[65], frel[128];
+                        fp_hex_encode(fbd1.bytes, FP_DNA_LEN, fbd1h);
+                        snprintf(frel, sizeof(frel), "gen/%s", fbd1h);
+                        assert(symlink(frel, r1cur) == 0);
+                        r1cfg.repo_url = "http://127.0.0.1:1";
+                        (void)fp_agent_sync_once(&r1cfg, &rep);
+                        assert(lstat(r1cur, &st_chk) != 0 && lstat(r1rev, &st_chk) == 0);
+
+                        /* A7-P1-02: UP_TO_DATE branch when latest_ev.serial <= st.serial AND st.current_dna is in deny-set! */
+                        assert(fp_event_encode(&fe1, &eb, &el) == FP_OK);
+                        snprintf(rp, sizeof(rp), "%s/latest.ev", r1st); write_bytes_file(rp, eb, el); free(eb);
+                        r1cfg.repo_url = base_url;
+                        assert(fp_agent_sync_once(&r1cfg, &rep) == FP_ERR_POLICY);
+                        assert(rep.outcome == FP_AGENT_REVOKED && rep.active_serial == 0);
+                        printf("[PASS] A7-P0-02/A7-P1-02 (REV-01/REV-02): Pre-download fencing, offline boot fence & UP_TO_DATE deny-set verified!\n");
+
+                        /* --- REV-05 (A7-P0-03) & REV-06 (A7-P0-04) & TX-01 (A7-P0-05) --- */
+                        char s7repo[256], s7ev[300], s7ch[300], s7st[340], s7edge[256];
+                        char s7store[300], s7target[300], s7root[300], s7src[300], s7dst[300];
+                        char s7cur[360], s7rev[360], s7hcmd[512];
+                        snprintf(s7repo, sizeof(s7repo), "%s/s7_repo", a7dir);
+                        snprintf(s7ev, sizeof(s7ev), "%s/events", s7repo);
+                        snprintf(s7ch, sizeof(s7ch), "%s/channels", s7repo);
+                        snprintf(s7st, sizeof(s7st), "%s/stable", s7ch);
+                        snprintf(s7edge, sizeof(s7edge), "%s/s7_edge", a7dir);
+                        snprintf(s7store, sizeof(s7store), "%s/store", s7edge);
+                        snprintf(s7target, sizeof(s7target), "%s/live", s7edge);
+                        snprintf(s7root, sizeof(s7root), "%s/root.fpr", s7edge);
+                        snprintf(s7src, sizeof(s7src), "%s/src.db", a7dir);
+                        snprintf(s7dst, sizeof(s7dst), "%s/dst.db", s7edge);
+                        snprintf(s7cur, sizeof(s7cur), "%s/current", s7target);
+                        snprintf(s7rev, sizeof(s7rev), "%s/.sf_revoked", s7target);
+                        snprintf(s7hcmd, sizeof(s7hcmd), "grep -q 'OK=1' '%s/current/app.cfg'", s7target);
+                        assert(mkdir(s7repo, 0755) == 0 && mkdir(s7ev, 0755) == 0 &&
+                               mkdir(s7ch, 0755) == 0 && mkdir(s7st, 0755) == 0 && mkdir(s7edge, 0755) == 0);
+                        assert(fp_root_encode(&nr, &rb, &rl) == FP_OK);
+                        write_bytes_file(s7root, rb, rl);
+                        snprintf(rp, sizeof(rp), "%s/root.fpr", s7repo); write_bytes_file(rp, rb, rl); free(rb);
+
+                        fp_sql_ctx_t *s7s = NULL, *s7d = NULL;
+                        assert(fp_sql_open(s7src, &s7s) == FP_OK && fp_sql_open(s7dst, &s7d) == FP_OK);
+                        assert(fp_sql_exec(s7s, "CREATE TABLE t7(id INTEGER PRIMARY KEY, val TEXT);") == FP_OK);
+                        assert(fp_sql_exec(s7d, "CREATE TABLE t7(id INTEGER PRIMARY KEY, val TEXT);") == FP_OK);
+                        fp_sql_close(s7d);
+
+                        /* Build 4 SQLite+file bundles:
+                         * V1(OK, id=1), V2(revoked intermediate, id=2), V3(OK for REV-05), V4(FAIL for REV-06), V5(OK for REV-06) */
+                        const char *s7sql[5] = {
+                            "INSERT INTO t7 VALUES (1, 'v1');",
+                            "INSERT INTO t7 VALUES (2, 'v2-mid');",
+                            "INSERT INTO t7 VALUES (3, 'v3-ok');",
+                            "INSERT INTO t7 VALUES (4, 'v4-fail');",
+                            "INSERT INTO t7 VALUES (5, 'v5-ok');"
+                        };
+                        const char *s7cfg[5] = { "OK=1\nV=1\n", "FAIL=1\nV=2\n", "OK=1\nV=3\n", "FAIL=1\nV=4\n", "OK=1\nV=5\n" };
+                        fp_dna_t s7bd[5], s7dig[5];
+                        uint64_t s7bsz[5];
+                        for (int i = 0; i < 5; i++) {
+                            uint8_t *cs = NULL; size_t csl = 0;
+                            assert(fp_sql_capture_changeset(s7s, "t7", s7sql[i], &cs, &csl) == FP_OK);
+                            assert(fp_sql_state_digest(s7s, "t7", &s7dig[i]) == FP_OK);
+                            fp_bundle_t b;
+                            memset(&b, 0, sizeof(b));
+                            b.version = 1; b.entry_count = 2;
+                            b.entries[0].role = FP_ROLE_FILE; b.entries[0].mode = 0644; b.entries[0].size = strlen(s7cfg[i]);
+                            snprintf(b.entries[0].path, sizeof(b.entries[0].path), "app.cfg");
+                            assert(fp_store_put_object(s7repo, (const uint8_t *)s7cfg[i], strlen(s7cfg[i]), &b.entries[0].dna) == FP_OK);
+                            b.entries[1].role = FP_ROLE_SQLITE_CHANGESET; b.entries[1].size = csl;
+                            snprintf(b.entries[1].path, sizeof(b.entries[1].path), "t7");
+                            assert(fp_store_put_object(s7repo, cs, csl, &b.entries[1].dna) == FP_OK);
+                            free(cs);
+                            assert(fp_bundle_pack(s7repo, &b, &s7bd[i]) == FP_OK);
+                            assert(fp_store_has_object(s7repo, &s7bd[i], &s7bsz[i]));
+                        }
+                        fp_sql_close(s7s);
+
+                        /* Event 1: INSTALL V1 */
+                        fp_event_t se[9];
+                        memset(se, 0, sizeof(se));
+                        se[1].action = FP_ACTION_INSTALL; se[1].repo_id = nrid; se[1].serial = 1;
+                        se[1].timestamp_unix = now; se[1].expires_unix = now + 3600;
+                        se[1].target_dna = s7bd[0]; se[1].target_size = s7bsz[0];
+                        assert(fp_event_sign(&se[1], &nrel) == FP_OK);
+                        assert(fp_event_encode(&se[1], &eb, &el) == FP_OK);
+                        snprintf(rp, sizeof(rp), "%s/1.ev", s7ev); write_bytes_file(rp, eb, el);
+                        snprintf(rp, sizeof(rp), "%s/latest.ev", s7st); write_bytes_file(rp, eb, el); free(eb);
+
+                        srv.repo_dir = s7repo;
+                        fp_agent_cfg_t s7acfg;
+                        memset(&s7acfg, 0, sizeof(s7acfg));
+                        s7acfg.device_id = "edge-s7"; s7acfg.repo_url = base_url; s7acfg.channel = "stable";
+                        s7acfg.store_dir = s7store; s7acfg.target_dir = s7target; s7acfg.db_path = s7dst;
+                        s7acfg.root_path = s7root; s7acfg.health_cmd = s7hcmd; s7acfg.health_timeout_sec = 5;
+                        assert(fp_agent_sync_once(&s7acfg, &rep) == FP_OK && rep.active_serial == 1);
+
+                        /* REV-05 (A7-P0-03): [2: INSTALL V2 (revoked!), 3: REVOKE V2, 4: INSTALL V3 (OK)] ->
+                         * V3 succeeds with exact SQL digest (V1+V2+V3), AND gen/<V2> is NEVER created! */
+                        se[2].action = FP_ACTION_INSTALL; se[2].repo_id = nrid; se[2].serial = 2;
+                        se[2].prev_event_hash = se[1].event_hash; se[2].timestamp_unix = now; se[2].expires_unix = now + 3600;
+                        se[2].target_dna = s7bd[1]; se[2].target_size = s7bsz[1];
+                        assert(fp_event_sign(&se[2], &nrel) == FP_OK);
+                        assert(fp_event_encode(&se[2], &eb, &el) == FP_OK);
+                        snprintf(rp, sizeof(rp), "%s/2.ev", s7ev); write_bytes_file(rp, eb, el); free(eb);
+
+                        se[3].action = FP_ACTION_REVOKE; se[3].repo_id = nrid; se[3].serial = 3;
+                        se[3].prev_event_hash = se[2].event_hash; se[3].timestamp_unix = now; se[3].expires_unix = now + 3600;
+                        se[3].target_dna = s7bd[1]; se[3].target_size = 0;
+                        snprintf(se[3].reason, sizeof(se[3].reason), "revoked-intermediate-v2");
+                        assert(fp_event_sign(&se[3], &nrel) == FP_OK);
+                        assert(fp_event_encode(&se[3], &eb, &el) == FP_OK);
+                        snprintf(rp, sizeof(rp), "%s/3.ev", s7ev); write_bytes_file(rp, eb, el); free(eb);
+
+                        se[4].action = FP_ACTION_INSTALL; se[4].repo_id = nrid; se[4].serial = 4;
+                        se[4].prev_event_hash = se[3].event_hash; se[4].timestamp_unix = now; se[4].expires_unix = now + 3600;
+                        se[4].target_dna = s7bd[2]; se[4].target_size = s7bsz[2];
+                        assert(fp_event_sign(&se[4], &nrel) == FP_OK);
+                        assert(fp_event_encode(&se[4], &eb, &el) == FP_OK);
+                        snprintf(rp, sizeof(rp), "%s/4.ev", s7ev); write_bytes_file(rp, eb, el);
+                        snprintf(rp, sizeof(rp), "%s/latest.ev", s7st); write_bytes_file(rp, eb, el); free(eb);
+
+                        assert(fp_agent_sync_once(&s7acfg, &rep) == FP_OK && rep.active_serial == 4);
+                        char v2_hex[65], v2_gen[400];
+                        fp_hex_encode(s7bd[1].bytes, FP_DNA_LEN, v2_hex);
+                        snprintf(v2_gen, sizeof(v2_gen), "%s/gen/%s", s7target, v2_hex);
+                        assert(lstat(v2_gen, &st_chk) != 0); /* Intermediate revoked V2 NEVER materialized! */
+                        assert(fp_sql_open(s7dst, &s7d) == FP_OK);
+                        fp_dna_t s7dig_now;
+                        assert(fp_sql_state_digest(s7d, "t7", &s7dig_now) == FP_OK && fp_dna_equal(&s7dig_now, &s7dig[2]));
+                        fp_sql_close(s7d);
+                        printf("[PASS] A7-P0-03 (REV-05): Intermediate revoked V2 replayed SQL-only (gen/<V2> never created, V3 SQL exact)!\n");
+
+                        /* REV-06 (A7-P0-04): Active V3 revoked + V4(SQL, health FAIL) -> SQLite reverted to V3 WITHOUT
+                         * reactivating V3, then V5(SQL, health OK) advances cleanly without FP_ERR_CHAIN! */
+                        se[5].action = FP_ACTION_REVOKE; se[5].repo_id = nrid; se[5].serial = 5;
+                        se[5].prev_event_hash = se[4].event_hash; se[5].timestamp_unix = now; se[5].expires_unix = now + 3600;
+                        se[5].target_dna = s7bd[2]; se[5].target_size = 0;
+                        snprintf(se[5].reason, sizeof(se[5].reason), "revoke-v3");
+                        assert(fp_event_sign(&se[5], &nrel) == FP_OK);
+                        assert(fp_event_encode(&se[5], &eb, &el) == FP_OK);
+                        snprintf(rp, sizeof(rp), "%s/5.ev", s7ev); write_bytes_file(rp, eb, el); free(eb);
+
+                        se[6].action = FP_ACTION_INSTALL; se[6].repo_id = nrid; se[6].serial = 6;
+                        se[6].prev_event_hash = se[5].event_hash; se[6].timestamp_unix = now; se[6].expires_unix = now + 3600;
+                        se[6].target_dna = s7bd[3]; se[6].target_size = s7bsz[3];
+                        assert(fp_event_sign(&se[6], &nrel) == FP_OK);
+                        assert(fp_event_encode(&se[6], &eb, &el) == FP_OK);
+                        snprintf(rp, sizeof(rp), "%s/6.ev", s7ev); write_bytes_file(rp, eb, el);
+                        snprintf(rp, sizeof(rp), "%s/latest.ev", s7st); write_bytes_file(rp, eb, el); free(eb);
+
+                        assert(fp_agent_sync_once(&s7acfg, &rep) == FP_ERR_POLICY);
+                        assert(rep.outcome == FP_AGENT_REVOKED && rep.active_serial == 0);
+                        assert(lstat(s7cur, &st_chk) != 0 && lstat(s7rev, &st_chk) == 0);
+                        assert(fp_sql_open(s7dst, &s7d) == FP_OK);
+                        uint64_t pseq7 = 0; char pdna7[65], v3_hex[65];
+                        fp_hex_encode(s7bd[2].bytes, FP_DNA_LEN, v3_hex);
+                        assert(fp_sql_get_progress(s7d, &pseq7, pdna7) == FP_OK && pseq7 == 4 && strcmp(pdna7, v3_hex) == 0);
+                        assert(fp_sql_state_digest(s7d, "t7", &s7dig_now) == FP_OK && fp_dna_equal(&s7dig_now, &s7dig[2]));
+                        fp_sql_close(s7d);
+
+                        /* Now publish 7: INSTALL V5 (OK) -> MUST advance cleanly from (4, V3) -> V4(sql-only) -> V5(full) with exact digest! */
+                        se[7].action = FP_ACTION_INSTALL; se[7].repo_id = nrid; se[7].serial = 7;
+                        se[7].prev_event_hash = se[6].event_hash; se[7].timestamp_unix = now; se[7].expires_unix = now + 3600;
+                        se[7].target_dna = s7bd[4]; se[7].target_size = s7bsz[4];
+                        assert(fp_event_sign(&se[7], &nrel) == FP_OK);
+                        assert(fp_event_encode(&se[7], &eb, &el) == FP_OK);
+                        snprintf(rp, sizeof(rp), "%s/7.ev", s7ev); write_bytes_file(rp, eb, el);
+                        snprintf(rp, sizeof(rp), "%s/latest.ev", s7st); write_bytes_file(rp, eb, el); free(eb);
+
+                        assert(fp_agent_sync_once(&s7acfg, &rep) == FP_OK && rep.outcome == FP_AGENT_UPDATED && rep.active_serial == 7);
+                        assert(lstat(s7cur, &st_chk) == 0 && lstat(s7rev, &st_chk) != 0);
+                        assert(fp_sql_open(s7dst, &s7d) == FP_OK);
+                        assert(fp_sql_state_digest(s7d, "t7", &s7dig_now) == FP_OK && fp_dna_equal(&s7dig_now, &s7dig[4]));
+                        fp_sql_close(s7d);
+                        printf("[PASS] A7-P0-04 (REV-06): Failed V4 on revoked V3 reverted SQLite cleanly & V5 advanced without FP_ERR_CHAIN!\n");
+
+                        /* TX-01 (A7-P0-05): LEDGER_PENDING with st.serial < ol.serial MUST NOT mutate state.bin when
+                         * material invariants fail OR when a pending_events/<N>.ev file is missing! */
+                        char pdir7[360], pev8[400], ota7[360], v5_hex[65];
+                        fp_hex_encode(s7bd[4].bytes, FP_DNA_LEN, v5_hex);
+                        snprintf(pdir7, sizeof(pdir7), "%s/pending_events", s7store);
+                        (void)mkdir(pdir7, 0700);
+                        /* Create signed event 8 (historical REVOKE of V1) and omit event 9 to test pre-validation! */
+                        se[8].action = FP_ACTION_REVOKE; se[8].repo_id = nrid; se[8].serial = 8;
+                        se[8].prev_event_hash = se[7].event_hash; se[8].timestamp_unix = now; se[8].expires_unix = now + 3600;
+                        se[8].target_dna = s7bd[0]; se[8].target_size = 0;
+                        snprintf(se[8].reason, sizeof(se[8].reason), "hist-v1");
+                        assert(fp_event_sign(&se[8], &nrel) == FP_OK);
+                        assert(fp_event_encode(&se[8], &eb, &el) == FP_OK);
+                        snprintf(pev8, sizeof(pev8), "%s/8.ev", pdir7);
+                        write_bytes_file(pev8, eb, el);
+                        free(eb);
+
+                        /* Case 1: Missing `current` with st.serial(7) < ol.serial(8) -> fails closed AND st.serial stays 7! */
+                        assert(unlink(s7cur) == 0);
+                        snprintf(ota7, sizeof(ota7), "%s/.sf_ota_state", s7target);
+                        oln = snprintf(oline, sizeof(oline), "SFOTA1 LEDGER_PENDING 8 %s 1 %s 8 8\n", v5_hex, v5_hex);
+                        write_bytes_file(ota7, (const uint8_t *)oline, (size_t)oln);
+                        s7acfg.repo_url = "http://127.0.0.1:1";
+                        assert(fp_agent_sync_once(&s7acfg, &rep) == FP_ERR_INTEGRITY);
+                        fp_store_state_t st7;
+                        assert(fp_store_load_state(s7store, &st7) == FP_OK && st7.serial == 7);
+
+                        /* Case 2: Valid `current` -> gen/V5, but ol.serial=9 and 9.ev missing -> fails closed AND st.serial stays 7 (8.ev NOT committed)! */
+                        snprintf(frel, sizeof(frel), "gen/%s", v5_hex);
+                        assert(symlink(frel, s7cur) == 0);
+                        oln = snprintf(oline, sizeof(oline), "SFOTA1 LEDGER_PENDING 9 %s 1 %s 8 9\n", v5_hex, v5_hex);
+                        write_bytes_file(ota7, (const uint8_t *)oline, (size_t)oln);
+                        assert(fp_agent_sync_once(&s7acfg, &rep) == FP_ERR_NOT_FOUND);
+                        assert(fp_store_load_state(s7store, &st7) == FP_OK && st7.serial == 7);
+                        assert(unlink(ota7) == 0 && unlink(pev8) == 0);
+                        printf("[PASS] A7-P0-05 (TX-01): LEDGER_PENDING pre-validates invariants & full pending_events chain (zero state.bin drift)!\n");
+                    }
                 }
             }
         }

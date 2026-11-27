@@ -598,6 +598,71 @@ static void test_m4_mixed_rollback_and_sql_namespace_guards(void) {
         printf("[PASS] SQL-01/SQL-02 (P0-02): Missing table, fewer columns & mismatched PK rejected fail-closed (no silent SQLITE_OK)\n");
     }
 
+    /* A7-P0-01 (SQL-01 swapped non-PK columns): Identical column count & PK bitmap, swapped column order!
+     * `kv_swap(id INTEGER PRIMARY KEY, a TEXT, b TEXT)` vs `kv_swap(id INTEGER PRIMARY KEY, b TEXT, a TEXT)`.
+     * SFCS1 schema hash MUST reject fail-closed (FP_ERR_INTEGRITY) with ZERO rows inserted & _fp_progress unchanged! */
+    {
+        char sw_src[256], sw_dst[256], sw_tgt[256];
+        snprintf(sw_src, sizeof(sw_src), "%s/swap_src.db", tmp);
+        snprintf(sw_dst, sizeof(sw_dst), "%s/swap_dst.db", tmp);
+        snprintf(sw_tgt, sizeof(sw_tgt), "%s/swap_tgt", tmp);
+
+        fp_sql_ctx_t *db_sw_s = NULL, *db_sw_d = NULL;
+        assert(fp_sql_open(sw_src, &db_sw_s) == FP_OK);
+        assert(fp_sql_open(sw_dst, &db_sw_d) == FP_OK);
+        assert(fp_sql_exec(db_sw_s, "CREATE TABLE kv_swap(id INTEGER PRIMARY KEY, a TEXT, b TEXT);") == FP_OK);
+        assert(fp_sql_exec(db_sw_d, "CREATE TABLE kv_swap(id INTEGER PRIMARY KEY, b TEXT, a TEXT);") == FP_OK);
+
+        fp_dna_t dst_before;
+        assert(fp_sql_state_digest(db_sw_d, "kv_swap", &dst_before) == FP_OK);
+
+        uint8_t *sw_cs = NULL; size_t sw_csl = 0;
+        assert(fp_sql_capture_changeset(db_sw_s, "kv_swap",
+                                        "INSERT INTO kv_swap(id,a,b) VALUES(1,'ALPHA','BETA');",
+                                        &sw_cs, &sw_csl) == FP_OK);
+        fp_bundle_t b_sw;
+        memset(&b_sw, 0, sizeof(b_sw));
+        b_sw.version = 1; b_sw.entry_count = 1;
+        b_sw.entries[0].role = FP_ROLE_SQLITE_CHANGESET;
+        b_sw.entries[0].size = sw_csl;
+        snprintf(b_sw.entries[0].path, sizeof(b_sw.entries[0].path), "kv_swap");
+        assert(fp_store_put_object(store, sw_cs, sw_csl, &b_sw.entries[0].dna) == FP_OK);
+        free(sw_cs);
+        fp_dna_t sw_bdna;
+        assert(fp_bundle_pack(store, &b_sw, &sw_bdna) == FP_OK);
+
+        assert(fp_bundle_apply(store, &sw_bdna, sw_tgt, db_sw_d, 1, 0) == FP_ERR_INTEGRITY);
+        fp_dna_t dst_after;
+        assert(fp_sql_state_digest(db_sw_d, "kv_swap", &dst_after) == FP_OK);
+        assert(fp_dna_equal(&dst_before, &dst_after));
+        uint64_t pseq = 99; char pdna[65];
+        assert(fp_sql_get_progress(db_sw_d, &pseq, pdna) == FP_OK && pseq == 0 && pdna[0] == '\0');
+
+        /* A7-P1-05 (SQL-04): Digest MUST distinguish (1 col x 2 rows) vs (2 cols x 1 row) AND empty schemas! */
+        char d1p[256], d2p[256];
+        snprintf(d1p, sizeof(d1p), "%s/dig1.db", tmp);
+        snprintf(d2p, sizeof(d2p), "%s/dig2.db", tmp);
+        fp_sql_ctx_t *dd1 = NULL, *dd2 = NULL;
+        assert(fp_sql_open(d1p, &dd1) == FP_OK && fp_sql_open(d2p, &dd2) == FP_OK);
+        assert(fp_sql_exec(dd1, "CREATE TABLE shape(x INTEGER PRIMARY KEY);") == FP_OK);
+        assert(fp_sql_exec(dd2, "CREATE TABLE shape(x INTEGER PRIMARY KEY, y INTEGER);") == FP_OK);
+        fp_dna_t e1, e2;
+        assert(fp_sql_state_digest(dd1, "shape", &e1) == FP_OK);
+        assert(fp_sql_state_digest(dd2, "shape", &e2) == FP_OK);
+        assert(!fp_dna_equal(&e1, &e2)); /* Different empty schemas! */
+        assert(fp_sql_exec(dd1, "INSERT INTO shape VALUES (1),(2);") == FP_OK);
+        assert(fp_sql_exec(dd2, "INSERT INTO shape VALUES (1,2);") == FP_OK);
+        fp_dna_t r1, r2;
+        assert(fp_sql_state_digest(dd1, "shape", &r1) == FP_OK);
+        assert(fp_sql_state_digest(dd2, "shape", &r2) == FP_OK);
+        assert(!fp_dna_equal(&r1, &r2)); /* (1 col x 2 rows) != (2 cols x 1 row)! */
+        fp_sql_close(dd1);
+        fp_sql_close(dd2);
+        fp_sql_close(db_sw_s);
+        fp_sql_close(db_sw_d);
+        printf("[PASS] A7-P0-01/A7-P1-05 (SQL-01/SQL-04): Swapped non-PK columns rejected (SFCS1) & digest distinguishes schema/row shape\n");
+    }
+
     fp_sql_close(src_db);
     fp_sql_close(dst_db);
 }

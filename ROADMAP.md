@@ -50,6 +50,8 @@ This roadmap tracks completed hardening milestones and planned work to develop m
    - Evaluate migrating the experimental `FPN1`/`FPU1` 1-RTT handshake to a standard **Noise_IK** / **Noise_XX** pattern with explicit key confirmation, server-identity binding in `C_HELLO`, and ProVerif/Tamarin symbolic analysis.
 4. **Power-Loss & Disk-Full Fault Injection**
    - Add automated `dm-flakey` / loop-device `ENOSPC` and concurrent multi-agent target-lock stress tests to `tests/test_chaos.c`.
+5. **Segmented / Checkpointed Multi-Window SQLite Catch-Up**
+   - Extend single-window SQLite catch-up beyond the v0.7 rollback safety bounds (`<= 64` incremental `INSTALL` steps / `<= 32 MiB` cumulative changesets, no mixed `INSTALL+ROLLBACK` in one window) via persisted intermediate checkpoint windows or explicit snapshot-reprovisioning handshakes.
 
 ---
 
