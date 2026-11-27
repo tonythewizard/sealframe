@@ -701,14 +701,49 @@ typedef struct {
     int             require_quorum;
     sqlite3        *db;
     pthread_mutex_t mu;
+    pthread_mutex_t w_mu;
+    pthread_cond_t  w_cv;
     _Atomic int     active_workers;
 } cp_state_t;
+
+static int db_table_exists(sqlite3 *db, const char *table_name) {
+    sqlite3_stmt *s = NULL;
+    int exists = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;",
+                           -1, &s, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(s, 1, table_name, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(s);
+    if (rc == SQLITE_ROW) exists = 1;
+    else if (rc != SQLITE_DONE) exists = -1;
+    sqlite3_finalize(s);
+    return exists;
+}
+
+static int db_table_has_col(sqlite3 *db, const char *table_name, const char *col_name) {
+    char q[128];
+    if (snprintf(q, sizeof(q), "PRAGMA table_info(%s);", table_name) >= (int)sizeof(q)) return -1;
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(db, q, -1, &s, NULL) != SQLITE_OK) return -1;
+    int found = 0;
+    int rc;
+    while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(s, 1);
+        if (name && strcmp(name, col_name) == 0) { found = 1; break; }
+    }
+    sqlite3_finalize(s);
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) return -1;
+    return found;
+}
 
 static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_path,
                          const char *explicit_tok, int require_signed_hb,
                          int require_enrolled, int require_quorum) {
     memset(st, 0, sizeof(*st));
     pthread_mutex_init(&st->mu, NULL);
+    pthread_mutex_init(&st->w_mu, NULL);
+    pthread_cond_init(&st->w_cv, NULL);
     st->require_signed_hb = require_signed_hb;
     st->require_enrolled = require_enrolled;
     st->require_quorum = require_quorum;
@@ -777,9 +812,61 @@ static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_
     }
     if (sqlite3_open(db_path, &st->db) != SQLITE_OK) return -1;
     sqlite3_busy_timeout(st->db, 5000);
+    if (sqlite3_exec(st->db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;", NULL, NULL, NULL) != SQLITE_OK) {
+        return -1;
+    }
+
+    /* Schema versioning & safe migration (P1-06, P0-05) */
+    int user_ver = 0;
+    {
+        sqlite3_stmt *vs = NULL;
+        if (sqlite3_prepare_v2(st->db, "PRAGMA user_version;", -1, &vs, NULL) != SQLITE_OK) return -1;
+        int rc = sqlite3_step(vs);
+        if (rc == SQLITE_ROW) user_ver = sqlite3_column_int(vs, 0);
+        sqlite3_finalize(vs);
+        if (rc != SQLITE_ROW) return -1;
+    }
+    if (user_ver < 0 || user_ver > 2) {
+        fprintf(stderr, "sf-cp: unsupported control_plane.db schema version %d\n", user_ver);
+        return -1;
+    }
+
+    if (sqlite3_exec(st->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) return -1;
+
+    if (user_ver < 2) {
+        int has_app_tbl = db_table_exists(st->db, "approvals");
+        if (has_app_tbl < 0) { (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL); return -1; }
+        if (has_app_tbl == 1) {
+            int has_ev_hash = db_table_has_col(st->db, "approvals", "event_hash");
+            int has_app_pk  = db_table_has_col(st->db, "approvals", "approver_pubkey");
+            if (has_ev_hash < 0 || has_app_pk < 0) {
+                (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+                return -1;
+            }
+            if (has_ev_hash == 0) {
+                /* Legacy v0 non-cryptographic approvals table: archive without granting quorum validity */
+                int has_legacy = db_table_exists(st->db, "approvals_legacy_v0");
+                if (has_legacy != 0) {
+                    (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+                    return -1;
+                }
+                if (sqlite3_exec(st->db, "ALTER TABLE approvals RENAME TO approvals_legacy_v0;",
+                                 NULL, NULL, NULL) != SQLITE_OK) {
+                    (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+                    return -1;
+                }
+            } else if (has_app_pk == 0) {
+                if (sqlite3_exec(st->db,
+                                 "ALTER TABLE approvals ADD COLUMN approver_pubkey TEXT NOT NULL DEFAULT '';",
+                                 NULL, NULL, NULL) != SQLITE_OK) {
+                    (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+                    return -1;
+                }
+            }
+        }
+    }
+
     const char *schema =
-        "PRAGMA journal_mode=WAL;"
-        "PRAGMA synchronous=NORMAL;"
         "CREATE TABLE IF NOT EXISTS devices ("
         "  device_id TEXT PRIMARY KEY,"
         "  ip TEXT NOT NULL,"
@@ -819,27 +906,36 @@ static int cp_state_init(cp_state_t *st, const char *data_dir, const char *sbom_
         ");"
         "CREATE TABLE IF NOT EXISTS approvers ("
         "  approver TEXT PRIMARY KEY,"
-        "  pubkey TEXT NOT NULL,"
+        "  pubkey TEXT NOT NULL UNIQUE,"
         "  added_utc TEXT NOT NULL"
         ");"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_approvers_pubkey ON approvers(pubkey);"
         "CREATE TABLE IF NOT EXISTS approvals ("
         "  channel TEXT NOT NULL DEFAULT 'stable',"
         "  serial INTEGER NOT NULL,"
         "  approver TEXT NOT NULL,"
+        "  approver_pubkey TEXT NOT NULL DEFAULT '',"
         "  event_hash TEXT NOT NULL DEFAULT '',"
         "  signature TEXT NOT NULL DEFAULT '',"
         "  approved_utc TEXT NOT NULL,"
         "  reason TEXT NOT NULL,"
         "  threshold INTEGER NOT NULL,"
         "  PRIMARY KEY (channel, serial, approver)"
-        ");";
-    if (sqlite3_exec(st->db, schema, NULL, NULL, NULL) != SQLITE_OK) return -1;
+        ");"
+        "PRAGMA user_version = 2;";
+    if (sqlite3_exec(st->db, schema, NULL, NULL, NULL) != SQLITE_OK ||
+        sqlite3_exec(st->db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+        return -1;
+    }
     return 0;
 }
 
 static void cp_state_close(cp_state_t *st) {
     sodium_memzero(st->admin_token, sizeof(st->admin_token));
     if (st->db) { sqlite3_close(st->db); st->db = NULL; }
+    pthread_cond_destroy(&st->w_cv);
+    pthread_mutex_destroy(&st->w_mu);
     pthread_mutex_destroy(&st->mu);
 }
 
@@ -930,6 +1026,12 @@ static int cp_record_heartbeat(cp_state_t *st, const char *ip, const jval_t *bod
     snprintf(pk_trunc, sizeof(pk_trunc), "%.64s", pk_hex ? pk_hex : "");
 
     pthread_mutex_lock(&st->mu);
+    if (sqlite3_exec(st->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&st->mu);
+        *out_http_status = 500;
+        snprintf(err_msg, err_cap, "database transaction begin failed");
+        return -1;
+    }
 
     /* Enforce device identity pinning & monotonic anti-replay counter */
     sqlite3_stmt *es = NULL;
@@ -939,20 +1041,34 @@ static int cp_record_heartbeat(cp_state_t *st, const char *ip, const jval_t *bod
     pinned_pk[0] = '\0';
     if (sqlite3_prepare_v2(st->db,
                            "SELECT pubkey, last_seq FROM enrolled_devices WHERE device_id=?;",
-                           -1, &es, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(es, 1, dev_id, -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(es) == SQLITE_ROW) {
-            enrolled = 1;
-            const char *pkc = (const char *)sqlite3_column_text(es, 0);
-            snprintf(pinned_pk, sizeof(pinned_pk), "%.64s", pkc ? pkc : "");
-            last_seq = sqlite3_column_int64(es, 1);
-        }
-        sqlite3_finalize(es);
+                           -1, &es, NULL) != SQLITE_OK) {
+        (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+        pthread_mutex_unlock(&st->mu);
+        *out_http_status = 500;
+        snprintf(err_msg, err_cap, "database query failed");
+        return -1;
+    }
+    sqlite3_bind_text(es, 1, dev_id, -1, SQLITE_TRANSIENT);
+    int erc = sqlite3_step(es);
+    if (erc == SQLITE_ROW) {
+        enrolled = 1;
+        const char *pkc = (const char *)sqlite3_column_text(es, 0);
+        snprintf(pinned_pk, sizeof(pinned_pk), "%.64s", pkc ? pkc : "");
+        last_seq = sqlite3_column_int64(es, 1);
+    }
+    sqlite3_finalize(es);
+    if (erc != SQLITE_ROW && erc != SQLITE_DONE) {
+        (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+        pthread_mutex_unlock(&st->mu);
+        *out_http_status = 500;
+        snprintf(err_msg, err_cap, "database enrollment lookup failed");
+        return -1;
     }
 
     if (enrolled) {
         if (!auth_ok || strlen(pk_trunc) != 64 || strlen(pinned_pk) != 64 ||
             sodium_memcmp(pk_trunc, pinned_pk, 64) != 0) {
+            (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
             pthread_mutex_unlock(&st->mu);
             *out_http_status = 401;
             snprintf(err_msg, err_cap, "device identity mismatch: pubkey does not match enrolled key");
@@ -960,6 +1076,7 @@ static int cp_record_heartbeat(cp_state_t *st, const char *ip, const jval_t *bod
         }
         if (has_hb_seq) {
             if (hb_seq <= last_seq) {
+                (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
                 pthread_mutex_unlock(&st->mu);
                 *out_http_status = 409;
                 snprintf(err_msg, err_cap, "heartbeat replay detected (hb_seq=%lld <= last=%lld)",
@@ -967,15 +1084,24 @@ static int cp_record_heartbeat(cp_state_t *st, const char *ip, const jval_t *bod
                 return -1;
             }
             sqlite3_stmt *us = NULL;
-            if (sqlite3_prepare_v2(st->db,
-                                   "UPDATE enrolled_devices SET last_seq=? WHERE device_id=?;",
-                                   -1, &us, NULL) == SQLITE_OK) {
+            int urc = sqlite3_prepare_v2(st->db,
+                                         "UPDATE enrolled_devices SET last_seq=? WHERE device_id=?;",
+                                         -1, &us, NULL);
+            if (urc == SQLITE_OK) {
                 sqlite3_bind_int64(us, 1, hb_seq);
                 sqlite3_bind_text(us, 2, dev_id, -1, SQLITE_TRANSIENT);
-                (void)sqlite3_step(us);
+                urc = sqlite3_step(us);
                 sqlite3_finalize(us);
             }
-        } else if (last_seq > 0) {
+            if (urc != SQLITE_DONE) {
+                (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+                pthread_mutex_unlock(&st->mu);
+                *out_http_status = 500;
+                snprintf(err_msg, err_cap, "database heartbeat counter update failed");
+                return -1;
+            }
+        } else if (last_seq > 0 || st->require_enrolled) {
+            (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
             pthread_mutex_unlock(&st->mu);
             *out_http_status = 409;
             snprintf(err_msg, err_cap, "heartbeat replay protection active: monotonic hb_seq required");
@@ -983,6 +1109,7 @@ static int cp_record_heartbeat(cp_state_t *st, const char *ip, const jval_t *bod
         }
     } else {
         if (st->require_enrolled) {
+            (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
             pthread_mutex_unlock(&st->mu);
             *out_http_status = 401;
             snprintf(err_msg, err_cap, "device not enrolled");
@@ -991,16 +1118,24 @@ static int cp_record_heartbeat(cp_state_t *st, const char *ip, const jval_t *bod
         if (auth_ok && strlen(pk_trunc) == 64) {
             /* Pin first cryptographically authenticated device key (TOFU pinning) */
             sqlite3_stmt *is = NULL;
-            if (sqlite3_prepare_v2(
+            int irc = sqlite3_prepare_v2(
                     st->db,
                     "INSERT INTO enrolled_devices(device_id,pubkey,last_seq,enrolled_utc) VALUES(?,?,?,?);",
-                    -1, &is, NULL) == SQLITE_OK) {
+                    -1, &is, NULL);
+            if (irc == SQLITE_OK) {
                 sqlite3_bind_text(is, 1, dev_id, -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(is, 2, pk_trunc, -1, SQLITE_TRANSIENT);
                 sqlite3_bind_int64(is, 3, has_hb_seq ? hb_seq : 0);
                 sqlite3_bind_text(is, 4, utc, -1, SQLITE_TRANSIENT);
-                (void)sqlite3_step(is);
+                irc = sqlite3_step(is);
                 sqlite3_finalize(is);
+            }
+            if (irc != SQLITE_DONE) {
+                (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+                pthread_mutex_unlock(&st->mu);
+                *out_http_status = 500;
+                snprintf(err_msg, err_cap, "database device pinning failed");
+                return -1;
             }
         }
     }
@@ -1042,10 +1177,24 @@ static int cp_record_heartbeat(cp_state_t *st, const char *ip, const jval_t *bod
         sqlite3_bind_int(stmt, 16, auth_ok ? 1 : 0);
         sqlite3_bind_text(stmt, 17, pk_trunc, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 18, utc, -1, SQLITE_TRANSIENT);
-        (void)sqlite3_step(stmt);
+        rc = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
     }
+    if (rc != SQLITE_DONE) {
+        (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+        pthread_mutex_unlock(&st->mu);
+        *out_http_status = 500;
+        snprintf(err_msg, err_cap, "database heartbeat write failed");
+        return -1;
+    }
     db_append_audit(st->db, dev_id, ip, channel, outcome, active_serial, detail, auth_ok, utc);
+    if (sqlite3_exec(st->db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        (void)sqlite3_exec(st->db, "ROLLBACK;", NULL, NULL, NULL);
+        pthread_mutex_unlock(&st->mu);
+        *out_http_status = 500;
+        snprintf(err_msg, err_cap, "database commit failed");
+        return -1;
+    }
     pthread_mutex_unlock(&st->mu);
 
     snprintf(out_dev, 65, "%s", dev_id);
@@ -1089,9 +1238,13 @@ static int cp_set_channel_serial(cp_state_t *st, const char *ch, int64_t serial,
         return -1;
     }
 
+    /* Serialize monotonicity check, quorum verification, atomic file write, and audit log (SEC-03, P0-05) */
+    pthread_mutex_lock(&st->mu);
+
     /* Enforce strict monotonicity on channel serial (agents ignore serial <= current!) */
     fp_event_t cur_ev;
     if (cp_load_event_file(dst, &cur_ev, NULL) == 0 && (uint64_t)serial <= cur_ev.serial) {
+        pthread_mutex_unlock(&st->mu);
         *out_http_status = 409;
         snprintf(msg, msg_cap,
                  "monotonic violation: serial %lld <= active channel '%s' serial %llu "
@@ -1101,54 +1254,78 @@ static int cp_set_channel_serial(cp_state_t *st, const char *ch, int64_t serial,
         return -1;
     }
 
-    /* Enforce cryptographic 2-of-N approver quorum whenever approvers are registered or --require-quorum is set */
-    pthread_mutex_lock(&st->mu);
+    /* Enforce cryptographic 2-of-N distinct-key approver quorum whenever approvers are registered or --require-quorum is set */
     int approver_count = 0;
     sqlite3_stmt *cs = NULL;
-    if (sqlite3_prepare_v2(st->db, "SELECT COUNT(*) FROM approvers;", -1, &cs, NULL) == SQLITE_OK) {
-        if (sqlite3_step(cs) == SQLITE_ROW) approver_count = sqlite3_column_int(cs, 0);
-        sqlite3_finalize(cs);
+    if (sqlite3_prepare_v2(st->db, "SELECT COUNT(*) FROM approvers;", -1, &cs, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&st->mu);
+        *out_http_status = 500;
+        snprintf(msg, msg_cap, "database approver lookup failed");
+        return -1;
+    }
+    int crc = sqlite3_step(cs);
+    if (crc == SQLITE_ROW) approver_count = sqlite3_column_int(cs, 0);
+    sqlite3_finalize(cs);
+    if (crc != SQLITE_ROW && crc != SQLITE_DONE) {
+        pthread_mutex_unlock(&st->mu);
+        *out_http_status = 500;
+        snprintf(msg, msg_cap, "database approver query failed");
+        return -1;
     }
     if (st->require_quorum || approver_count > 0) {
         int verified_approvals = 0;
         if (sqlite3_prepare_v2(
                 st->db,
-                "SELECT COUNT(DISTINCT a.approver) FROM approvals a "
-                "JOIN approvers r ON a.approver = r.approver "
-                "WHERE a.channel=? AND a.serial=? AND a.event_hash=?;",
-                -1, &cs, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(cs, 1, ch, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(cs, 2, serial);
-            sqlite3_bind_text(cs, 3, ev_hash_hex, -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(cs) == SQLITE_ROW) verified_approvals = sqlite3_column_int(cs, 0);
-            sqlite3_finalize(cs);
+                "SELECT COUNT(DISTINCT r.pubkey) FROM approvals a "
+                "JOIN approvers r ON a.approver = r.approver AND a.approver_pubkey = r.pubkey "
+                "WHERE a.channel=? AND a.serial=? AND a.event_hash=? AND length(a.approver_pubkey) = 64;",
+                -1, &cs, NULL) != SQLITE_OK) {
+            pthread_mutex_unlock(&st->mu);
+            *out_http_status = 500;
+            snprintf(msg, msg_cap, "database quorum lookup failed");
+            return -1;
+        }
+        sqlite3_bind_text(cs, 1, ch, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(cs, 2, serial);
+        sqlite3_bind_text(cs, 3, ev_hash_hex, -1, SQLITE_TRANSIENT);
+        crc = sqlite3_step(cs);
+        if (crc == SQLITE_ROW) verified_approvals = sqlite3_column_int(cs, 0);
+        sqlite3_finalize(cs);
+        if (crc != SQLITE_ROW && crc != SQLITE_DONE) {
+            pthread_mutex_unlock(&st->mu);
+            *out_http_status = 500;
+            snprintf(msg, msg_cap, "database quorum query failed");
+            return -1;
         }
         if (verified_approvals < 2) {
             pthread_mutex_unlock(&st->mu);
             *out_http_status = 403;
             snprintf(msg, msg_cap,
-                     "quorum not met for channel '%s' serial %lld (%d/2 distinct Ed25519 approvals)",
+                     "quorum not met for channel '%s' serial %lld (%d/2 distinct Ed25519 keys)",
                      ch, (long long)serial, verified_approvals);
             return -1;
         }
     }
-    pthread_mutex_unlock(&st->mu);
 
     if (mkdir_p(cdir) != 0 || copy_file_atomic(src, dst) != 0) {
+        pthread_mutex_unlock(&st->mu);
         *out_http_status = 500;
         snprintf(msg, msg_cap, "failed to write channel latest.ev");
         return -1;
     }
     if (strcmp(ch, "stable") == 0) {
         char root_latest[PATH_MAX];
-        if (snprintf(root_latest, sizeof(root_latest), "%s/latest.ev", st->repo_dir) < (int)sizeof(root_latest)) {
-            (void)copy_file_atomic(src, root_latest);
+        if (snprintf(root_latest, sizeof(root_latest), "%s/latest.ev", st->repo_dir) >= (int)sizeof(root_latest) ||
+            copy_file_atomic(src, root_latest) != 0) {
+            pthread_mutex_unlock(&st->mu);
+            *out_http_status = 500;
+            snprintf(msg, msg_cap, "failed to write root latest.ev");
+            return -1;
         }
     }
     char utc[32], detail[256];
     utc_now(utc);
     snprintf(detail, sizeof(detail), "%s: channel '%s' -> serial #%lld", reason, ch, (long long)serial);
-    pthread_mutex_lock(&st->mu);
     db_append_audit(st->db, "CONTROL_PLANE", "admin", ch,
                     is_emergency_rollback ? "EMERGENCY_ROLLBACK" : "CHANNEL_SET",
                     serial, detail, 1, utc);
@@ -2139,16 +2316,25 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 utc_now(utc);
                 pthread_mutex_lock(&st->mu);
                 sqlite3_stmt *stmt = NULL;
-                if (sqlite3_prepare_v2(
+                int erc = sqlite3_prepare_v2(
                         st->db,
                         "INSERT INTO enrolled_devices(device_id,pubkey,last_seq,enrolled_utc) VALUES(?,?,0,?) "
-                        "ON CONFLICT(device_id) DO UPDATE SET pubkey=excluded.pubkey, last_seq=0, enrolled_utc=excluded.enrolled_utc;",
-                        -1, &stmt, NULL) == SQLITE_OK) {
+                        "ON CONFLICT(device_id) DO UPDATE SET "
+                        "last_seq = CASE WHEN enrolled_devices.pubkey = excluded.pubkey THEN enrolled_devices.last_seq ELSE 0 END, "
+                        "pubkey=excluded.pubkey, enrolled_utc=excluded.enrolled_utc;",
+                        -1, &stmt, NULL);
+                if (erc == SQLITE_OK) {
                     sqlite3_bind_text(stmt, 1, dev_id, -1, SQLITE_TRANSIENT);
                     sqlite3_bind_text(stmt, 2, pk_hex, -1, SQLITE_TRANSIENT);
                     sqlite3_bind_text(stmt, 3, utc, -1, SQLITE_TRANSIENT);
-                    (void)sqlite3_step(stmt);
+                    erc = sqlite3_step(stmt);
                     sqlite3_finalize(stmt);
+                }
+                if (erc != SQLITE_DONE) {
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database enrollment write failed\"}");
+                    return;
                 }
                 char det[256];
                 snprintf(det, sizeof(det), "Enrolled Ed25519 pubkey %.16s... for %s", pk_hex, dev_id);
@@ -2181,16 +2367,29 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 utc_now(utc);
                 pthread_mutex_lock(&st->mu);
                 sqlite3_stmt *stmt = NULL;
-                if (sqlite3_prepare_v2(
+                int arc = sqlite3_prepare_v2(
                         st->db,
                         "INSERT INTO approvers(approver,pubkey,added_utc) VALUES(?,?,?) "
                         "ON CONFLICT(approver) DO UPDATE SET pubkey=excluded.pubkey, added_utc=excluded.added_utc;",
-                        -1, &stmt, NULL) == SQLITE_OK) {
+                        -1, &stmt, NULL);
+                if (arc == SQLITE_OK) {
                     sqlite3_bind_text(stmt, 1, approver, -1, SQLITE_TRANSIENT);
                     sqlite3_bind_text(stmt, 2, pk_hex, -1, SQLITE_TRANSIENT);
                     sqlite3_bind_text(stmt, 3, utc, -1, SQLITE_TRANSIENT);
-                    (void)sqlite3_step(stmt);
+                    arc = sqlite3_step(stmt);
                     sqlite3_finalize(stmt);
+                }
+                if (arc == SQLITE_CONSTRAINT || arc == SQLITE_CONSTRAINT_UNIQUE) {
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 409, "{\"ok\":false,\"error\":\"approver pubkey already registered to another identity\"}");
+                    return;
+                }
+                if (arc != SQLITE_DONE) {
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database approver write failed\"}");
+                    return;
                 }
                 char det[256];
                 snprintf(det, sizeof(det), "Registered Ed25519 approver %s (%.16s...)", approver, pk_hex);
@@ -2235,14 +2434,22 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 char app_pk_hex[65];
                 app_pk_hex[0] = '\0';
                 sqlite3_stmt *stmt = NULL;
-                if (sqlite3_prepare_v2(st->db, "SELECT pubkey FROM approvers WHERE approver=?;",
-                                       -1, &stmt, NULL) == SQLITE_OK) {
+                int lrc = sqlite3_prepare_v2(st->db, "SELECT pubkey FROM approvers WHERE approver=?;",
+                                             -1, &stmt, NULL);
+                if (lrc == SQLITE_OK) {
                     sqlite3_bind_text(stmt, 1, approver, -1, SQLITE_TRANSIENT);
-                    if (sqlite3_step(stmt) == SQLITE_ROW) {
+                    lrc = sqlite3_step(stmt);
+                    if (lrc == SQLITE_ROW) {
                         const char *pkc = (const char *)sqlite3_column_text(stmt, 0);
                         snprintf(app_pk_hex, sizeof(app_pk_hex), "%.64s", pkc ? pkc : "");
                     }
                     sqlite3_finalize(stmt);
+                }
+                if (lrc != SQLITE_ROW && lrc != SQLITE_DONE) {
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database approver lookup failed\"}");
+                    return;
                 }
                 if (strlen(app_pk_hex) != 64) {
                     pthread_mutex_unlock(&st->mu);
@@ -2269,25 +2476,36 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
                 int thr = 2;
                 char utc[32];
                 utc_now(utc);
-                if (sqlite3_prepare_v2(
+                int wrc = sqlite3_prepare_v2(
                         st->db,
-                        "INSERT OR REPLACE INTO approvals(channel,serial,approver,event_hash,signature,approved_utc,reason,threshold) "
-                        "VALUES(?,?,?,?,?,?,?,?);", -1, &stmt, NULL) == SQLITE_OK) {
+                        "INSERT OR REPLACE INTO approvals("
+                        "channel,serial,approver,approver_pubkey,event_hash,signature,approved_utc,reason,threshold) "
+                        "VALUES(?,?,?,?,?,?,?,?,?);", -1, &stmt, NULL);
+                if (wrc == SQLITE_OK) {
                     sqlite3_bind_text(stmt, 1, ch, -1, SQLITE_TRANSIENT);
                     sqlite3_bind_int64(stmt, 2, serial);
                     sqlite3_bind_text(stmt, 3, approver, -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(stmt, 4, ev_hash_hex, -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(stmt, 5, sig_hex, -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(stmt, 6, utc, -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(stmt, 7, reason, -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_int(stmt, 8, thr);
-                    (void)sqlite3_step(stmt);
+                    sqlite3_bind_text(stmt, 4, app_pk_hex, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 5, ev_hash_hex, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 6, sig_hex, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 7, utc, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 8, reason, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int(stmt, 9, thr);
+                    wrc = sqlite3_step(stmt);
                     sqlite3_finalize(stmt);
+                }
+                if (wrc != SQLITE_DONE) {
+                    pthread_mutex_unlock(&st->mu);
+                    jval_free(body); free(raw_body);
+                    send_json(cfd, 500, "{\"ok\":false,\"error\":\"database approval write failed\"}");
+                    return;
                 }
                 int cnt = 0;
                 if (sqlite3_prepare_v2(
                         st->db,
-                        "SELECT COUNT(DISTINCT approver) FROM approvals WHERE channel=? AND serial=? AND event_hash=?;",
+                        "SELECT COUNT(DISTINCT r.pubkey) FROM approvals a "
+                        "JOIN approvers r ON a.approver = r.approver AND a.approver_pubkey = r.pubkey "
+                        "WHERE a.channel=? AND a.serial=? AND a.event_hash=? AND length(a.approver_pubkey) = 64;",
                         -1, &stmt, NULL) == SQLITE_OK) {
                     sqlite3_bind_text(stmt, 1, ch, -1, SQLITE_TRANSIENT);
                     sqlite3_bind_int64(stmt, 2, serial);
@@ -2370,10 +2588,16 @@ static void handle_client(cp_state_t *st, int cfd, const char *client_ip) {
 
 static void *worker_thread(void *arg) {
     conn_ctx_t *ctx = (conn_ctx_t *)arg;
-    handle_client(ctx->st, ctx->cfd, ctx->ip);
+    cp_state_t *st = ctx->st;
+    handle_client(st, ctx->cfd, ctx->ip);
     close(ctx->cfd);
-    atomic_fetch_sub(&ctx->st->active_workers, 1);
     free(ctx);
+    pthread_mutex_lock(&st->w_mu);
+    int prev = atomic_fetch_sub(&st->active_workers, 1);
+    if (prev <= 1) {
+        pthread_cond_broadcast(&st->w_cv);
+    }
+    pthread_mutex_unlock(&st->w_mu);
     return NULL;
 }
 
@@ -2381,9 +2605,9 @@ static void *worker_thread(void *arg) {
 
 static void usage(void) {
     fprintf(stderr,
-            "Usage: sf-cp --data-dir <dir> [--bind 0.0.0.0] [--port 8080] "
+            "Usage: sf-cp --data-dir <dir> [--bind 127.0.0.1] [--port 8080] "
             "[--sbom <sbom.json>] [--admin-token <tok>] [--require-signed-heartbeat] "
-            "[--require-enrolled] [--require-quorum]\n");
+            "[--require-enrolled] [--require-quorum] [--allow-insecure-dev]\n");
 }
 
 int main(int argc, char **argv) {
@@ -2396,14 +2620,16 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const char *bind_addr = "0.0.0.0";
+    /* Fail-closed secure defaults (P0-06): loopback bind, signed+enrolled heartbeats, 2-of-N quorum */
+    const char *bind_addr = "127.0.0.1";
     uint16_t port = 8080;
     const char *data_dir = NULL;
     const char *sbom_path = NULL;
     const char *admin_tok = NULL;
-    int require_signed_hb = 0;
-    int require_enrolled = 0;
-    int require_quorum = 0;
+    int require_signed_hb = 1;
+    int require_enrolled = 1;
+    int require_quorum = 1;
+    int insecure_dev = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
@@ -2420,6 +2646,11 @@ int main(int argc, char **argv) {
             sbom_path = argv[++i];
         } else if (strcmp(argv[i], "--admin-token") == 0 && i + 1 < argc) {
             admin_tok = argv[++i];
+        } else if (strcmp(argv[i], "--allow-insecure-dev") == 0) {
+            insecure_dev = 1;
+            require_signed_hb = 0;
+            require_enrolled = 0;
+            require_quorum = 0;
         } else if (strcmp(argv[i], "--require-signed-heartbeat") == 0) {
             require_signed_hb = 1;
         } else if (strcmp(argv[i], "--require-enrolled") == 0) {
@@ -2440,6 +2671,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "sf-cp: --data-dir is required\n");
         usage();
         return 2;
+    }
+    if (insecure_dev) {
+        fprintf(stderr, "sf-cp: WARNING: --allow-insecure-dev active (signed_hb=%d enrolled=%d quorum=%d)\n",
+                require_signed_hb, require_enrolled, require_quorum);
     }
 
     cp_state_t st;
@@ -2498,10 +2733,12 @@ int main(int argc, char **argv) {
 
     int fd = atomic_exchange(&g_listen_fd, -1);
     if (fd >= 0) close(fd);
-    for (int i = 0; i < 100 && atomic_load(&st.active_workers) > 0; i++) {
-        struct timespec ts = { 0, 20000000 }; /* 20ms */
-        nanosleep(&ts, NULL);
+    /* Wait deterministically for all active workers to finish before closing DB/mutexes (SEC-04) */
+    pthread_mutex_lock(&st.w_mu);
+    while (atomic_load(&st.active_workers) > 0) {
+        pthread_cond_wait(&st.w_cv, &st.w_mu);
     }
+    pthread_mutex_unlock(&st.w_mu);
     cp_state_close(&st);
     return 0;
 }

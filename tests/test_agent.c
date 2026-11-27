@@ -563,7 +563,12 @@ int main(void) {
         assert(rep.outcome == FP_AGENT_INITIAL_INSTALL_FAILED && rep.active_serial == 0);
         snprintf(cur_link, sizeof(cur_link), "%s/current", e2_target);
         assert(lstat(cur_link, &st_chk) != 0);
-        printf("[PASS] P0-02 initial install health failure returns error + INITIAL_INSTALL_FAILED + removes current\n");
+
+        /* V-03: Subsequent sync on the same failed initial serial MUST keep failing closed (not ROLLED_BACK + OK) */
+        fp_err_t ierr2 = fp_agent_sync_once(&acfg2, &rep);
+        assert(ierr2 != FP_OK);
+        assert(rep.outcome == FP_AGENT_INITIAL_INSTALL_FAILED && rep.active_serial == 0);
+        printf("[PASS] P0-02/V-03 initial install health failure stays fail-closed across repeated syncs\n");
     }
 
     /* Test J (P1-04): Offline recovery from EXPIRED pinned root v1 across multi-step v1->v2->v3
@@ -695,6 +700,20 @@ int main(void) {
         assert(fp_agent_sync_once(&hcfg, &rep) == FP_OK);
         assert(rep.outcome == FP_AGENT_UPDATED && rep.root_version == 3 && rep.active_serial == 2);
         printf("[PASS] P1-04 offline recovery: expired root v1 -> v2 -> v3 + historical key chain synced cleanly!\n");
+
+        /* Test K (P1-01 + P0-04): Offline recovery of interrupted revoke completes BEFORE any network access */
+        char h_rev_pend[600], h_cur[600], h_rev[600];
+        snprintf(h_rev_pend, sizeof(h_rev_pend), "%s/.sf_revoke_pending", htarget);
+        snprintf(h_cur, sizeof(h_cur), "%s/current", htarget);
+        snprintf(h_rev, sizeof(h_rev), "%s/.sf_revoked", htarget);
+        write_bytes_file(h_rev_pend, (const uint8_t *)"REVOKE_PENDING 3\n", 17);
+        hcfg.repo_url = "http://127.0.0.1:1"; /* unreachable! */
+        fp_err_t off_err = fp_agent_sync_once(&hcfg, &rep);
+        assert(off_err != FP_OK); /* network fetch fails, AFTER offline recovery finishes! */
+        assert(lstat(h_cur, &st_chk) != 0);
+        assert(lstat(h_rev, &st_chk) == 0);
+        assert(lstat(h_rev_pend, &st_chk) != 0);
+        printf("[PASS] P1-01/P0-04 offline revoke recovery completed before network access\n");
     }
 
     srv.stop = 1;

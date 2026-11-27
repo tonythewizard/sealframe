@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sodium.h>
+#include <sqlite3.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -223,7 +224,8 @@ static void test_control_plane(const char *work) {
 
     char port_s[16];
     snprintf(port_s, sizeof(port_s), "%u", (unsigned)port);
-    char *argv[] = { "./bin/sf-cp", "--bind", "127.0.0.1", "--port", port_s, "--data-dir", cp_dir, NULL };
+    char *argv[] = { "./bin/sf-cp", "--bind", "127.0.0.1", "--port", port_s, "--data-dir", cp_dir,
+                     "--allow-insecure-dev", NULL };
     pid_t pid = spawn_bg(argv);
     assert(pid > 0);
 
@@ -439,6 +441,17 @@ static void test_control_plane(const char *work) {
         raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
         if (strncmp(resp, "HTTP/1.1 200 OK", 15) != 0) record_finding("HIGH", "CP-P0-03", "Approver 2 register failed");
 
+        /* P0-05: Registering a second alias with the SAME pubkey MUST be rejected with 409 Conflict */
+        snprintf(abody, sizeof(abody), "{\"approver\":\"cto-alias@corp\",\"pubkey\":\"%s\"}", a1_pk);
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/approvers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s", tok, strlen(abody), abody);
+        raw_http(port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 409", 12) != 0)
+            record_finding("CRITICAL", "CP-P0-05", "Duplicate approver pubkey across alias was NOT rejected with 409");
+        else
+            record_ok("CP-P0-05", "Duplicate approver pubkey alias blocked with 409 Conflict (quorum requires distinct keys)");
+
         /* Promotion with 0/2 approvals MUST fail with 403 */
         const char *prom1 = "{\"serial\":1}";
         snprintf(req, sizeof(req),
@@ -560,6 +573,112 @@ static void test_control_plane(const char *work) {
 
     kill(pid, SIGTERM);
     waitpid(pid, &st, 0);
+
+    /* 1j. P0-06 Fail-Closed Default Mode + P1-06 Legacy v0 DB Migration */
+    {
+        const uint16_t sec_port = 18924;
+        char sec_dir[512], sec_ev_dir[544], sec_db_path[544];
+        snprintf(sec_dir, sizeof(sec_dir), "%s/cp_secure_default", work);
+        snprintf(sec_ev_dir, sizeof(sec_ev_dir), "%s/repo/events", sec_dir);
+        snprintf(sec_db_path, sizeof(sec_db_path), "%s/control_plane.db", sec_dir);
+        mkdir(sec_dir, 0755);
+        char sec_repo_dir[544];
+        snprintf(sec_repo_dir, sizeof(sec_repo_dir), "%s/repo", sec_dir);
+        mkdir(sec_repo_dir, 0755);
+        mkdir(sec_ev_dir, 0755);
+
+        /* Pre-seed legacy v0 DB with unsigned approvals rows that MUST NOT grant quorum after migration */
+        sqlite3 *ldb = NULL;
+        assert(sqlite3_open(sec_db_path, &ldb) == SQLITE_OK);
+        const char *v0_sql =
+            "CREATE TABLE approvals ("
+            "  serial INTEGER NOT NULL,"
+            "  approver TEXT NOT NULL,"
+            "  approved_utc TEXT NOT NULL,"
+            "  reason TEXT NOT NULL,"
+            "  threshold INTEGER NOT NULL,"
+            "  PRIMARY KEY (serial, approver)"
+            ");"
+            "INSERT INTO approvals VALUES (1, 'legacy-a', '2025-01-01T00:00:00Z', 'old', 2);"
+            "INSERT INTO approvals VALUES (1, 'legacy-b', '2025-01-01T00:00:00Z', 'old', 2);"
+            "PRAGMA user_version = 0;";
+        assert(sqlite3_exec(ldb, v0_sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(ldb);
+
+        /* Put signed 1.ev in repo/events/1.ev */
+        fp_keypair_t rkp;
+        assert(fp_keygen(&rkp) == FP_OK);
+        fp_dna_t rid, bdna;
+        assert(fp_random_id(&rid) == FP_OK && fp_random_id(&bdna) == FP_OK);
+        fp_event_t ev1;
+        memset(&ev1, 0, sizeof(ev1));
+        ev1.action = FP_ACTION_INSTALL; ev1.repo_id = rid; ev1.serial = 1;
+        ev1.timestamp_unix = (uint64_t)time(NULL); ev1.expires_unix = ev1.timestamp_unix + 3600;
+        ev1.target_dna = bdna; ev1.target_size = 64;
+        assert(fp_event_sign(&ev1, &rkp) == FP_OK);
+        uint8_t *eb = NULL; size_t el = 0;
+        assert(fp_event_encode(&ev1, &eb, &el) == FP_OK);
+        char evp[600];
+        snprintf(evp, sizeof(evp), "%s/1.ev", sec_ev_dir);
+        FILE *ef = fopen(evp, "wb"); assert(ef && fwrite(eb, 1, el, ef) == el); fclose(ef); free(eb);
+
+        /* Launch sf-cp with ZERO security flags -> must default to loopback + signed + enrolled + quorum! */
+        char sec_port_s[16];
+        snprintf(sec_port_s, sizeof(sec_port_s), "%u", (unsigned)sec_port);
+        char *sec_argv[] = { "./bin/sf-cp", "--port", sec_port_s, "--data-dir", sec_dir, NULL };
+        pid_t spid = spawn_bg(sec_argv);
+        assert(spid > 0);
+        int sready = 0;
+        for (int i = 0; i < 40; i++) {
+            int fd = tcp_connect_local(sec_port, 200);
+            if (fd >= 0) { close(fd); sready = 1; break; }
+            msleep(50);
+        }
+        assert(sready);
+
+        char sec_tok_path[600], sec_tok[128];
+        snprintf(sec_tok_path, sizeof(sec_tok_path), "%s/admin.token", sec_dir);
+        assert(read_file_str(sec_tok_path, sec_tok, sizeof(sec_tok)) == 0);
+
+        /* Unsigned heartbeat -> 401 */
+        const char *uhb = "{\"device_id\":\"d1\",\"outcome\":\"UPDATED\",\"active_serial\":1}";
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: %zu\r\n\r\n%s",
+                 strlen(uhb), uhb);
+        raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 401", 12) != 0)
+            record_finding("CRITICAL", "CP-P0-06", "Default sf-cp did NOT reject unsigned heartbeat with 401");
+
+        /* Signed but unenrolled heartbeat -> 401 */
+        uint8_t dsig[64];
+        char dpk_hex[65], dsig_hex[129];
+        crypto_sign_ed25519_detached(dsig, NULL, (const uint8_t *)uhb, strlen(uhb), dkp.sk);
+        to_hex(dkp.pk, 32, dpk_hex);
+        to_hex(dsig, 64, dsig_hex);
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/heartbeat HTTP/1.1\r\nHost: x\r\n"
+                 "X-SF-Device-PubKey: %s\r\nX-SF-Signature: %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s",
+                 dpk_hex, dsig_hex, strlen(uhb), uhb);
+        raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 401", 12) != 0)
+            record_finding("CRITICAL", "CP-P0-06", "Default sf-cp did NOT reject unenrolled device with 401");
+
+        /* Promotion without crypto quorum (despite legacy v0 approvals!) -> 403 */
+        const char *sprom = "{\"serial\":1}";
+        snprintf(req, sizeof(req),
+                 "POST /api/v1/channels/stable HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n"
+                 "Content-Length: %zu\r\n\r\n%s",
+                 sec_tok, strlen(sprom), sprom);
+        raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+        if (strncmp(resp, "HTTP/1.1 403", 12) != 0)
+            record_finding("CRITICAL", "CP-P0-06/P1-06", "Default sf-cp allowed promotion without crypto quorum or accepted legacy v0 approvals");
+        else
+            record_ok("CP-P0-06/P1-06", "Default fail-closed mode (401 unsigned/unenrolled, 403 no quorum) & legacy v0 DB migration verified");
+
+        kill(spid, SIGTERM);
+        waitpid(spid, &st, 0);
+    }
 }
 
 /* ==================== 2. Live TCP & UDP Server Fuzzing ==================== */
