@@ -474,6 +474,20 @@ fp_err_t fp_bundle_apply_sql_only(const char *store_dir, const fp_dna_t *bundle_
                                   const char *target_dir, fp_sql_ctx_t *sql_ctx,
                                   uint64_t expected_seq);
 
+/* A8-P0-03: Single-transaction multi-step bundle chain apply (1..64 steps).
+ * Executes ALL intermediate + final SQLite changesets inside ONE atomic SQLite WAL
+ * transaction (`BEGIN IMMEDIATE ... COMMIT`), stages ONLY the final generation's files,
+ * and flips `<target_dir>/current` once to the final generation so concurrent WAL readers
+ * NEVER observe intermediate or revoked SQL states. */
+typedef struct {
+    fp_dna_t bundle_dna;
+    uint64_t expected_seq;
+} fp_bundle_step_t;
+
+fp_err_t fp_bundle_apply_chain(const char *store_dir,
+                               const fp_bundle_step_t *steps, size_t step_count,
+                               const char *target_dir, fp_sql_ctx_t *sql_ctx);
+
 /* Deterministic crash-recovery for any incomplete composite bundle transaction
  * recorded in `<target_dir>/.sf_tx_journal`. Reconciles forward if SQLite already
  * committed, or cleans up safely if interrupted prior to commit. */

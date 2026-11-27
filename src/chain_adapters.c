@@ -419,19 +419,183 @@ static fp_err_t http_post_json(const char *url, const char *bearer, const char *
     return (code >= 200 && code < 300) ? FP_OK : FP_ERR_IO;
 }
 
-static void extract_json_str_field(const char *json, const char *key, char *out, size_t cap) {
-    out[0] = '\0';
-    char pat[64];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(json, pat);
-    if (!p) return;
-    p += strlen(pat);
-    while (*p == ' ' || *p == ':' || *p == '\t') p++;
-    if (*p != '"') return;
+/* A8-SEC-04: Strict pure-C11 JSON-RPC 2.0 structural parser (replaces substring matching). */
+static const char *j_skip_ws(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return p;
+}
+
+static const char *j_skip_str(const char *p) {
+    if (*p != '"') return NULL;
+    p++;
+    while (*p && *p != '"') {
+        if (*p == '\\') {
+            p++;
+            if (!*p) return NULL;
+        }
+        p++;
+    }
+    return (*p == '"') ? p + 1 : NULL;
+}
+
+static const char *j_skip_val(const char *p, int depth) {
+    if (depth > 16) return NULL;
+    p = j_skip_ws(p);
+    if (*p == '"') return j_skip_str(p);
+    if (*p == '{') {
+        p = j_skip_ws(p + 1);
+        if (*p == '}') return p + 1;
+        for (;;) {
+            p = j_skip_str(p);
+            if (!p) return NULL;
+            p = j_skip_ws(p);
+            if (*p != ':') return NULL;
+            p = j_skip_val(p + 1, depth + 1);
+            if (!p) return NULL;
+            p = j_skip_ws(p);
+            if (*p == '}') return p + 1;
+            if (*p != ',') return NULL;
+            p = j_skip_ws(p + 1);
+        }
+    }
+    if (*p == '[') {
+        p = j_skip_ws(p + 1);
+        if (*p == ']') return p + 1;
+        for (;;) {
+            p = j_skip_val(p, depth + 1);
+            if (!p) return NULL;
+            p = j_skip_ws(p);
+            if (*p == ']') return p + 1;
+            if (*p != ',') return NULL;
+            p = j_skip_ws(p + 1);
+        }
+    }
+    if (strncmp(p, "true", 4) == 0)  return p + 4;
+    if (strncmp(p, "false", 5) == 0) return p + 5;
+    if (strncmp(p, "null", 4) == 0)  return p + 4;
+    if (*p == '-' || (*p >= '0' && *p <= '9')) {
+        if (*p == '-') p++;
+        if (!(*p >= '0' && *p <= '9')) return NULL;
+        while (*p >= '0' && *p <= '9') p++;
+        if (*p == '.') {
+            p++;
+            if (!(*p >= '0' && *p <= '9')) return NULL;
+            while (*p >= '0' && *p <= '9') p++;
+        }
+        if (*p == 'e' || *p == 'E') {
+            p++;
+            if (*p == '+' || *p == '-') p++;
+            if (!(*p >= '0' && *p <= '9')) return NULL;
+            while (*p >= '0' && *p <= '9') p++;
+        }
+        return p;
+    }
+    return NULL;
+}
+
+static int j_parse_str(const char *p, char *out, size_t cap) {
+    if (!p || !out || cap == 0) return -1;
+    p = j_skip_ws(p);
+    if (*p != '"') return -1;
     p++;
     size_t i = 0;
-    while (*p && *p != '"' && i + 1u < cap) out[i++] = *p++;
+    while (*p && *p != '"') {
+        char ch = *p++;
+        if (ch == '\\') {
+            if (!*p) return -1;
+            ch = *p++;
+        }
+        if (i + 1u >= cap) return -1;
+        out[i++] = ch;
+    }
+    if (*p != '"') return -1;
     out[i] = '\0';
+    return 0;
+}
+
+static int j_parse_i64(const char *p, int64_t *out) {
+    p = j_skip_ws(p);
+    if (!(*p == '-' || (*p >= '0' && *p <= '9'))) return -1;
+    char *end = NULL;
+    errno = 0;
+    long long v = strtoll(p, &end, 10);
+    if (errno != 0 || end == p) return -1;
+    if (*end == '.' || *end == 'e' || *end == 'E') return -1;
+    *out = (int64_t)v;
+    return 0;
+}
+
+/* Find a key strictly at the TOP LEVEL of a JSON object `{ ... }` (returns pointer to value). */
+static const char *j_find_top_field(const char *obj, const char *key) {
+    const char *p = j_skip_ws(obj);
+    if (*p != '{') return NULL;
+    p = j_skip_ws(p + 1);
+    if (*p == '}') return NULL;
+    size_t klen = strlen(key);
+    for (;;) {
+        if (*p != '"') return NULL;
+        const char *kstart = p + 1;
+        const char *kend = j_skip_str(p);
+        if (!kend) return NULL;
+        size_t found_len = (size_t)((kend - 1) - kstart);
+        p = j_skip_ws(kend);
+        if (*p != ':') return NULL;
+        const char *val = j_skip_ws(p + 1);
+        if (found_len == klen && memcmp(kstart, key, klen) == 0) {
+            return val;
+        }
+        p = j_skip_val(val, 1);
+        if (!p) return NULL;
+        p = j_skip_ws(p);
+        if (*p == '}') return NULL;
+        if (*p != ',') return NULL;
+        p = j_skip_ws(p + 1);
+    }
+}
+
+/* Validate strict JSON-RPC 2.0 response envelope:
+ *   - Well-formed root JSON object with no trailing garbage
+ *   - "jsonrpc": "2.0"
+ *   - "id": exact integer matching expected_id
+ *   - "error": absent or literal null
+ *   - "result": present and NOT literal null */
+static fp_err_t validate_jsonrpc_resp(const char *resp, int64_t expected_id, const char **out_result) {
+    if (!resp || !out_result) return FP_ERR_INVALID;
+    *out_result = NULL;
+    const char *root = j_skip_ws(resp);
+    if (*root != '{') return FP_ERR_INTEGRITY;
+    const char *end = j_skip_val(root, 0);
+    if (!end || *j_skip_ws(end) != '\0') return FP_ERR_INTEGRITY;
+
+    const char *ver_v = j_find_top_field(root, "jsonrpc");
+    char ver_s[16];
+    if (!ver_v || j_parse_str(ver_v, ver_s, sizeof(ver_s)) != 0 || strcmp(ver_s, "2.0") != 0) {
+        return FP_ERR_INTEGRITY;
+    }
+
+    const char *id_v = j_find_top_field(root, "id");
+    int64_t got_id = -1;
+    if (!id_v || j_parse_i64(id_v, &got_id) != 0 || got_id != expected_id) {
+        return FP_ERR_INTEGRITY;
+    }
+
+    const char *err_v = j_find_top_field(root, "error");
+    if (err_v != NULL) {
+        const char *ev = j_skip_ws(err_v);
+        if (strncmp(ev, "null", 4) != 0) return FP_ERR_IO;
+        const char *after = j_skip_ws(ev + 4);
+        if (*after != ',' && *after != '}') return FP_ERR_IO;
+    }
+
+    const char *res_v = j_find_top_field(root, "result");
+    if (!res_v) return FP_ERR_INTEGRITY;
+    const char *rv = j_skip_ws(res_v);
+    if (strncmp(rv, "null", 4) == 0) {
+        const char *after = j_skip_ws(rv + 4);
+        if (*after == ',' || *after == '}') return FP_ERR_INTEGRITY;
+    }
+    *out_result = rv;
+    return FP_OK;
 }
 
 /* ==================== 5. Unified fp_anchor_ops_t Implementations ==================== */
@@ -474,14 +638,21 @@ static fp_err_t chain_publish(void *user_ctx, const fp_anchor_commitment_t *c) {
     fp_err_t err = http_post_json(ctx->cfg.rpc_url, ctx->cfg.bearer_token, req,
                                   ctx->cfg.io_timeout_ms, &status, resp, sizeof(resp));
     if (err != FP_OK) return err;
-    if (strstr(resp, "\"error\"") != NULL && strstr(resp, "\"error\":null") == NULL) {
-        return FP_ERR_IO;
+
+    const char *res_v = NULL;
+    err = validate_jsonrpc_resp(resp, 1, &res_v);
+    if (err != FP_OK) return err;
+
+    ctx->last_tx_id[0] = '\0';
+    if (*res_v == '"') {
+        if (j_parse_str(res_v, ctx->last_tx_id, sizeof(ctx->last_tx_id)) != 0) return FP_ERR_INTEGRITY;
+    } else if (*res_v == '{') {
+        const char *tx_v = j_find_top_field(res_v, "tx_id");
+        if (!tx_v || j_parse_str(tx_v, ctx->last_tx_id, sizeof(ctx->last_tx_id)) != 0) return FP_ERR_INTEGRITY;
+    } else {
+        return FP_ERR_INTEGRITY;
     }
-    extract_json_str_field(resp, "result", ctx->last_tx_id, sizeof(ctx->last_tx_id));
-    if (!ctx->last_tx_id[0]) {
-        extract_json_str_field(resp, "tx_id", ctx->last_tx_id, sizeof(ctx->last_tx_id));
-    }
-    return FP_OK;
+    return (ctx->last_tx_id[0] != '\0') ? FP_OK : FP_ERR_INTEGRITY;
 }
 
 static fp_err_t chain_verify(void *user_ctx, const fp_anchor_commitment_t *c) {
@@ -501,7 +672,13 @@ static fp_err_t chain_verify(void *user_ctx, const fp_anchor_commitment_t *c) {
         fp_err_t err = http_post_json(ctx->cfg.rpc_url, ctx->cfg.bearer_token, req,
                                       ctx->cfg.io_timeout_ms, &status, resp, sizeof(resp));
         if (err != FP_OK) return err;
-        return (strstr(resp, "\"verified\":true") != NULL) ? FP_OK : FP_ERR_INTEGRITY;
+        const char *res_v = NULL;
+        err = validate_jsonrpc_resp(resp, 2, &res_v);
+        if (err != FP_OK || *res_v != '{') return FP_ERR_INTEGRITY;
+        const char *ver_v = j_find_top_field(res_v, "verified");
+        if (!ver_v || strncmp(ver_v, "true", 4) != 0) return FP_ERR_INTEGRITY;
+        const char *after = j_skip_ws(ver_v + 4);
+        return (*after == ',' || *after == '}') ? FP_OK : FP_ERR_INTEGRITY;
     }
 
     if (ctx->cfg.kind == SF_CHAIN_KERYX) {
@@ -511,7 +688,13 @@ static fp_err_t chain_verify(void *user_ctx, const fp_anchor_commitment_t *c) {
         fp_err_t err = http_post_json(ctx->cfg.rpc_url, ctx->cfg.bearer_token, req,
                                       ctx->cfg.io_timeout_ms, &status, resp, sizeof(resp));
         if (err != FP_OK) return err;
-        return (strstr(resp, "\"anchored\":true") != NULL) ? FP_OK : FP_ERR_INTEGRITY;
+        const char *res_v = NULL;
+        err = validate_jsonrpc_resp(resp, 2, &res_v);
+        if (err != FP_OK || *res_v != '{') return FP_ERR_INTEGRITY;
+        const char *anc_v = j_find_top_field(res_v, "anchored");
+        if (!anc_v || strncmp(anc_v, "true", 4) != 0) return FP_ERR_INTEGRITY;
+        const char *after = j_skip_ws(anc_v + 4);
+        return (*after == ',' || *after == '}') ? FP_OK : FP_ERR_INTEGRITY;
     }
 
     return FP_ERR_INVALID;
@@ -558,8 +741,6 @@ fp_err_t sf_chain_submit_derivation(sf_chain_ctx_t *ctx, const fp_derivation_t *
     err = http_post_json(ctx->cfg.rpc_url, ctx->cfg.bearer_token, req,
                          ctx->cfg.io_timeout_ms, &status, resp, sizeof(resp));
     if (err != FP_OK) return err;
-    if (strstr(resp, "\"error\"") != NULL && strstr(resp, "\"error\":null") == NULL) {
-        return FP_ERR_IO;
-    }
-    return FP_OK;
+    const char *res_v = NULL;
+    return validate_jsonrpc_resp(resp, 3, &res_v);
 }

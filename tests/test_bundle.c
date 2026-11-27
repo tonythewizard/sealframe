@@ -663,6 +663,121 @@ static void test_m4_mixed_rollback_and_sql_namespace_guards(void) {
         printf("[PASS] A7-P0-01/A7-P1-05 (SQL-01/SQL-04): Swapped non-PK columns rejected (SFCS1) & digest distinguishes schema/row shape\n");
     }
 
+    /* A8-P0-01/02/03 & A8-P1-01/02: 8th Audit SQLite Semantics, Legacy Raw Block, Trigger Reject & Atomic Chain Batch */
+    {
+        /* SQL-01 (A8-P0-01): Appendix A trigger side-effect reproducer -> MUST fail closed (FP_ERR_POLICY)! */
+        char ta_p[256], tb_p[256], ttgt[256];
+        snprintf(ta_p, sizeof(ta_p), "%s/trig_a.db", tmp);
+        snprintf(tb_p, sizeof(tb_p), "%s/trig_b.db", tmp);
+        snprintf(ttgt, sizeof(ttgt), "%s/trig_tgt", tmp);
+        fp_sql_ctx_t *dba = NULL, *dbb = NULL;
+        assert(fp_sql_open(ta_p, &dba) == FP_OK && fp_sql_open(tb_p, &dbb) == FP_OK);
+        const char *tschema = "CREATE TABLE kv_t(id INTEGER PRIMARY KEY, val TEXT); CREATE TABLE aux(v TEXT);";
+        assert(fp_sql_exec(dba, tschema) == FP_OK && fp_sql_exec(dbb, tschema) == FP_OK);
+        assert(fp_sql_exec(dbb, "CREATE TRIGGER side_effect AFTER INSERT ON kv_t BEGIN INSERT INTO aux VALUES(new.val); END;") == FP_OK);
+
+        fp_dna_t b_kv_before, b_aux_before, b_kv_after, b_aux_after;
+        assert(fp_sql_state_digest(dbb, "kv_t", &b_kv_before) == FP_OK);
+        assert(fp_sql_state_digest(dbb, "aux", &b_aux_before) == FP_OK);
+
+        uint8_t *tcs = NULL; size_t tcsl = 0;
+        assert(fp_sql_capture_changeset(dba, "kv_t", "INSERT INTO kv_t VALUES(1,'alpha');", &tcs, &tcsl) == FP_OK);
+        /* A8-P1-01 (SQL-05): No-op capture returns FP_ERR_INVALID; capture on table with trigger returns FP_ERR_POLICY & rolls back! */
+        uint8_t *noop_cs = NULL; size_t noop_l = 0;
+        assert(fp_sql_capture_changeset(dba, "kv_t", "DELETE FROM kv_t WHERE id=9999;", &noop_cs, &noop_l) == FP_ERR_INVALID);
+        assert(fp_sql_capture_changeset(dbb, "kv_t", "INSERT INTO kv_t VALUES(2,'boom');", &noop_cs, &noop_l) == FP_ERR_POLICY);
+        assert(fp_sql_state_digest(dbb, "kv_t", &b_kv_after) == FP_OK && fp_dna_equal(&b_kv_before, &b_kv_after));
+        assert(fp_sql_state_digest(dbb, "aux", &b_aux_after) == FP_OK && fp_dna_equal(&b_aux_before, &b_aux_after));
+
+        fp_bundle_t bt;
+        memset(&bt, 0, sizeof(bt));
+        bt.version = 1; bt.entry_count = 1;
+        bt.entries[0].role = FP_ROLE_SQLITE_CHANGESET; bt.entries[0].size = tcsl;
+        snprintf(bt.entries[0].path, sizeof(bt.entries[0].path), "kv_t");
+        assert(fp_store_put_object(store, tcs, tcsl, &bt.entries[0].dna) == FP_OK);
+        fp_dna_t bt_dna;
+        assert(fp_bundle_pack(store, &bt, &bt_dna) == FP_OK);
+
+        /* Apply to DB B with hidden trigger MUST fail closed with zero mutation to kv_t, aux, _fp_progress! */
+        assert(fp_bundle_apply(store, &bt_dna, ttgt, dbb, 1, 0) == FP_ERR_POLICY);
+        assert(fp_sql_state_digest(dbb, "kv_t", &b_kv_after) == FP_OK && fp_dna_equal(&b_kv_before, &b_kv_after));
+        assert(fp_sql_state_digest(dbb, "aux", &b_aux_after) == FP_OK && fp_dna_equal(&b_aux_before, &b_aux_after));
+        uint64_t pseq = 99; char pdna[65];
+        assert(fp_sql_get_progress(dbb, &pseq, pdna) == FP_OK && pseq == 0 && pdna[0] == '\0');
+
+        /* SQL-02 (A8-P0-02): Legacy raw SQLite changeset (stripped of 42B SFCS1 header) MUST be rejected fail-closed! */
+        assert(tcsl > 42u);
+        fp_bundle_t bl;
+        memset(&bl, 0, sizeof(bl));
+        bl.version = 1; bl.entry_count = 1;
+        bl.entries[0].role = FP_ROLE_SQLITE_CHANGESET; bl.entries[0].size = tcsl - 42u;
+        snprintf(bl.entries[0].path, sizeof(bl.entries[0].path), "kv_t");
+        assert(fp_store_put_object(store, tcs + 42u, tcsl - 42u, &bl.entries[0].dna) == FP_OK);
+        free(tcs);
+        fp_dna_t bl_dna;
+        assert(fp_bundle_pack(store, &bl, &bl_dna) == FP_OK);
+        assert(fp_bundle_apply(store, &bl_dna, ttgt, dba, 1, 0) == FP_ERR_POLICY);
+
+        /* SQL-04b (A8-P1-02): COLLATE BINARY vs COLLATE NOCASE MUST produce distinct digests AND fail cross-apply! */
+        char cb1_p[256], cb2_p[256];
+        snprintf(cb1_p, sizeof(cb1_p), "%s/col_bin.db", tmp);
+        snprintf(cb2_p, sizeof(cb2_p), "%s/col_nocase.db", tmp);
+        fp_sql_ctx_t *dcb1 = NULL, *dcb2 = NULL;
+        assert(fp_sql_open(cb1_p, &dcb1) == FP_OK && fp_sql_open(cb2_p, &dcb2) == FP_OK);
+        assert(fp_sql_exec(dcb1, "CREATE TABLE ck(id TEXT PRIMARY KEY, v TEXT);") == FP_OK);
+        assert(fp_sql_exec(dcb2, "CREATE TABLE ck(id TEXT PRIMARY KEY COLLATE NOCASE, v TEXT);") == FP_OK);
+        uint8_t *ccs = NULL; size_t ccsl = 0;
+        assert(fp_sql_capture_changeset(dcb1, "ck", "INSERT INTO ck VALUES('Z','z'),('a','a');", &ccs, &ccsl) == FP_OK);
+        fp_bundle_t bc;
+        memset(&bc, 0, sizeof(bc));
+        bc.version = 1; bc.entry_count = 1;
+        bc.entries[0].role = FP_ROLE_SQLITE_CHANGESET; bc.entries[0].size = ccsl;
+        snprintf(bc.entries[0].path, sizeof(bc.entries[0].path), "ck");
+        assert(fp_store_put_object(store, ccs, ccsl, &bc.entries[0].dna) == FP_OK);
+        free(ccs);
+        fp_dna_t bc_dna;
+        assert(fp_bundle_pack(store, &bc, &bc_dna) == FP_OK);
+        assert(fp_bundle_apply(store, &bc_dna, ttgt, dcb2, 1, 0) == FP_ERR_INTEGRITY);
+        assert(fp_sql_exec(dcb2, "INSERT INTO ck VALUES('Z','z'),('a','a');") == FP_OK);
+        fp_dna_t cd1, cd2;
+        assert(fp_sql_state_digest(dcb1, "ck", &cd1) == FP_OK && fp_sql_state_digest(dcb2, "ck", &cd2) == FP_OK);
+        assert(!fp_dna_equal(&cd1, &cd2));
+
+        /* TX-01 (A8-P0-03): Single-transaction fp_bundle_apply_chain() stages ONLY final gen & commits atomically! */
+        char ch_tgt[256], ch_db_p[256];
+        snprintf(ch_tgt, sizeof(ch_tgt), "%s/chain_tgt", tmp);
+        snprintf(ch_db_p, sizeof(ch_db_p), "%s/chain.db", tmp);
+        fp_sql_ctx_t *ch_db = NULL;
+        assert(fp_sql_open(ch_db_p, &ch_db) == FP_OK);
+        assert(fp_sql_exec(ch_db, "CREATE TABLE kv(k INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+        fp_bundle_step_t csteps[3] = {
+            { b1_dna, 1 },
+            { b2_dna, 2 },
+            { b3_dna, 3 }
+        };
+        assert(fp_bundle_apply_chain(store, csteps, 3, ch_tgt, ch_db) == FP_OK);
+        char g1h[65], g2h[65], g3h[65], gp1[360], gp2[360], gp3[360];
+        fp_hex_encode(b1_dna.bytes, FP_DNA_LEN, g1h);
+        fp_hex_encode(b2_dna.bytes, FP_DNA_LEN, g2h);
+        fp_hex_encode(b3_dna.bytes, FP_DNA_LEN, g3h);
+        snprintf(gp1, sizeof(gp1), "%s/gen/%s", ch_tgt, g1h);
+        snprintf(gp2, sizeof(gp2), "%s/gen/%s", ch_tgt, g2h);
+        snprintf(gp3, sizeof(gp3), "%s/gen/%s", ch_tgt, g3h);
+        struct stat csb;
+        assert(lstat(gp1, &csb) != 0 && lstat(gp2, &csb) != 0 && stat(gp3, &csb) == 0);
+        fp_dna_t ch_dig;
+        assert(fp_sql_state_digest(ch_db, "kv", &ch_dig) == FP_OK && fp_dna_equal(&ch_dig, &dig2));
+        assert(fp_bundle_rollback(store, &b3_dna, NULL, ch_tgt, ch_db) == FP_OK);
+        assert(fp_sql_state_digest(ch_db, "kv", &ch_dig) == FP_OK && fp_dna_equal(&ch_dig, &empty_dig));
+
+        fp_sql_close(ch_db);
+        fp_sql_close(dcb1);
+        fp_sql_close(dcb2);
+        fp_sql_close(dba);
+        fp_sql_close(dbb);
+        printf("[PASS] A8-P0-01/02/03 & A8-P1-01/02: Trigger side-effects, legacy raw, COLLATE mismatch & single-TX batch verified!\n");
+    }
+
     fp_sql_close(src_db);
     fp_sql_close(dst_db);
 }
