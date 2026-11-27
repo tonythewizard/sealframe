@@ -117,6 +117,7 @@ RC_EVIL=$?
 set -e
 test "$RC_EVIL" -ne 0
 block "Rogue-signed firmware rejected fail-closed by edge device -> $OUT_EVIL"
+cp "$WORK/cp/repo/events/1.ev" "$WORK/cp/repo/channels/canary/latest.ev"
 
 # --- SCENE 3: Broken Firmware v2.0.0-bad -> Automatic Rollback ---
 banner "SCENE 3: Validly Signed Broken Update v2.0.0-bad -> Zero-Downtime Auto-Rollback"
@@ -128,12 +129,20 @@ echo "Agent output: $OUT2"
 grep -q "RELEASE=v1.0.0" "$WORK/edge/live/current/app.cfg"
 warn "Downloaded ONLY ~154 B (2 MiB AI model deduplicated!) -> health-check failed -> AUTO-ROLLED BACK to $(tr '\n' ' ' < "$WORK/edge/live/current/app.cfg")"
 
-# --- SCENE 4: 2-of-3 Quorum Approval + Clean Recovery to v3.0.0-fixed ---
-banner "SCENE 4: 2-of-3 Executive Approval Quorum & Clean Recovery to v3.0.0-fixed"
-api_post "/api/v1/approvals" '{"serial":3,"approver":"cto@acme-robotics.eu","reason":"HIL rig verified"}' "$TOKEN" >/dev/null
-ok "Approval 1/2 recorded (cto@acme-robotics.eu)"
-api_post "/api/v1/approvals" '{"serial":3,"approver":"ciso@acme-robotics.eu","reason":"SBOM & CRA check OK"}' "$TOKEN" >/dev/null
-ok "Approval 2/2 recorded (ciso@acme-robotics.eu) -> QUORUM MET"
+# --- SCENE 4: Cryptographic 2-of-2 Ed25519 Quorum Approval + Clean Recovery to v3.0.0-fixed ---
+banner "SCENE 4: Cryptographic Ed25519 Approval Quorum & Clean Recovery to v3.0.0-fixed"
+CTO_PK=$($FP keygen "$WORK/keys/cto.sk" "$WORK/keys/cto.pk" | awk -F= '/^pubkey=/{print $2}')
+CISO_PK=$($FP keygen "$WORK/keys/ciso.sk" "$WORK/keys/ciso.pk" | awk -F= '/^pubkey=/{print $2}')
+api_post "/api/v1/approvers" "{\"approver\":\"cto@acme-robotics.eu\",\"pubkey\":\"$CTO_PK\"}" "$TOKEN" >/dev/null
+api_post "/api/v1/approvers" "{\"approver\":\"ciso@acme-robotics.eu\",\"pubkey\":\"$CISO_PK\"}" "$TOKEN" >/dev/null
+RES_NOQ=$(api_post "/api/v1/channels/canary" '{"serial":3}' "$TOKEN")
+block "Promotion without 2-of-2 Ed25519 quorum blocked -> HTTP $RES_NOQ"
+CTO_SIG=$($FP sign-approval --key "$WORK/keys/cto.sk" --channel canary --serial 3 --event "$WORK/cp/repo/events/3.ev" | sed -n 's/.*signature=\([0-9a-f]\{128\}\).*/\1/p')
+CISO_SIG=$($FP sign-approval --key "$WORK/keys/ciso.sk" --channel canary --serial 3 --event "$WORK/cp/repo/events/3.ev" | sed -n 's/.*signature=\([0-9a-f]\{128\}\).*/\1/p')
+api_post "/api/v1/approvals" "{\"channel\":\"canary\",\"serial\":3,\"approver\":\"cto@acme-robotics.eu\",\"signature\":\"$CTO_SIG\",\"reason\":\"HIL rig verified\"}" "$TOKEN" >/dev/null
+ok "Ed25519 Approval 1/2 verified (cto@acme-robotics.eu)"
+api_post "/api/v1/approvals" "{\"channel\":\"canary\",\"serial\":3,\"approver\":\"ciso@acme-robotics.eu\",\"signature\":\"$CISO_SIG\",\"reason\":\"SBOM & CRA check OK\"}" "$TOKEN" >/dev/null
+ok "Ed25519 Approval 2/2 verified (ciso@acme-robotics.eu) -> QUORUM MET"
 api_post "/api/v1/channels/canary" '{"serial":3}' "$TOKEN" >/dev/null
 
 OUT3=$("$AGENT" --repo "$BASE" --channel canary --device factory-robot-01 \

@@ -473,12 +473,101 @@ static fp_err_t load_and_verify_bundle(const char *store_dir, const fp_dna_t *bu
     return err;
 }
 
+/* --- Persistent Crash-Recovery Transaction Journal (.sf_tx_journal) --- */
+
+static fp_err_t tx_journal_write(const char *target_dir, const char *state,
+                                 uint64_t seq, const char *dna_hex, int has_sql) {
+    if (mkdir_p(target_dir) != FP_OK) return FP_ERR_IO;
+    char tmp[PATH_MAX], dst[PATH_MAX];
+    int n1 = snprintf(tmp, sizeof(tmp), "%s/.sf_tx_journal.tmp.%ld", target_dir, (long)getpid());
+    int n2 = snprintf(dst, sizeof(dst), "%s/.sf_tx_journal", target_dir);
+    if (n1 < 0 || (size_t)n1 >= sizeof(tmp) || n2 < 0 || (size_t)n2 >= sizeof(dst)) {
+        return FP_ERR_BOUNDS;
+    }
+    char line[256];
+    int ln = snprintf(line, sizeof(line), "SFTX1 %s %llu %s %d\n",
+                      state, (unsigned long long)seq, dna_hex, has_sql ? 1 : 0);
+    if (ln <= 0 || (size_t)ln >= sizeof(line)) return FP_ERR_BOUNDS;
+    unlink(tmp);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) return FP_ERR_IO;
+    size_t pos = 0;
+    while (pos < (size_t)ln) {
+        ssize_t w = write(fd, line + pos, (size_t)ln - pos);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            close(fd); unlink(tmp); return FP_ERR_IO;
+        }
+        pos += (size_t)w;
+    }
+    if (fsync(fd) != 0) { close(fd); unlink(tmp); return FP_ERR_IO; }
+    close(fd);
+    if (rename(tmp, dst) != 0) { unlink(tmp); return FP_ERR_IO; }
+    return sync_dir_path(target_dir);
+}
+
+static int tx_journal_read(const char *target_dir, char state_out[32],
+                           uint64_t *seq_out, char dna_out[65], int *has_sql_out) {
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/.sf_tx_journal", target_dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char magic[16], st[32], dna[65];
+    unsigned long long seq = 0;
+    int hsql = 0;
+    int got = fscanf(f, "%15s %31s %llu %64s %d", magic, st, &seq, dna, &hsql);
+    fclose(f);
+    if (got != 5 || strcmp(magic, "SFTX1") != 0 || strlen(dna) != 64u) return 0;
+    snprintf(state_out, 32, "%s", st);
+    *seq_out = (uint64_t)seq;
+    snprintf(dna_out, 65, "%s", dna);
+    *has_sql_out = hsql ? 1 : 0;
+    return 1;
+}
+
+/* Verify whether an already-sealed immutable generation directory has intact files. */
+static int verify_sealed_generation(const fp_bundle_t *b, const char *gen_dir) {
+    char seal[PATH_MAX];
+    int sn = snprintf(seal, sizeof(seal), "%s/.sf_gen_sealed", gen_dir);
+    if (sn < 0 || (size_t)sn >= sizeof(seal)) return 0;
+    struct stat sb;
+    if (lstat(seal, &sb) != 0 || !S_ISREG(sb.st_mode)) return 0;
+    for (uint16_t i = 0; i < b->entry_count; i++) {
+        if (b->entries[i].role != FP_ROLE_FILE) continue;
+        char fpath[PATH_MAX];
+        int fn = snprintf(fpath, sizeof(fpath), "%s/%s", gen_dir, b->entries[i].path);
+        if (fn < 0 || (size_t)fn >= sizeof(fpath)) return 0;
+        if (lstat(fpath, &sb) != 0 || !S_ISREG(sb.st_mode) ||
+            (uint64_t)sb.st_size != b->entries[i].size) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Immutable generation staging: if gen/<dna> is already sealed & verified, never mutate in place.
+ * Otherwise stage into a unique temporary dir, seal it, and atomically rename into gen/<dna>. */
 static fp_err_t stage_bundle_files(const char *store_dir, const fp_bundle_t *b,
                                    const char *target_dir, const char *dna_hex) {
-    char gen_dir[PATH_MAX];
+    char gen_root[PATH_MAX], gen_dir[PATH_MAX], stage_dir[PATH_MAX];
+    int rn = snprintf(gen_root, sizeof(gen_root), "%s/gen", target_dir);
     int gn = snprintf(gen_dir, sizeof(gen_dir), "%s/gen/%s", target_dir, dna_hex);
-    if (gn < 0 || (size_t)gn >= sizeof(gen_dir)) return FP_ERR_BOUNDS;
-    if (mkdir_p(gen_dir) != FP_OK) return FP_ERR_IO;
+    int tn = snprintf(stage_dir, sizeof(stage_dir), "%s/gen/.stage-%s-%ld",
+                      target_dir, dna_hex, (long)getpid());
+    if (rn < 0 || (size_t)rn >= sizeof(gen_root) ||
+        gn < 0 || (size_t)gn >= sizeof(gen_dir) ||
+        tn < 0 || (size_t)tn >= sizeof(stage_dir)) {
+        return FP_ERR_BOUNDS;
+    }
+    if (mkdir_p(gen_root) != FP_OK) return FP_ERR_IO;
+
+    /* Immutable generation fast path: never overwrite an already-sealed active generation! */
+    if (verify_sealed_generation(b, gen_dir)) {
+        return FP_OK;
+    }
+
+    if (mkdir_p(stage_dir) != FP_OK) return FP_ERR_IO;
 
     for (uint16_t i = 0; i < b->entry_count; i++) {
         if (b->entries[i].role != FP_ROLE_FILE) continue;
@@ -490,19 +579,108 @@ static fp_err_t stage_bundle_files(const char *store_dir, const fp_bundle_t *b,
         if (len != b->entries[i].size) { free(data); return FP_ERR_INTEGRITY; }
 
         char fpath[PATH_MAX];
-        int fn = snprintf(fpath, sizeof(fpath), "%s/%s", gen_dir, b->entries[i].path);
+        int fn = snprintf(fpath, sizeof(fpath), "%s/%s", stage_dir, b->entries[i].path);
         if (fn < 0 || (size_t)fn >= sizeof(fpath)) { free(data); return FP_ERR_BOUNDS; }
         err = write_staged_file(fpath, b->entries[i].mode, data, len);
         free(data);
         if (err != FP_OK) return err;
     }
-    return sync_dir_path(gen_dir);
+
+    /* Write generation seal marker before atomic publication */
+    char seal_path[PATH_MAX];
+    int sn = snprintf(seal_path, sizeof(seal_path), "%s/.sf_gen_sealed", stage_dir);
+    if (sn < 0 || (size_t)sn >= sizeof(seal_path)) return FP_ERR_BOUNDS;
+    fp_err_t serr = write_staged_file(seal_path, 0644, (const uint8_t *)dna_hex, strlen(dna_hex));
+    if (serr != FP_OK) return serr;
+    if (sync_dir_path(stage_dir) != FP_OK) return FP_ERR_IO;
+
+    /* Publish generation directory atomically; if a concurrent/prior partial dir exists,
+     * only replace if unsealed (never overwrite a sealed generation). */
+    if (rename(stage_dir, gen_dir) != 0) {
+        if (verify_sealed_generation(b, gen_dir)) {
+            return FP_OK;
+        }
+        /* Move unsealed/stale directory aside then publish cleanly */
+        char stale[PATH_MAX];
+        int stn = snprintf(stale, sizeof(stale), "%s/gen/.stale-%s-%ld",
+                           target_dir, dna_hex, (long)getpid());
+        if (stn < 0 || (size_t)stn >= sizeof(stale)) return FP_ERR_BOUNDS;
+        (void)rename(gen_dir, stale);
+        if (rename(stage_dir, gen_dir) != 0) return FP_ERR_IO;
+    }
+    return sync_dir_path(gen_root);
+}
+
+fp_err_t fp_bundle_recover(const char *store_dir, const char *target_dir,
+                           fp_sql_ctx_t *sql_ctx) {
+    if (!store_dir || !target_dir) return FP_ERR_INVALID;
+    char state[32], dna_hex[65];
+    uint64_t jseq = 0;
+    int has_sql = 0;
+    if (!tx_journal_read(target_dir, state, &jseq, dna_hex, &has_sql)) {
+        return FP_OK; /* No pending journal */
+    }
+    if (strcmp(state, "COMMITTED") == 0) {
+        return FP_OK;
+    }
+    if (strcmp(state, "ACTIVATION_PENDING") == 0) {
+        int db_committed = 0;
+        if (has_sql) {
+            if (!sql_ctx) return FP_ERR_INVALID;
+            uint64_t cur_seq = 0;
+            char cur_dna[65];
+            fp_err_t err = read_progress(sql_ctx, &cur_seq, cur_dna);
+            if (err != FP_OK) return err;
+            if (cur_seq == jseq && strcmp(cur_dna, dna_hex) == 0) {
+                db_committed = 1;
+            }
+        }
+        if (db_committed) {
+            /* SQLite already committed before crash: complete forward activation deterministically! */
+            char gen_dir[PATH_MAX], rel[128];
+            int gn = snprintf(gen_dir, sizeof(gen_dir), "%s/gen/%s", target_dir, dna_hex);
+            if (gn < 0 || (size_t)gn >= sizeof(gen_dir)) return FP_ERR_BOUNDS;
+            fp_dna_t bdna;
+            if (fp_hex_decode(dna_hex, bdna.bytes, FP_DNA_LEN) != FP_OK) return FP_ERR_INTEGRITY;
+            fp_bundle_t b;
+            fp_err_t err = load_and_verify_bundle(store_dir, &bdna, &b);
+            if (err != FP_OK) return err;
+            if (!verify_sealed_generation(&b, gen_dir)) {
+                err = stage_bundle_files(store_dir, &b, target_dir, dna_hex);
+                if (err != FP_OK) return err;
+            }
+            snprintf(rel, sizeof(rel), "gen/%s", dna_hex);
+            err = atomic_flip_current(target_dir, rel);
+            if (err != FP_OK) return err;
+            return tx_journal_write(target_dir, "COMMITTED", jseq, dna_hex, has_sql);
+        }
+        /* Interrupted BEFORE SQLite commit (or non-SQL before flip): abort pending intent cleanly */
+        char jpath[PATH_MAX];
+        int jn = snprintf(jpath, sizeof(jpath), "%s/.sf_tx_journal", target_dir);
+        if (jn > 0 && (size_t)jn < sizeof(jpath)) {
+            unlink(jpath);
+            (void)sync_dir_path(target_dir);
+        }
+        return FP_OK;
+    }
+    /* STAGING or unknown incomplete intent: clean up journal marker safely */
+    char jpath[PATH_MAX];
+    int jn = snprintf(jpath, sizeof(jpath), "%s/.sf_tx_journal", target_dir);
+    if (jn > 0 && (size_t)jn < sizeof(jpath)) {
+        unlink(jpath);
+        (void)sync_dir_path(target_dir);
+    }
+    return FP_OK;
 }
 
 fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
                          const char *target_dir, fp_sql_ctx_t *sql_ctx,
-                         uint64_t expected_seq, int fault_sigkill_before_commit) {
+                         uint64_t expected_seq, int fault_mode) {
     if (!store_dir || !bundle_dna || !target_dir) return FP_ERR_INVALID;
+
+    /* Reconcile any prior interrupted transaction deterministically before starting */
+    fp_err_t rec_err = fp_bundle_recover(store_dir, target_dir, sql_ctx);
+    if (rec_err != FP_OK) return rec_err;
 
     fp_bundle_t b;
     fp_err_t err = load_and_verify_bundle(store_dir, bundle_dna, &b);
@@ -534,12 +712,34 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
     char dna_hex[65];
     fp_hex_encode(bundle_dna->bytes, FP_DNA_LEN, dna_hex);
 
-    /* Stage all files into isolated generation dir (does NOT touch live `current` yet!) */
+    /* Check SQLite progress BEFORE staging so an already-committed generation is never re-staged */
+    int sql_already_committed = 0;
+    if (has_sql) {
+        uint64_t cur_seq = 0;
+        char cur_dna[65];
+        err = read_progress(sql_ctx, &cur_seq, cur_dna);
+        if (err != FP_OK) goto cleanup;
+        if (cur_seq == expected_seq && strcmp(cur_dna, dna_hex) == 0) {
+            sql_already_committed = 1;
+        } else if (expected_seq <= cur_seq) {
+            err = FP_ERR_CHAIN;
+            goto cleanup;
+        }
+    }
+
+    /* Record STAGING intent and publish immutable sealed generation dir (does NOT touch `current`!) */
+    err = tx_journal_write(target_dir, "STAGING", expected_seq, dna_hex, has_sql);
+    if (err != FP_OK) goto cleanup;
+
     err = stage_bundle_files(store_dir, &b, target_dir, dna_hex);
     if (err != FP_OK) goto cleanup;
 
+    /* Persist ACTIVATION_PENDING journal BEFORE SQLite COMMIT so any crash after COMMIT recovers forward */
+    err = tx_journal_write(target_dir, "ACTIVATION_PENDING", expected_seq, dna_hex, has_sql);
+    if (err != FP_OK) goto cleanup;
+
     /* Apply SQLite changesets in ONE atomic WAL transaction */
-    if (has_sql) {
+    if (has_sql && !sql_already_committed) {
         if (sqlite3_exec(sql_ctx->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
             err = FP_ERR_IO;
             goto cleanup;
@@ -549,7 +749,6 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
         err = read_progress(sql_ctx, &cur_seq, cur_dna);
         if (err == FP_OK) {
             if (cur_seq == expected_seq && strcmp(cur_dna, dna_hex) == 0) {
-                /* Already committed cleanly before a prior crash: idempotent resume! */
                 (void)sqlite3_exec(sql_ctx->db, "ROLLBACK", NULL, NULL, NULL);
             } else if (expected_seq <= cur_seq) {
                 (void)sqlite3_exec(sql_ctx->db, "ROLLBACK", NULL, NULL, NULL);
@@ -565,8 +764,8 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
                 if (err == FP_OK) {
                     err = write_progress(sql_ctx, expected_seq, dna_hex);
                 }
-                if (err == FP_OK && fault_sigkill_before_commit) {
-                    raise(SIGKILL); /* Abrupt OS process kill BEFORE COMMIT! */
+                if (err == FP_OK && fault_mode == 1) {
+                    raise(SIGKILL); /* Fault 1: OS SIGKILL BEFORE SQLite COMMIT */
                 }
                 if (err == FP_OK) {
                     if (sqlite3_exec(sql_ctx->db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
@@ -582,10 +781,21 @@ fp_err_t fp_bundle_apply(const char *store_dir, const fp_dna_t *bundle_dna,
         if (err != FP_OK) goto cleanup;
     }
 
+    if (fault_mode == 2) {
+        raise(SIGKILL); /* Fault 2: OS SIGKILL AFTER SQLite COMMIT, BEFORE `current` symlink flip */
+    }
+
     /* Atomic POSIX symlink flip: activates the new generation in 1 atomic operation */
     char rel[128];
     snprintf(rel, sizeof(rel), "gen/%s", dna_hex);
     err = atomic_flip_current(target_dir, rel);
+    if (err != FP_OK) goto cleanup;
+
+    if (fault_mode == 3) {
+        raise(SIGKILL); /* Fault 3: OS SIGKILL AFTER `current` flip, BEFORE journal COMMITTED */
+    }
+
+    err = tx_journal_write(target_dir, "COMMITTED", expected_seq, dna_hex, has_sql);
 
 cleanup:
     for (uint16_t i = 0; i < FP_BUNDLE_MAX_ENTRIES; i++) free(cs_blobs[i]);
@@ -665,5 +875,14 @@ fp_err_t fp_bundle_rollback(const char *store_dir,
 
     char rel[128];
     snprintf(rel, sizeof(rel), "gen/%s", prev_hex);
-    return atomic_flip_current(target_dir, rel);
+    err = atomic_flip_current(target_dir, rel);
+    if (err == FP_OK) {
+        uint64_t done_seq = 0;
+        if (has_sql && sql_ctx) {
+            char tmp_dna[65];
+            (void)read_progress(sql_ctx, &done_seq, tmp_dna);
+        }
+        err = tx_journal_write(target_dir, "COMMITTED", done_seq, prev_hex, has_sql);
+    }
+    return err;
 }

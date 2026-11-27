@@ -25,7 +25,19 @@ static void fill_prng(uint8_t *buf, size_t len, uint64_t seed) {
     }
 }
 
-/* Chaos 1: 10 consecutive OS SIGKILL crashes during composite bundle apply */
+static void assert_current_state_text(const char *target_dir, const char *expected) {
+    char p[512];
+    snprintf(p, sizeof(p), "%s/current/state.txt", target_dir);
+    FILE *f = fopen(p, "rb");
+    assert(f != NULL);
+    char buf[128];
+    size_t n = fread(buf, 1, sizeof(buf) - 1u, f);
+    fclose(f);
+    buf[n] = '\0';
+    assert(strcmp(buf, expected) == 0);
+}
+
+/* Chaos 1: 12 consecutive OS SIGKILL crashes across ALL 3 transactional commit boundaries */
 static void chaos_repeated_sigkill_bundles(void) {
     char dt[] = "/tmp/fp-ch-kill-XXXXXX";
     char *dir = mkdtemp(dt);
@@ -46,8 +58,10 @@ static void chaos_repeated_sigkill_bundles(void) {
 
     fp_dna_t expected_sql_state;
     assert(fp_sql_state_digest(sdb, "ledger", &expected_sql_state) == FP_OK);
+    char prev_payload[128] = "";
 
-    for (int round = 1; round <= 10; round++) {
+    for (int round = 1; round <= 12; round++) {
+        int fault_mode = ((round - 1) % 3) + 1; /* cycles 1=pre-COMMIT, 2=post-COMMIT/pre-flip, 3=post-flip */
         char sql[128], payload[128];
         snprintf(sql, sizeof(sql), "INSERT INTO ledger VALUES (%d, 'round-%d');", round, round);
         snprintf(payload, sizeof(payload), "binary-generation-%d", round);
@@ -71,36 +85,61 @@ static void chaos_repeated_sigkill_bundles(void) {
         fp_dna_t bdna;
         assert(fp_bundle_pack(store, &b, &bdna) == FP_OK);
 
-        /* Close DB, fork child, inject SIGKILL right before COMMIT! */
+        /* Close DB, fork child, inject SIGKILL at boundary fault_mode (1, 2, or 3)! */
         fp_sql_close(ddb); ddb = NULL;
         pid_t pid = fork();
         assert(pid >= 0);
         if (pid == 0) {
             fp_sql_ctx_t *cdb = NULL;
             if (fp_sql_open(ddb_p, &cdb) != FP_OK) _exit(2);
-            (void)fp_bundle_apply(store, &bdna, target, cdb, (uint64_t)round, 1);
+            (void)fp_bundle_apply(store, &bdna, target, cdb, (uint64_t)round, fault_mode);
             _exit(3);
         }
         int ws = 0;
         assert(waitpid(pid, &ws, 0) == pid);
         assert(WIFSIGNALED(ws) && WTERMSIG(ws) == SIGKILL);
 
-        /* Reopen & confirm ZERO partial DB corruption */
         assert(fp_sql_open(ddb_p, &ddb) == FP_OK);
         fp_dna_t after_kill;
         assert(fp_sql_state_digest(ddb, "ledger", &after_kill) == FP_OK);
-        assert(fp_dna_equal(&after_kill, &expected_sql_state));
 
-        /* Now apply cleanly and verify state advances identically */
-        assert(fp_bundle_apply(store, &bdna, target, ddb, (uint64_t)round, 0) == FP_OK);
+        if (fault_mode == 1) {
+            /* Killed BEFORE SQLite COMMIT: DB & live files must still match previous generation */
+            assert(fp_dna_equal(&after_kill, &expected_sql_state));
+            if (prev_payload[0]) assert_current_state_text(target, prev_payload);
+            assert(fp_bundle_recover(store, target, ddb) == FP_OK);
+            assert(fp_sql_state_digest(ddb, "ledger", &after_kill) == FP_OK);
+            assert(fp_dna_equal(&after_kill, &expected_sql_state));
+            /* Retry apply cleanly */
+            assert(fp_bundle_apply(store, &bdna, target, ddb, (uint64_t)round, 0) == FP_OK);
+        } else if (fault_mode == 2) {
+            /* Killed AFTER SQLite COMMIT, BEFORE `current` symlink flip!
+             * DB has committed new_sql_state while `current` still points to prev_payload.
+             * fp_bundle_recover() MUST reconcile `current` forward to the new generation! */
+            assert(fp_dna_equal(&after_kill, &new_sql_state));
+            if (prev_payload[0]) assert_current_state_text(target, prev_payload);
+            assert(fp_bundle_recover(store, target, ddb) == FP_OK);
+            assert_current_state_text(target, payload);
+            /* Re-invoking apply for the already-committed round must be idempotent */
+            assert(fp_bundle_apply(store, &bdna, target, ddb, (uint64_t)round, 0) == FP_OK);
+        } else {
+            /* Killed AFTER `current` symlink flip, BEFORE journal COMMITTED */
+            assert(fp_dna_equal(&after_kill, &new_sql_state));
+            assert_current_state_text(target, payload);
+            assert(fp_bundle_recover(store, target, ddb) == FP_OK);
+            assert(fp_bundle_apply(store, &bdna, target, ddb, (uint64_t)round, 0) == FP_OK);
+        }
+
         assert(fp_sql_state_digest(ddb, "ledger", &after_kill) == FP_OK);
         assert(fp_dna_equal(&after_kill, &new_sql_state));
+        assert_current_state_text(target, payload);
         expected_sql_state = new_sql_state;
+        snprintf(prev_payload, sizeof(prev_payload), "%s", payload);
     }
 
     fp_sql_close(sdb);
     fp_sql_close(ddb);
-    printf("[PASS] Chaos 1: 10 consecutive OS SIGKILL crashes during composite apply -> 0 corrupt states\n");
+    printf("[PASS] Chaos 1: 12 consecutive OS SIGKILL crashes across ALL 3 commit boundaries (pre-COMMIT, post-COMMIT/pre-flip, post-flip) -> 0 split-brain / 0 corrupt states\n");
 }
 
 /* Chaos 2: 4-stage multi-drop TCP blackout resume (drops at chunks 5, 17, 41, then finishes 64) */

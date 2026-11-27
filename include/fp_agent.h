@@ -42,11 +42,13 @@ void fp_http_resp_free(fp_http_resp_t *resp);
 /* --- Edge Agent Core (Multi-Sig + Hybrid LAN FP-NET/HTTP + Health-Check + Auto-Rollback) --- */
 
 typedef enum {
-    FP_AGENT_UP_TO_DATE   = 0,
-    FP_AGENT_UPDATED      = 1,
-    FP_AGENT_ROLLED_BACK  = 2,
-    FP_AGENT_REVOKED      = 3,
-    FP_AGENT_REJECTED     = 4
+    FP_AGENT_UP_TO_DATE             = 0,
+    FP_AGENT_UPDATED                = 1,
+    FP_AGENT_ROLLED_BACK            = 2,
+    FP_AGENT_REVOKED                = 3,
+    FP_AGENT_REJECTED               = 4,
+    FP_AGENT_ROLLBACK_FAILED        = 5,
+    FP_AGENT_INITIAL_INSTALL_FAILED = 6
 } fp_agent_outcome_t;
 
 typedef struct {

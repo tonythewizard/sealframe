@@ -32,13 +32,13 @@ jobs:
           ./bin/sf-llama-bridge --selftest --transport udp --cast int8 --fec auto --logits-topk 64 --drop 2
           ./bin/sf-llama-bridge --selftest --transport udp --cast int4o --fec auto --logits-topk 64 --drop 2
 
-      - name: AddressSanitizer + UBSan verification (GCC)
+      - name: AddressSanitizer + UBSan verification (GCC, all 11 suites)
         if: matrix.compiler == 'gcc'
         run: |
           make clean
-          make CC=gcc CFLAGS="-std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Werror -pedantic -Iinclude -Ithird_party/blake3 -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0" \
+          make CC=gcc CFLAGS="-std=c11 -O1 -g -fPIC -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Werror -pedantic -Iinclude -Ithird_party/blake3 -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0" \
                LDFLAGS="-fsanitize=address,undefined -lsodium -lzstd -lsqlite3 -lpthread -lm" \
-               build/test_particle build/test_net build/test_cdc build/test_bundle build/test_trust build/test_swarm build/test_chain_adapters build/test_split_shim
-          for t in build/test_particle build/test_net build/test_cdc build/test_bundle build/test_trust build/test_swarm build/test_chain_adapters build/test_split_shim; do
+               all build/test_particle build/test_net build/test_cdc build/test_bundle build/test_trust build/test_swarm build/test_agent build/test_chaos build/test_chain_adapters build/test_split_shim build/test_redteam
+          for t in build/test_particle build/test_net build/test_cdc build/test_bundle build/test_trust build/test_swarm build/test_agent build/test_chaos build/test_chain_adapters build/test_split_shim build/test_redteam; do
             ./"$t"
           done

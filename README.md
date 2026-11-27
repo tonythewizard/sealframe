@@ -5,13 +5,13 @@
 <h1 align="center">SealFrame™ (<code>sf</code>) — v0.6.0</h1>
 
 <p align="center">
-  <strong>Zero-Brick Verified File/OTA Delivery &amp; Distributed AI WAN Acceleration — 100% Pure ISO C11.</strong>
+  <strong>Crash-Safe Verified File/OTA Delivery &amp; Distributed AI WAN Acceleration — Pure C11 (POSIX/Linux).</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/tonythewizard/sealframe/actions/workflows/ci.yml"><img src="https://github.com/tonythewizard/sealframe/actions/workflows/ci.yml/badge.svg" alt="CI Status" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0%20%2F%20Commercial-blue.svg" alt="Dual License" /></a>
-  <img src="https://img.shields.io/badge/ISO-C11%20Pure-00599C.svg" alt="Pure ISO C11" />
+  <img src="https://img.shields.io/badge/C11-POSIX%20%2F%20Linux-00599C.svg" alt="C11 POSIX/Linux" />
   <img src="https://img.shields.io/badge/EU%20CRA-Ready-2ea44f.svg" alt="EU CRA Ready" />
 </p>
 
@@ -19,13 +19,13 @@
 
 ### Why SealFrame™?
 
-#### 1. Unbrickable, Crash-Safe & Zero-Trust File / OTA Delivery
-- **Anti-Brick & Anti-Shutdown (`SIGKILL` / Power-Loss Resilient):** Atomic commits across **Files + AI Models + SQLite WAL** (`flock` + `fsync` + atomic `rename`), exact Merkle chunk resume after abrupt shutdowns, and automatic health-watchdog rollback that bit-exact inverts both files and SQLite rows (`0` corrupt states across 10 consecutive OS `SIGKILL` chaos tests).
-- **Cryptographic Zero-Trust & Anti-Byzantine:** Every 16 KiB chunk is verified inline with **BLAKE3 Merkle proofs** (1-bit in-flight tamper or silent disk bit-rot rejected fail-closed), protected by **2-of-3 Ed25519 Root Multi-Sig** with monotonic revocation, over **1-RTT X25519 + XChaCha20-Poly1305** encrypted TCP/UDP (`FP-UDP1` survives **25% packet loss + live IP/NAT migration**; poisoned swarm peers are banned on the first bad chunk).
-- **Extreme Efficiency & Tiny Footprint:** Pure ISO C11 (zero Python, zero C++, zero OpenSSL, zero `libcurl`; ~150–210 KB binaries, **5.86 MiB RSS** serving 512 MiB on 256 MiB RAM hardware), `-99.8%` FastCDC/delta patches (**22× faster & 147× fewer bytes** than `rsync`).
+#### 1. Crash-Safe Atomic & Zero-Trust File / OTA Delivery
+- **Crash-Safe Atomic Commits & Auto-Rollback (`SIGKILL`-Resilient):** Transactional commits across **Files + AI Models + SQLite WAL** (`flock` + `fsync` + atomic `rename` + persistent `.sf_tx_journal` + immutable sealed generations), exact Merkle chunk resume after abrupt shutdowns, and automatic health-watchdog rollback that bit-exact inverts both files and SQLite rows (`0` split-brain or corrupt states across 12 consecutive multi-boundary OS `SIGKILL` chaos tests).
+- **Cryptographic Zero-Trust & Anti-Byzantine:** Every 16 KiB chunk is verified inline with **BLAKE3 Merkle proofs** (1-bit in-flight tamper or silent disk bit-rot rejected fail-closed), protected by **2-of-3 Ed25519 Root Multi-Sig** with monotonic revocation & target deactivation, Ed25519 device enrollment/pinning with replay protection, cryptographic 2-of-N approver quorum, over **1-RTT X25519 + XChaCha20-Poly1305** encrypted TCP/UDP (`FP-UDP1` survives **25% packet loss + live IP/NAT migration**; poisoned swarm peers are banned on the first bad chunk).
+- **Extreme Efficiency & Tiny Footprint:** C11 (POSIX/Linux) — zero Python, zero C++, zero OpenSSL, zero `libcurl`; ~150–210 KB binaries, **5.86 MiB RSS** serving 512 MiB on 256 MiB RAM hardware, `-99.8%` FastCDC/delta patches (**22× faster & 147× fewer bytes** than `rsync`).
 
 #### 2. Distributed Split-Model AI Inference over WAN (Drop-In)
-- **`sf-llama-bridge`** transparently accelerates `llama.cpp` (`ggml-rpc`) across slow, lossy residential/cross-country links: **up to `-97.5%` wire reduction**, encrypted `FP-UDP1` + adaptive 0-RTT XOR FEC, outlier-safe wire codecs (`BF16`/`INT8*`/`INT4+Outlier`), exact FP32 Top-K logits, and 0-RTT control pipelining.
+- **`sf-llama-bridge`** transparently accelerates `llama.cpp` (`ggml-rpc`) across slow, lossy residential/cross-country links: **up to `-97.5%` wire reduction**, encrypted `FP-UDP1` + adaptive 0-RTT XOR FEC, outlier-safe wire codecs (`BF16`/`INT8*`/`INT4+Outlier`), sparse FP32 Top-K logits transport (exact for greedy / top-k ≤ K), and 0-RTT control pipelining.
 - **6-Shard / 6-Country WAN-Emulated A/B (`570 ms` cumulative RTT):** **`4.2×`** serial speedup on `Qwen3.5-9B` (`0.33 → 1.38 tok/s`), up to **`10.4×–13.2×`** with a local coordinator draft on `Qwen3-8B` (**`2.73–3.45 tok/s`** median, peak **`9.41 tok/s`**), cutting per-request prompt overhead from `~55 s` down to **`3–5 s`**.
 
 > **Dual-Licensed:** Open-source under **GNU AGPL-3.0** ([`LICENSE`](LICENSE)) and available under a **Commercial License** ([`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md)) for proprietary/OEM embedding, SaaS/cloud deployments, and EU CRA LTS support. Contact: **`tonyswagcard@gmail.com`**.
@@ -36,10 +36,10 @@
 
 | Binary / Artifact | Purpose |
 | :--- | :--- |
-| **`bin/sf`** | Core CLI: BLAKE3 16 KiB Merkle DNA, Morph (`RAW`/`ZSTD`/`DELTA`/`REF`/`COMPUTE`), FastCDC O(1)-RAM pool, `FPB1` atomic File+SQLite bundles, `FPR1` 2-of-3 TUF Root Multi-Sig, `FP-NET` TCP & `FP-UDP1` encrypted transport, anti-Byzantine Swarm. |
-| **`bin/sf-agent`** | Hardened Edge OTA daemon (`systemd` ready): hybrid LAN `FP-NET` + HTTP/1.1 `206` Range resume, health watchdog, automatic crash-safe File + SQLite WAL rollback (`sqlite3changeset_invert`), Ed25519 heartbeats. |
-| **`bin/sf-cp`** | Pure-C11 On-Prem Control Plane (~4 MiB RSS): Ed25519 fleet telemetry, 2-of-3 approval workflow, EU CRA JSON/HTML audit endpoints. |
-| **`bin/sf-llama-bridge`** | Transparent `llama.cpp` (`ggml-rpc`) WAN accelerator: `FP-UDP1` + Adaptive 0-RTT XOR FEC, `SFT1` wire quantization (`BF16`/`FP16`/outlier-safe `INT8`/`INT4+Outlier`), batched exact FP32 Top-K logits, BLAKE3 DNA dedup, Zstd + zero-block compression, 0-RTT void-command pipelining, and pointer-independent `GET_ALLOC_SIZE` cache. |
+| **`bin/sf`** | Core CLI: BLAKE3 16 KiB Merkle DNA (`O(N / 16 KiB)` tree), Morph (`RAW`/`ZSTD`/`DELTA`/`REF`/`COMPUTE`), FastCDC streaming chunker (`O(1)` chunker RAM), `FPB1` atomic File+SQLite bundles, `FPR1` 2-of-3 TUF Root Multi-Sig, `FP-NET` TCP & `FP-UDP1` encrypted transport, anti-Byzantine Swarm. |
+| **`bin/sf-agent`** | Hardened Edge OTA daemon (`systemd` ready): hybrid LAN `FP-NET` + HTTP/1.1 `206` Range resume, crash-recovery journal, health watchdog, automatic File + SQLite WAL rollback (`sqlite3changeset_invert`), physical revoke deactivation, monotonic Ed25519 heartbeats. |
+| **`bin/sf-cp`** | Pure-C11 On-Prem Control Plane (~4 MiB RSS): Ed25519 device enrollment/key-pinning + anti-replay telemetry, cryptographic 2-of-N Ed25519 approval quorum enforcement, monotonic rollout/rollback, EU CRA JSON/HTML audit endpoints. |
+| **`bin/sf-llama-bridge`** | Transparent `llama.cpp` (`ggml-rpc`) WAN accelerator: `FP-UDP1` + Adaptive 0-RTT XOR FEC, `SFT1` wire quantization (`BF16`/`FP16`/outlier-safe `INT8`/`INT4+Outlier`), batched sparse FP32 Top-K logits, BLAKE3 DNA dedup, Zstd + zero-block compression, 0-RTT void-command pipelining, and pointer-independent `GET_ALLOC_SIZE` cache. |
 | **`libsealframe.a` / `.so`** | C11 SDK (`sealframe.h`, `sealframe_agent.h`, `sealframe_split.h`, `sealframe_chain.h`) + multi-chain anchoring adapters (Generic JSON-RPC 2.0, EVM Keccak-256/ABI, Solana Anchor/Borsh, Keryx OPoI Phase-2 + RFC 6455 WebSocket). |
 
 ---
