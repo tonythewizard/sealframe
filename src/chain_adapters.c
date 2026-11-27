@@ -1,5 +1,5 @@
 /*
- * SealFrame Blockchain Anchor Adapters (Generic JSON-RPC 2.0, EVM, Solana, Keryx BlockDAG/OPoI)
+ * SealFrame Anchor Adapters (Generic JSON-RPC 2.0 & Keryx BlockDAG/OPoI)
  * 100% Pure ISO C11 — Zero Python, Zero C++, Zero OpenSSL, Zero libcurl.
  */
 #define _POSIX_C_SOURCE 200809L
@@ -21,160 +21,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-/* ==================== 1. Pure-C11 Ethereum Keccak-256 ==================== */
-
-static uint64_t rotl64(uint64_t x, unsigned n) {
-    return (x << n) | (x >> (64u - n));
-}
-
-static void keccak_f1600(uint64_t st[25]) {
-    static const uint64_t RC[24] = {
-        UINT64_C(0x0000000000000001), UINT64_C(0x0000000000008082),
-        UINT64_C(0x800000000000808a), UINT64_C(0x8000000080008000),
-        UINT64_C(0x000000000000808b), UINT64_C(0x0000000080000001),
-        UINT64_C(0x8000000080008081), UINT64_C(0x8000000000008009),
-        UINT64_C(0x000000000000008a), UINT64_C(0x0000000000000088),
-        UINT64_C(0x0000000080008009), UINT64_C(0x000000008000000a),
-        UINT64_C(0x000000008000808b), UINT64_C(0x800000000000008b),
-        UINT64_C(0x8000000000008089), UINT64_C(0x8000000000008003),
-        UINT64_C(0x8000000000008002), UINT64_C(0x8000000000000080),
-        UINT64_C(0x000000000000800a), UINT64_C(0x800000008000000a),
-        UINT64_C(0x8000000080008081), UINT64_C(0x8000000000008080),
-        UINT64_C(0x0000000080000001), UINT64_C(0x8000000080008008)
-    };
-    static const unsigned RHO[24] = {
-        1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14,
-        27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44
-    };
-    static const unsigned PIL[24] = {
-        10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4,
-        15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1
-    };
-
-    for (int round = 0; round < 24; round++) {
-        uint64_t bc[5];
-        for (int i = 0; i < 5; i++)
-            bc[i] = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20];
-        for (int i = 0; i < 5; i++) {
-            uint64_t t = bc[(i + 4) % 5] ^ rotl64(bc[(i + 1) % 5], 1u);
-            for (int j = 0; j < 25; j += 5) st[j + i] ^= t;
-        }
-        uint64_t t = st[1];
-        for (int i = 0; i < 24; i++) {
-            unsigned j = PIL[i];
-            uint64_t tmp = st[j];
-            st[j] = rotl64(t, RHO[i]);
-            t = tmp;
-        }
-        for (int j = 0; j < 25; j += 5) {
-            for (int i = 0; i < 5; i++) bc[i] = st[j + i];
-            for (int i = 0; i < 5; i++) st[j + i] ^= (~bc[(i + 1) % 5]) & bc[(i + 2) % 5];
-        }
-        st[0] ^= RC[round];
-    }
-}
-
-void sf_keccak256(const uint8_t *data, size_t len, uint8_t out[32]) {
-    uint64_t st[25];
-    memset(st, 0, sizeof(st));
-    const size_t rate = 136u;
-    uint8_t block[136];
-    size_t off = 0;
-
-    while (len - off >= rate) {
-        for (size_t i = 0; i < rate / 8u; i++) {
-            uint64_t v = 0;
-            for (int b = 0; b < 8; b++) v |= ((uint64_t)data[off + i * 8u + (size_t)b]) << (b * 8);
-            st[i] ^= v;
-        }
-        keccak_f1600(st);
-        off += rate;
-    }
-    memset(block, 0, sizeof(block));
-    size_t rem = len - off;
-    if (rem > 0) memcpy(block, data + off, rem);
-    block[rem] ^= 0x01u; /* Ethereum Keccak-256 domain padding */
-    block[rate - 1u] ^= 0x80u;
-    for (size_t i = 0; i < rate / 8u; i++) {
-        uint64_t v = 0;
-        for (int b = 0; b < 8; b++) v |= ((uint64_t)block[i * 8u + (size_t)b]) << (b * 8);
-        st[i] ^= v;
-    }
-    keccak_f1600(st);
-
-    for (size_t i = 0; i < 4u; i++) {
-        for (int b = 0; b < 8; b++) out[i * 8u + (size_t)b] = (uint8_t)(st[i] >> (b * 8));
-    }
-}
-
-void sf_evm_selector(const char *signature, uint8_t out[4]) {
-    uint8_t h[32];
-    sf_keccak256((const uint8_t *)signature, strlen(signature), h);
-    memcpy(out, h, 4);
-}
-
-void sf_evm_encode_anchor(const fp_anchor_commitment_t *c, uint8_t out[100]) {
-    memset(out, 0, 100);
-    sf_evm_selector("anchor(bytes32,bytes32,uint64)", out);
-    memcpy(out + 4,  c->commitment.bytes, 32);
-    memcpy(out + 36, c->target_dna.bytes, 32);
-    /* uint64 big-endian right-aligned in 32-byte ABI slot [68..100) */
-    uint64_t s = c->serial;
-    for (int i = 0; i < 8; i++) out[99 - i] = (uint8_t)(s >> (i * 8));
-}
-
-void sf_evm_encode_is_anchored(const fp_dna_t *commitment, uint8_t out[36]) {
-    sf_evm_selector("isAnchored(bytes32)", out);
-    memcpy(out + 4, commitment->bytes, 32);
-}
-
-/* ==================== 2. Solana Encoders (Anchor + Borsh + Base58/64) ==================== */
-
-void sf_solana_encode_anchor_ix(const fp_anchor_commitment_t *c, uint8_t out[144]) {
-    /* Anchor 8-byte discriminator = SHA-256("global:anchor_commitment")[0..8] */
-    const char *disc_src = "global:anchor_commitment";
-    uint8_t h[crypto_hash_sha256_BYTES];
-    crypto_hash_sha256(h, (const uint8_t *)disc_src, (unsigned long long)strlen(disc_src));
-    memcpy(out, h, 8);
-    /* Borsh layout: repo_id[32] | serial(u64 LE) | event_hash[32] | target_dna[32] | commitment[32] */
-    memcpy(out + 8, c->repo_id.bytes, 32);
-    for (int i = 0; i < 8; i++) out[40 + i] = (uint8_t)(c->serial >> (i * 8));
-    memcpy(out + 48,  c->event_hash.bytes, 32);
-    memcpy(out + 80,  c->target_dna.bytes, 32);
-    memcpy(out + 112, c->commitment.bytes, 32);
-}
-
-size_t sf_base58_encode(const uint8_t *in, size_t in_len, char *out, size_t out_cap) {
-    static const char ALPH[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    if (!in || !out || out_cap == 0) return 0;
-    size_t zeros = 0;
-    while (zeros < in_len && in[zeros] == 0) zeros++;
-
-    size_t bsize = (in_len - zeros) * 138u / 100u + 1u;
-    uint8_t *buf = calloc(bsize > 0 ? bsize : 1u, 1u);
-    if (!buf) return 0;
-    size_t length = 0;
-    for (size_t i = zeros; i < in_len; i++) {
-        uint32_t carry = in[i];
-        size_t j = 0;
-        for (size_t k = bsize; (carry != 0 || j < length) && k > 0; k--, j++) {
-            carry += 256u * (uint32_t)buf[k - 1u];
-            buf[k - 1u] = (uint8_t)(carry % 58u);
-            carry /= 58u;
-        }
-        length = j;
-    }
-    size_t it = bsize - length;
-    while (it < bsize && buf[it] == 0) it++;
-    size_t need = zeros + (bsize - it);
-    if (need + 1u > out_cap) { free(buf); return 0; }
-    size_t pos = 0;
-    for (size_t i = 0; i < zeros; i++) out[pos++] = '1';
-    while (it < bsize) out[pos++] = ALPH[buf[it++]];
-    out[pos] = '\0';
-    free(buf);
-    return pos;
-}
+/* ==================== 1. Base64 Helper (RFC 6455 WebSocket Key) ==================== */
 
 size_t sf_base64_encode(const uint8_t *in, size_t in_len, char *out, size_t out_cap) {
     static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -608,34 +455,6 @@ static fp_err_t chain_publish(void *user_ctx, const fp_anchor_commitment_t *c) {
                  "\"repo_id\":\"%s\",\"serial\":%llu,\"event_hash\":\"%s\","
                  "\"target_dna\":\"%s\",\"commitment\":\"%s\"}}",
                  h_repo, (unsigned long long)c->serial, h_ev, h_tgt, h_comm);
-    } else if (ctx->cfg.kind == SF_CHAIN_EVM) {
-        if (!ctx->cfg.contract_addr) return FP_ERR_INVALID;
-        uint8_t abi[100];
-        char abi_hex[201];
-        sf_evm_encode_anchor(c, abi);
-        fp_hex_encode(abi, sizeof(abi), abi_hex);
-        const char *from = (ctx->cfg.sender_addr && ctx->cfg.sender_addr[0])
-            ? ctx->cfg.sender_addr : "0x0000000000000000000000000000000000000000";
-        snprintf(req, sizeof(req),
-                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_sendTransaction\",\"params\":[{"
-                 "\"from\":\"%s\",\"to\":\"%s\",\"data\":\"0x%s\"}]}",
-                 from, ctx->cfg.contract_addr, abi_hex);
-    } else if (ctx->cfg.kind == SF_CHAIN_SOLANA) {
-        uint8_t ix[144];
-        sf_solana_encode_anchor_ix(c, ix);
-        /* Wire envelope: [sig(64) if signer_kp else 0 | pk(32) | ix(144)] = 240 B -> base64 */
-        uint8_t tx_blob[240];
-        memset(tx_blob, 0, sizeof(tx_blob));
-        if (ctx->cfg.signer_kp) {
-            crypto_sign_ed25519_detached(tx_blob, NULL, ix, sizeof(ix), ctx->cfg.signer_kp->sk);
-            memcpy(tx_blob + 64, ctx->cfg.signer_kp->pk, 32);
-        }
-        memcpy(tx_blob + 96, ix, sizeof(ix));
-        char b64[512];
-        if (sf_base64_encode(tx_blob, sizeof(tx_blob), b64, sizeof(b64)) == 0) return FP_ERR_BOUNDS;
-        snprintf(req, sizeof(req),
-                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"sendTransaction\",\"params\":[\"%s\",{\"encoding\":\"base64\"}]}",
-                 b64);
     } else if (ctx->cfg.kind == SF_CHAIN_KERYX) {
         uint8_t payload[76];
         char p_hex[153], tag_hex[17];
@@ -685,44 +504,6 @@ static fp_err_t chain_verify(void *user_ctx, const fp_anchor_commitment_t *c) {
         return (strstr(resp, "\"verified\":true") != NULL) ? FP_OK : FP_ERR_INTEGRITY;
     }
 
-    if (ctx->cfg.kind == SF_CHAIN_EVM) {
-        if (!ctx->cfg.contract_addr) return FP_ERR_INVALID;
-        uint8_t abi[36];
-        char abi_hex[73];
-        sf_evm_encode_is_anchored(&c->commitment, abi);
-        fp_hex_encode(abi, sizeof(abi), abi_hex);
-        snprintf(req, sizeof(req),
-                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"eth_call\",\"params\":[{"
-                 "\"to\":\"%s\",\"data\":\"0x%s\"},\"latest\"]}",
-                 ctx->cfg.contract_addr, abi_hex);
-        fp_err_t err = http_post_json(ctx->cfg.rpc_url, ctx->cfg.bearer_token, req,
-                                      ctx->cfg.io_timeout_ms, &status, resp, sizeof(resp));
-        if (err != FP_OK) return err;
-        /* EVM bool true = 32-byte word ending in 01 */
-        char res_hex[128];
-        extract_json_str_field(resp, "result", res_hex, sizeof(res_hex));
-        size_t rl = strlen(res_hex);
-        if (rl == 66u && strncmp(res_hex, "0x", 2) == 0 && res_hex[65] == '1') {
-            for (size_t i = 2; i < 65; i++) if (res_hex[i] != '0') return FP_ERR_INTEGRITY;
-            return FP_OK;
-        }
-        return FP_ERR_INTEGRITY;
-    }
-
-    if (ctx->cfg.kind == SF_CHAIN_SOLANA) {
-        char pda_b58[64];
-        if (sf_base58_encode(c->commitment.bytes, 32, pda_b58, sizeof(pda_b58)) == 0) return FP_ERR_BOUNDS;
-        snprintf(req, sizeof(req),
-                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"getAccountInfo\",\"params\":[\"%s\",{\"encoding\":\"base64\"}]}",
-                 pda_b58);
-        fp_err_t err = http_post_json(ctx->cfg.rpc_url, ctx->cfg.bearer_token, req,
-                                      ctx->cfg.io_timeout_ms, &status, resp, sizeof(resp));
-        if (err != FP_OK) return err;
-        char b64_comm[64];
-        sf_base64_encode(c->commitment.bytes, 32, b64_comm, sizeof(b64_comm));
-        return (strstr(resp, b64_comm) != NULL) ? FP_OK : FP_ERR_INTEGRITY;
-    }
-
     if (ctx->cfg.kind == SF_CHAIN_KERYX) {
         snprintf(req, sizeof(req),
                  "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"keryx_verifyAnchor\",\"params\":{"
@@ -739,6 +520,7 @@ static fp_err_t chain_verify(void *user_ctx, const fp_anchor_commitment_t *c) {
 fp_err_t sf_chain_adapter_init(sf_chain_ctx_t *ctx, const sf_chain_cfg_t *cfg,
                                fp_anchor_ops_t *out_ops) {
     if (!ctx || !cfg || !cfg->rpc_url || !out_ops) return FP_ERR_INVALID;
+    if (cfg->kind != SF_CHAIN_GENERIC && cfg->kind != SF_CHAIN_KERYX) return FP_ERR_INVALID;
     memset(ctx, 0, sizeof(*ctx));
     ctx->cfg = *cfg;
     if (ctx->cfg.io_timeout_ms <= 0) ctx->cfg.io_timeout_ms = 10000;
@@ -765,9 +547,7 @@ fp_err_t sf_chain_submit_derivation(sf_chain_ctx_t *ctx, const fp_derivation_t *
     if (expected_result_dna) fp_hex_encode(expected_result_dna->bytes, 32, exp_hex);
 
     const char *method = "sealframe_submitDerivation";
-    if (ctx->cfg.kind == SF_CHAIN_EVM)         method = "sealframe_evmSubmitDerivation";
-    else if (ctx->cfg.kind == SF_CHAIN_SOLANA) method = "sealframe_solanaSubmitDerivation";
-    else if (ctx->cfg.kind == SF_CHAIN_KERYX)  method = "keryx_submitOpoiFraudProof";
+    if (ctx->cfg.kind == SF_CHAIN_KERYX) method = "keryx_submitOpoiFraudProof";
 
     char req[2048], resp[4096];
     int status = 0;

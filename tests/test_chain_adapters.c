@@ -1,17 +1,14 @@
 /*
- * SealFrame Multi-Chain Anchor Adapters Unit & Live JSON-RPC Integration Tests (Pure ISO C11)
+ * SealFrame Anchor Adapters Unit & Live JSON-RPC Integration Tests (Pure ISO C11)
  *
  * Verifies:
  *   1. Cryptographic & Encoding primitives:
- *      - Ethereum Keccak-256 standard vectors (empty + ERC-20 transfer selector 0xa9059cbb)
- *      - EVM ABI encoding for anchor(bytes32,bytes32,uint64) and isAnchored(bytes32)
- *      - Solana Anchor SHA-256 discriminator + Borsh layout + Base58/Base64 encoders
  *      - Keryx OPoI Phase-2 fixed-point MLP BIT-EXACT match against keryx-node opoi.rs nonce=42 vector!
- *   2. Live HTTP/1.1 JSON-RPC 2.0 end-to-end tests across all 4 adapters:
+ *      - Base64 encoder (used by RFC 6455 WebSocket handshake)
+ *   2. Live HTTP/1.1 JSON-RPC 2.0 end-to-end tests across supported adapters:
  *      - SF_CHAIN_GENERIC (sealframe_anchorPublish / sealframe_anchorVerify / submitDerivation)
- *      - SF_CHAIN_EVM     (eth_sendTransaction / eth_call / fraud-proof FPD1 verification)
- *      - SF_CHAIN_SOLANA  (sendTransaction Ed25519+Borsh / getAccountInfo PDA / fraud-proof)
  *      - SF_CHAIN_KERYX   (keryx_submitAnchor 76B SF1+OPoI payload / keryx_verifyAnchor / fraud-proof)
+ *   3. Pure-C11 RFC 6455 WebSocket wRPC-JSON client (sf_keryx_wrpc_call)
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -41,9 +38,6 @@ typedef struct {
     _Atomic int     stop;
     pthread_mutex_t mu;
     char            generic_comm[65];
-    char            evm_comm[65];
-    char            sol_comm_b64[64];
-    char            sol_pda_b58[64];
     char            keryx_comm[65];
     char            keryx_tag[17];
     int             derivations_verified;
@@ -79,13 +73,6 @@ static void *mock_rpc_thread(void *arg) {
     mock_rpc_t *m = (mock_rpc_t *)arg;
     struct timeval tv = { 0, 100000 };
     (void)setsockopt(m->lfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    uint8_t sel_anchor[4], sel_is[4];
-    char sel_anchor_hex[9], sel_is_hex[9];
-    sf_evm_selector("anchor(bytes32,bytes32,uint64)", sel_anchor);
-    sf_evm_selector("isAnchored(bytes32)", sel_is);
-    fp_hex_encode(sel_anchor, 4, sel_anchor_hex);
-    fp_hex_encode(sel_is, 4, sel_is_hex);
 
     while (!atomic_load(&m->stop)) {
         int c = accept(m->lfd, NULL, NULL);
@@ -157,42 +144,6 @@ static void *mock_rpc_thread(void *arg) {
                 send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"verified\":true}}");
             else
                 send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"verified\":false}}");
-        } else if (strcmp(method, "eth_sendTransaction") == 0) {
-            char data[256];
-            extract_str(body, "data", data, sizeof(data));
-            /* Verify exact 0x + 4-byte selector + 3*32-byte ABI words = 202 chars */
-            if (strlen(data) == 202u && strncmp(data, "0x", 2) == 0 &&
-                strncmp(data + 2, sel_anchor_hex, 8) == 0) {
-                memcpy(m->evm_comm, data + 10, 64);
-                m->evm_comm[64] = '\0';
-                send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0xdeadbeef01\"}");
-            } else {
-                send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":\"bad evm abi\"}");
-            }
-        } else if (strcmp(method, "eth_call") == 0) {
-            char data[128];
-            extract_str(body, "data", data, sizeof(data));
-            if (strlen(data) == 74u && strncmp(data + 2, sel_is_hex, 8) == 0 &&
-                m->evm_comm[0] && strncmp(data + 10, m->evm_comm, 64) == 0) {
-                send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":"
-                                  "\"0x0000000000000000000000000000000000000000000000000000000000000001\"}");
-            } else {
-                send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":"
-                                  "\"0x0000000000000000000000000000000000000000000000000000000000000000\"}");
-            }
-        } else if (strcmp(method, "sendTransaction") == 0) {
-            /* Solana sendTransaction: accept base64 payload and record expected commitment */
-            send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"5SolanaSigMock11111111\"}");
-        } else if (strcmp(method, "getAccountInfo") == 0) {
-            if (m->sol_pda_b58[0] && strstr(body, m->sol_pda_b58) != NULL) {
-                char r[256];
-                snprintf(r, sizeof(r),
-                         "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"value\":{\"data\":[\"%s\",\"base64\"]}}}",
-                         m->sol_comm_b64);
-                send_http_json(c, r);
-            } else {
-                send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"value\":null}}");
-            }
         } else if (strcmp(method, "keryx_submitAnchor") == 0) {
             char payload[256];
             extract_str(body, "commitment", m->keryx_comm, sizeof(m->keryx_comm));
@@ -214,8 +165,6 @@ static void *mock_rpc_thread(void *arg) {
             else
                 send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"anchored\":false}}");
         } else if (strcmp(method, "sealframe_submitDerivation") == 0 ||
-                   strcmp(method, "sealframe_evmSubmitDerivation") == 0 ||
-                   strcmp(method, "sealframe_solanaSubmitDerivation") == 0 ||
                    strcmp(method, "keryx_submitOpoiFraudProof") == 0) {
             char fpd_hex[1024];
             extract_str(body, "fpd1_hex", fpd_hex, sizeof(fpd_hex));
@@ -247,23 +196,7 @@ static void *mock_rpc_thread(void *arg) {
 int main(void) {
     assert(fp_init() == FP_OK);
 
-    /* --- 1. Ethereum Keccak-256 Standard Vectors --- */
-    {
-        uint8_t h_empty[32];
-        char hex_empty[65];
-        sf_keccak256((const uint8_t *)"", 0, h_empty);
-        fp_hex_encode(h_empty, 32, hex_empty);
-        assert(strcmp(hex_empty, "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470") == 0);
-
-        uint8_t sel_erc20[4];
-        char hex_sel[9];
-        sf_evm_selector("transfer(address,uint256)", sel_erc20);
-        fp_hex_encode(sel_erc20, 4, hex_sel);
-        assert(strcmp(hex_sel, "a9059cbb") == 0);
-        printf("[PASS] Ethereum Keccak-256 verified (empty hash + ERC-20 transfer selector 0xa9059cbb)\n");
-    }
-
-    /* --- 2. Keryx OPoI Phase-2 BIT-EXACT Regression Vector (nonce=42 from keryx-node opoi.rs) --- */
+    /* --- 1. Keryx OPoI Phase-2 BIT-EXACT Regression Vector (nonce=42 from keryx-node opoi.rs) --- */
     {
         static const uint8_t EXPECTED_NONCE42[32] = {
             182, 147, 169, 135, 251, 232, 129,  16,
@@ -283,16 +216,15 @@ int main(void) {
         printf("[PASS] Keryx OPoI Phase-2 fixed-point MLP bit-exact (nonce=42 matches keryx-node 32/32 bytes, tag=%s)\n", h1);
     }
 
-    /* --- 3. Solana Base58 / Base64 / Anchor Borsh Primitives --- */
+    /* --- 2. Base64 Helper (RFC 6455 WebSocket Handshake) --- */
     {
-        char b58[64], b64[64];
+        char b64[64];
         const uint8_t msg[5] = { 'h', 'e', 'l', 'l', 'o' };
-        assert(sf_base58_encode(msg, 5, b58, sizeof(b58)) > 0 && strcmp(b58, "Cn8eVZg") == 0);
         assert(sf_base64_encode(msg, 5, b64, sizeof(b64)) > 0 && strcmp(b64, "aGVsbG8=") == 0);
-        printf("[PASS] Solana Base58 ('%s') & Base64 ('%s') encoders verified\n", b58, b64);
+        printf("[PASS] Base64 encoder verified ('%s')\n", b64);
     }
 
-    /* --- 4. Live Multi-Protocol JSON-RPC 2.0 Integration (Generic, EVM, Solana, Keryx) --- */
+    /* --- 3. Live JSON-RPC 2.0 Integration (Generic JSON-RPC 2.0 & Keryx BlockDAG/OPoI) --- */
     fp_keypair_t kp;
     assert(fp_keygen(&kp) == FP_OK);
 
@@ -342,8 +274,6 @@ int main(void) {
     atomic_init(&rpc.stop, 0);
     pthread_mutex_init(&rpc.mu, NULL);
     memcpy(rpc.expected_signer_pk, kp.pk, 32);
-    sf_base58_encode(comm.commitment.bytes, 32, rpc.sol_pda_b58, sizeof(rpc.sol_pda_b58));
-    sf_base64_encode(comm.commitment.bytes, 32, rpc.sol_comm_b64, sizeof(rpc.sol_comm_b64));
 
     pthread_t th;
     assert(pthread_create(&th, NULL, mock_rpc_thread, &rpc) == 0);
@@ -351,18 +281,15 @@ int main(void) {
     char rpc_url[64];
     snprintf(rpc_url, sizeof(rpc_url), "http://127.0.0.1:%u", (unsigned)port);
 
-    const sf_chain_kind_t kinds[4] = { SF_CHAIN_GENERIC, SF_CHAIN_EVM, SF_CHAIN_SOLANA, SF_CHAIN_KERYX };
-    const char *names[4] = { "Generic JSON-RPC 2.0", "EVM (Ethereum/L2)", "Solana (Anchor/Ed25519)", "Keryx (BlockDAG/OPoI)" };
+    const sf_chain_kind_t kinds[2] = { SF_CHAIN_GENERIC, SF_CHAIN_KERYX };
+    const char *names[2] = { "Generic JSON-RPC 2.0", "Keryx (BlockDAG/OPoI)" };
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 2; i++) {
         sf_chain_cfg_t cfg;
         memset(&cfg, 0, sizeof(cfg));
         cfg.kind = kinds[i];
         cfg.rpc_url = rpc_url;
-        cfg.contract_addr = (kinds[i] == SF_CHAIN_EVM)
-            ? "0x1111111111111111111111111111111111111111"
-            : ((kinds[i] == SF_CHAIN_SOLANA) ? "SF11111111111111111111111111111111111111111" : "keryx:qpzry9x8");
-        cfg.sender_addr = "0x2222222222222222222222222222222222222222";
+        cfg.contract_addr = "keryx:qpzry9x8";
         cfg.signer_kp = &kp;
         cfg.keryx_nonce = UINT64_C(0xDEADBEEFCAFE1337);
         cfg.io_timeout_ms = 5000;
@@ -382,9 +309,9 @@ int main(void) {
                names[i], ctx.last_tx_id);
     }
 
-    assert(rpc.derivations_verified == 4);
+    assert(rpc.derivations_verified == 2);
 
-    /* --- 5. Pure-C11 RFC 6455 WebSocket wRPC-JSON client test --- */
+    /* --- 4. Pure-C11 RFC 6455 WebSocket wRPC-JSON client test --- */
     {
         char ws_url[64], ws_resp[512];
         snprintf(ws_url, sizeof(ws_url), "ws://127.0.0.1:%u/", (unsigned)port);
@@ -399,6 +326,6 @@ int main(void) {
     pthread_mutex_destroy(&rpc.mu);
     sodium_memzero(&kp, sizeof(kp));
 
-    printf("ALL 4 BLOCKCHAIN ANCHOR ADAPTER TESTS PASSED (Generic, EVM, Solana, Keryx).\n");
+    printf("ALL ANCHOR ADAPTER TESTS PASSED (Generic JSON-RPC 2.0 & Keryx).\n");
     return 0;
 }
