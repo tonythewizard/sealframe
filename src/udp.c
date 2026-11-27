@@ -1241,7 +1241,9 @@ fp_err_t fp_udp_session_connect(const char *host, uint16_t port,
     crypto_sign_detached(hello + 84, NULL, msg, sizeof(msg), client_kp->sk);
 
     int timeout_ms = io_timeout_ms > 0 ? io_timeout_ms : 10000;
-    uint64_t deadline = now_ns() + (uint64_t)timeout_ms * 1000000ull;
+    /* SEC-08: Bound initial handshake wait separately (<= 30s) even when active inference timeout is 10 min */
+    int hs_timeout_ms = timeout_ms > 30000 ? 30000 : timeout_ms;
+    uint64_t deadline = now_ns() + (uint64_t)hs_timeout_ms * 1000000ull;
     uint8_t wbuf[UDP_MAX_DATAGRAM];
     ssize_t wn = -1;
 
@@ -1345,7 +1347,9 @@ fp_err_t fp_udp_session_accept(int udp_fd,
     (void)setsockopt(udp_fd, SOL_SOCKET, SO_SNDBUF, &sbuf, sizeof(sbuf));
 
     int timeout_ms = io_timeout_ms > 0 ? io_timeout_ms : 10000;
-    uint64_t deadline = now_ns() + (uint64_t)timeout_ms * 1000000ull;
+    /* SEC-08: Bound initial handshake wait separately (<= 30s) even when active inference timeout is 10 min */
+    int hs_timeout_ms = timeout_ms > 30000 ? 30000 : timeout_ms;
+    uint64_t deadline = now_ns() + (uint64_t)hs_timeout_ms * 1000000ull;
     uint8_t hbuf[UDP_MAX_DATAGRAM];
     struct sockaddr_in peer;
     socklen_t plen = sizeof(peer);

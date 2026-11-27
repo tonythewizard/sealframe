@@ -676,6 +676,35 @@ static void test_control_plane(const char *work) {
         else
             record_ok("CP-P0-06/P1-06", "Default fail-closed mode (401 unsigned/unenrolled, 403 no quorum) & legacy v0 DB migration verified");
 
+        /* CP-03 (SEC-02): Admin GET endpoints MUST require Bearer token in default fail-closed mode! */
+        const char *admin_gets[4] = {
+            "/api/v1/fleet", "/api/v1/approvals", "/api/v1/audit/cra", "/api/v1/audit/cra.html"
+        };
+        int cp03_ok = 1;
+        for (int gi = 0; gi < 4; gi++) {
+            snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", admin_gets[gi]);
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            if (strncmp(resp, "HTTP/1.1 401", 12) != 0) cp03_ok = 0;
+
+            snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\n\r\n",
+                     admin_gets[gi], sec_tok);
+            raw_http(sec_port, req, strlen(req), resp, sizeof(resp), 2000);
+            if (strncmp(resp, "HTTP/1.1 200 OK", 15) != 0) cp03_ok = 0;
+        }
+        if (!cp03_ok)
+            record_finding("CRITICAL", "CP-03", "Default sf-cp leaked admin GET endpoint without Bearer token or rejected valid Bearer");
+        else
+            record_ok("CP-03", "Admin GET endpoints (fleet/approvals/CRA) enforce Bearer auth by default (401 unauth -> 200 auth)");
+
+        /* SEC-07: sf-llama-bridge --role server without --peer-pk or --allow-any-peer MUST fail closed */
+        char bkey[600];
+        snprintf(bkey, sizeof(bkey), "%s/bridge_sec07.key", work);
+        char *br_cmd[] = { "./bin/sf-llama-bridge", "--role", "server", "--key", bkey, "--once", NULL };
+        if (run_cmd_capture(br_cmd, NULL, 0) == 0)
+            record_finding("HIGH", "BRIDGE-SEC-07", "sf-llama-bridge server started without --peer-pk or --allow-any-peer");
+        else
+            record_ok("BRIDGE-SEC-07", "sf-llama-bridge server fails closed without --peer-pk / --allow-any-peer");
+
         kill(spid, SIGTERM);
         waitpid(spid, &st, 0);
     }

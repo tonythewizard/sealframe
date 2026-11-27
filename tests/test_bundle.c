@@ -362,12 +362,96 @@ static void test_m0_m1_hardening(void) {
     printf("[PASS] P0-01/P0-07: GC protects journaled generation & ROLLBACK_PENDING reconciles forward\n");
 }
 
+static void test_tx06_tx07_multistep_and_initial_sql_rollback(void) {
+    char tmpl[] = "/tmp/fp-tx0607-XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    assert(dir != NULL);
+
+    char store[256], target[256], src_p[256], dst_p[256];
+    snprintf(store, sizeof(store), "%s/store", dir);
+    snprintf(target, sizeof(target), "%s/live", dir);
+    snprintf(src_p, sizeof(src_p), "%s/src.db", dir);
+    snprintf(dst_p, sizeof(dst_p), "%s/dst.db", dir);
+
+    const char *schema = "CREATE TABLE kv(k INTEGER PRIMARY KEY, v INTEGER NOT NULL);";
+    fp_sql_ctx_t *src_db = NULL, *dst_db = NULL;
+    assert(fp_sql_open(src_p, &src_db) == FP_OK && fp_sql_open(dst_p, &dst_db) == FP_OK);
+    assert(fp_sql_exec(src_db, schema) == FP_OK && fp_sql_exec(dst_db, schema) == FP_OK);
+
+    fp_dna_t empty_dig;
+    assert(fp_sql_state_digest(src_db, "kv", &empty_dig) == FP_OK);
+
+    /* Build 4 incremental bundles V1(100) -> V2(200) -> V3(300) -> V4(400) */
+    const char *sqls[4] = {
+        "INSERT INTO kv VALUES (1, 100);",
+        "UPDATE kv SET v=200 WHERE k=1;",
+        "UPDATE kv SET v=300 WHERE k=1;",
+        "UPDATE kv SET v=400 WHERE k=1;"
+    };
+    const char *cfgs[4] = { "V1=100\n", "V2=200\n", "V3=300\n", "V4=400\n" };
+    fp_dna_t bdnas[4], sql_digs[4];
+    for (int i = 0; i < 4; i++) {
+        uint8_t *cs = NULL; size_t csl = 0;
+        assert(fp_sql_capture_changeset(src_db, "kv", sqls[i], &cs, &csl) == FP_OK);
+        assert(fp_sql_state_digest(src_db, "kv", &sql_digs[i]) == FP_OK);
+        fp_bundle_t b;
+        memset(&b, 0, sizeof(b));
+        b.version = 1; b.entry_count = 2;
+        b.entries[0].role = FP_ROLE_FILE; b.entries[0].mode = 0644; b.entries[0].size = strlen(cfgs[i]);
+        snprintf(b.entries[0].path, sizeof(b.entries[0].path), "ver.cfg");
+        assert(fp_store_put_object(store, (const uint8_t *)cfgs[i], strlen(cfgs[i]), &b.entries[0].dna) == FP_OK);
+        b.entries[1].role = FP_ROLE_SQLITE_CHANGESET; b.entries[1].size = csl;
+        snprintf(b.entries[1].path, sizeof(b.entries[1].path), "kv");
+        assert(fp_store_put_object(store, cs, csl, &b.entries[1].dna) == FP_OK);
+        free(cs);
+        assert(fp_bundle_pack(store, &b, &bdnas[i]) == FP_OK);
+    }
+
+    /* TX-07: Initial install V1 -> rollback with prev=NULL -> exact empty SQLite baseline + no `current`! */
+    assert(fp_bundle_apply(store, &bdnas[0], target, dst_db, 1, 0) == FP_OK);
+    fp_dna_t cur_dig;
+    assert(fp_sql_state_digest(dst_db, "kv", &cur_dig) == FP_OK && fp_dna_equal(&cur_dig, &sql_digs[0]));
+    assert(fp_bundle_rollback(store, &bdnas[0], NULL, target, dst_db) == FP_OK);
+    assert(fp_sql_state_digest(dst_db, "kv", &cur_dig) == FP_OK && fp_dna_equal(&cur_dig, &empty_dig));
+    uint64_t pseq = 99; char pdna[65];
+    assert(fp_sql_get_progress(dst_db, &pseq, pdna) == FP_OK && pseq == 0 && pdna[0] == '\0');
+    char cur_link[384], cur_cfg[384];
+    snprintf(cur_link, sizeof(cur_link), "%s/current", target);
+    snprintf(cur_cfg, sizeof(cur_cfg), "%s/current/ver.cfg", target);
+    struct stat sb;
+    assert(lstat(cur_link, &sb) != 0);
+    printf("[PASS] TX-07 (P1-01): Initial install rollback reverted SQLite to exact empty baseline & unlinked current\n");
+
+    /* TX-06: Apply V1 -> V2 -> V3 -> V4, then multi-step rollback V4 -> V1 in ONE atomic transaction! */
+    for (int i = 0; i < 4; i++) {
+        assert(fp_bundle_apply(store, &bdnas[i], target, dst_db, (uint64_t)(i + 1), 0) == FP_OK);
+    }
+    assert(fp_sql_state_digest(dst_db, "kv", &cur_dig) == FP_OK && fp_dna_equal(&cur_dig, &sql_digs[3]));
+    assert_file_eq(cur_cfg, (const uint8_t *)cfgs[3], strlen(cfgs[3]));
+
+    assert(fp_bundle_rollback(store, &bdnas[3], &bdnas[0], target, dst_db) == FP_OK);
+    assert(fp_sql_state_digest(dst_db, "kv", &cur_dig) == FP_OK && fp_dna_equal(&cur_dig, &sql_digs[0]));
+    assert_file_eq(cur_cfg, (const uint8_t *)cfgs[0], strlen(cfgs[0]));
+    assert(fp_sql_get_progress(dst_db, &pseq, pdna) == FP_OK && pseq == 1);
+
+    /* TX-05: Idempotent repeat of rollback V4 -> V1 when already at V1 MUST succeed with unchanged state! */
+    for (int r = 0; r < 10; r++) {
+        assert(fp_bundle_rollback(store, &bdnas[3], &bdnas[0], target, dst_db) == FP_OK);
+    }
+    assert(fp_sql_state_digest(dst_db, "kv", &cur_dig) == FP_OK && fp_dna_equal(&cur_dig, &sql_digs[0]));
+    printf("[PASS] TX-06/TX-05 (P0-05/P0-02): Multi-step V4->V1 SQLite+file rollback exact & 10x idempotent\n");
+
+    fp_sql_close(src_db);
+    fp_sql_close(dst_db);
+}
+
 int main(void) {
     assert(fp_init() == FP_OK);
     test_bundle_security_validation();
     test_composite_atomic_sigkill_and_rollback();
     test_p1_streaming_gc_and_merkle_index();
     test_m0_m1_hardening();
+    test_tx06_tx07_multistep_and_initial_sql_rollback();
     printf("ALL M3 PARTICLE BUNDLE & SQLITE SESSION TESTS PASSED.\n");
     return 0;
 }

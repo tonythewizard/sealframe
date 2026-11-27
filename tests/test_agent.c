@@ -727,6 +727,105 @@ int main(void) {
         assert(lstat(h_rev, &st_chk) == 0);
         assert(lstat(h_rev_pend, &st_chk) != 0);
         printf("[PASS] P1-01/P0-04 offline revoke recovery completed before network access\n");
+
+        /* Test L (TX-01 + TX-04/05 + P1-02 + TX-03 + TX-08 + TRUST-01): Full 3rd-audit gate coverage */
+        {
+            char l_otap[600];
+            snprintf(l_otap, sizeof(l_otap), "%s/.sf_ota_state", htarget);
+
+            /* P1-02: Corrupted .sf_ota_state MUST fail closed (FP_ERR_INTEGRITY) WITHOUT deleting evidence */
+            write_bytes_file(l_otap, (const uint8_t *)"SFOTA1 CORRUPT_GARBAGE\n", 23);
+            hcfg.repo_url = base_url;
+            assert(fp_agent_sync_once(&hcfg, &rep) == FP_ERR_INTEGRITY);
+            assert(lstat(l_otap, &st_chk) == 0);
+            assert(unlink(l_otap) == 0);
+
+            /* TX-01 & TX-04/05: HEALTH_PENDING written BEFORE apply (current already at hbd2) ->
+             * offline recovery clears .sf_ota_state cleanly without FP_ERR_CHAIN loop; repeat 25x idempotent! */
+            assert(fp_bundle_apply(hstore, &hbd2, htarget, NULL, 2, 0) == FP_OK);
+            char hbd1_hex[65], hbd2_hex[65], oline[256];
+            fp_hex_encode(hbd1.bytes, FP_DNA_LEN, hbd1_hex);
+            fp_hex_encode(hbd2.bytes, FP_DNA_LEN, hbd2_hex);
+            int oln = snprintf(oline, sizeof(oline), "SFOTA1 HEALTH_PENDING 9 %s 1 %s 9\n", hbd1_hex, hbd2_hex);
+            for (int r = 0; r < 25; r++) {
+                write_bytes_file(l_otap, (const uint8_t *)oline, (size_t)oln);
+                assert(fp_agent_sync_once(&hcfg, &rep) == FP_OK);
+                assert(lstat(l_otap, &st_chk) != 0);
+            }
+            printf("[PASS] TX-01/TX-04/TX-05/P1-02: Pre-apply HEALTH_PENDING idempotent 25x & corrupt .sf_ota_state fail-closed\n");
+
+            /* TX-03 (P0-03): Offline LEDGER_PENDING recovery commits pending_events/3.ev with NO network! */
+            fp_event_t he3;
+            memset(&he3, 0, sizeof(he3));
+            he3.action = FP_ACTION_REVOKE; he3.repo_id = hrid; he3.serial = 3;
+            he3.prev_event_hash = he2.event_hash;
+            he3.timestamp_unix = now; he3.expires_unix = now + 3600;
+            he3.target_dna = hbd1; he3.target_size = 0; /* revoke historical hbd1 */
+            snprintf(he3.reason, sizeof(he3.reason), "test-revoke-historical");
+            assert(fp_event_sign(&he3, &hrel3) == FP_OK);
+            assert(fp_event_encode(&he3, &eb, &el) == FP_OK);
+            char pdir[600], pev[640];
+            snprintf(pdir, sizeof(pdir), "%s/pending_events", hstore);
+            (void)mkdir(pdir, 0700);
+            snprintf(pev, sizeof(pev), "%s/3.ev", pdir);
+            write_bytes_file(pev, eb, el);
+            free(eb);
+            oln = snprintf(oline, sizeof(oline), "SFOTA1 LEDGER_PENDING 3 %s 1 %s 3\n", hbd2_hex, hbd2_hex);
+            write_bytes_file(l_otap, (const uint8_t *)oline, (size_t)oln);
+            hcfg.repo_url = "http://127.0.0.1:1"; /* completely offline! */
+            (void)fp_agent_sync_once(&hcfg, &rep);
+            fp_store_state_t pst;
+            assert(fp_store_load_state(hstore, &pst) == FP_OK && pst.serial == 3);
+            assert(lstat(l_otap, &st_chk) != 0);
+            printf("[PASS] TX-03 (P0-03): Offline LEDGER_PENDING committed serial=3 cleanly with zero network\n");
+
+            /* TX-08 (P0-04): Signed INSTALL targeting revoked hbd1 -> rejected in preflight BEFORE mutation! */
+            fp_event_t he4;
+            memset(&he4, 0, sizeof(he4));
+            he4.action = FP_ACTION_INSTALL; he4.repo_id = hrid; he4.serial = 4;
+            he4.prev_event_hash = he3.event_hash;
+            he4.timestamp_unix = now; he4.expires_unix = now + 3600;
+            he4.target_dna = hbd1; he4.target_size = hbs1; /* REVOKED! */
+            assert(fp_event_sign(&he4, &hrel3) == FP_OK);
+            assert(fp_event_encode(&he4, &eb, &el) == FP_OK);
+            snprintf(rp, sizeof(rp), "%s/4.ev", h_ev);
+            write_bytes_file(rp, eb, el);
+            snprintf(rp, sizeof(rp), "%s/latest.ev", h_st);
+            write_bytes_file(rp, eb, el);
+            free(eb);
+            hcfg.repo_url = base_url;
+            assert(fp_agent_sync_once(&hcfg, &rep) == FP_ERR_REVOKED);
+            assert(fp_store_load_state(hstore, &pst) == FP_OK && pst.serial == 3);
+            printf("[PASS] TX-08 (P0-04): Signed event targeting revoked DNA rejected in preflight before mutation\n");
+
+            /* TRUST-01 (P1-04): 40-step root rotation chain (v3 -> v43, exceeding old 32-slot array!) */
+            fp_root_doc_t prev_r = rv3;
+            for (uint64_t rv = 4; rv <= 43; rv++) {
+                fp_root_doc_t nr = prev_r;
+                nr.root_version = rv;
+                nr.sig_count = 0;
+                nr.timestamp_unix = prev_r.timestamp_unix + 1u;
+                nr.expires_unix = now + 86400;
+                assert(fp_root_add_sig(&nr, &hrk[0]) == FP_OK && fp_root_add_sig(&nr, &hrk[1]) == FP_OK);
+                assert(fp_root_encode(&nr, &rb, &rl) == FP_OK);
+                snprintf(rp, sizeof(rp), "%s/%llu.fpr", h_roots, (unsigned long long)rv);
+                write_bytes_file(rp, rb, rl);
+                if (rv == 43) {
+                    snprintf(rp, sizeof(rp), "%s/root.fpr", hrepo);
+                    write_bytes_file(rp, rb, rl);
+                }
+                free(rb);
+                prev_r = nr;
+            }
+            /* Point latest.ev back to serial=3 (up-to-date) so sync finishes cleanly after walking 40 rotations */
+            assert(fp_event_encode(&he3, &eb, &el) == FP_OK);
+            snprintf(rp, sizeof(rp), "%s/latest.ev", h_st);
+            write_bytes_file(rp, eb, el);
+            free(eb);
+            assert(fp_agent_sync_once(&hcfg, &rep) == FP_OK);
+            assert(rep.root_version == 43);
+            printf("[PASS] TRUST-01 (P1-04): 40-step verified root rotation chain (v3 -> v43) synced cleanly!\n");
+        }
     }
 
     srv.stop = 1;

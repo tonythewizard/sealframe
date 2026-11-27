@@ -243,6 +243,10 @@ int      fp_store_has_object(const char *root, const fp_dna_t *dna, uint64_t *ou
 int      fp_store_open_object_fd(const char *root, const fp_dna_t *dna,
                                  char *out_path, size_t out_path_cap, uint64_t *out_size);
 fp_err_t fp_store_load_state(const char *root, fp_store_state_t *out_state);
+/* Pure transition validator shared by agent preflight and store commit (P0-04, P1-06) */
+fp_err_t fp_store_validate_transition(const fp_store_state_t *current,
+                                      const fp_event_t *ev,
+                                      fp_store_state_t *out_next);
 fp_err_t fp_store_apply_event(const char *root, const fp_event_t *ev,
                               const uint8_t expected_pk[FP_PK_LEN],
                               const fp_dna_t *expected_repo,
@@ -448,6 +452,7 @@ fp_err_t fp_sql_capture_changeset(fp_sql_ctx_t *ctx, const char *table_name,
                                   const char *sql,
                                   uint8_t **out_cs, size_t *out_len);
 fp_err_t fp_sql_state_digest(fp_sql_ctx_t *ctx, const char *table_name, fp_dna_t *out_dna);
+fp_err_t fp_sql_get_progress(fp_sql_ctx_t *ctx, uint64_t *out_seq, char out_dna[65]);
 
 fp_err_t fp_bundle_encode(const fp_bundle_t *b, uint8_t **out_buf, size_t *out_len);
 fp_err_t fp_bundle_decode(const uint8_t *buf, size_t len, fp_bundle_t *out_b);
