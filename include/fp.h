@@ -488,6 +488,19 @@ fp_err_t fp_bundle_apply_chain(const char *store_dir,
                                const fp_bundle_step_t *steps, size_t step_count,
                                const char *target_dir, fp_sql_ctx_t *sql_ctx);
 
+/* A9-P0-04 / A9-P1-04: Global monotonic revocation deny-set (`<store_dir>/.revoked_dnas`).
+ * Tri-state result distinguishes ALLOWED, REVOKED, and ERROR (I/O or corruption) so a read
+ * failure fails closed WITHOUT fabricating a revocation entry. Enforced by EVERY activation
+ * path (fp_bundle_apply, fp_bundle_apply_chain, fp_bundle_rollback, fp_bundle_recover). */
+typedef enum {
+    FP_DENY_ALLOWED = 0,
+    FP_DENY_REVOKED = 1,
+    FP_DENY_ERROR   = -1
+} fp_deny_status_t;
+
+fp_deny_status_t fp_denyset_check(const char *store_dir, const fp_dna_t *dna);
+fp_err_t         fp_denyset_add(const char *store_dir, const fp_dna_t *dna);
+
 /* Deterministic crash-recovery for any incomplete composite bundle transaction
  * recorded in `<target_dir>/.sf_tx_journal`. Reconciles forward if SQLite already
  * committed, or cleans up safely if interrupted prior to commit. */

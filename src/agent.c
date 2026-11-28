@@ -216,17 +216,19 @@ static uint64_t load_failed_serial(const char *store_dir, int *out_had_prev) {
     return (uint64_t)v;
 }
 
-static void save_failed_serial(const char *store_dir, uint64_t serial, int had_prev) {
+static fp_err_t save_failed_serial(const char *store_dir, uint64_t serial, int had_prev) {
     char path[PATH_MAX];
     int n = snprintf(path, sizeof(path), "%s/agent_failed_serial", store_dir);
-    if (n < 0 || (size_t)n >= sizeof(path)) return;
+    if (n < 0 || (size_t)n >= sizeof(path)) return FP_ERR_BOUNDS;
     if (serial == 0) {
-        if (unlink(path) == 0) sync_parent_dir(path);
-        return;
+        if (unlink(path) != 0 && errno != ENOENT) return FP_ERR_IO;
+        (void)sync_parent_dir(path);
+        return FP_OK;
     }
     char buf[48];
     int bl = snprintf(buf, sizeof(buf), "%llu %d\n", (unsigned long long)serial, had_prev ? 1 : 0);
-    if (bl > 0) (void)write_file_atomic(path, (const uint8_t *)buf, (size_t)bl);
+    if (bl <= 0 || (size_t)bl >= sizeof(buf)) return FP_ERR_BOUNDS;
+    return write_file_atomic(path, (const uint8_t *)buf, (size_t)bl);
 }
 
 static int is_hex64_str(const char *s) {
@@ -259,106 +261,9 @@ static int parse_u64_strict(const char *s, uint64_t *out) {
     return 0;
 }
 
-static int acquire_denyset_lock(const char *store_dir) {
-    char lpath[PATH_MAX];
-    if (snprintf(lpath, sizeof(lpath), "%s/.revoked_dnas.lock", store_dir) >= (int)sizeof(lpath)) return -1;
-    (void)mkdir(store_dir, 0700);
-    int fd = open(lpath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (fd < 0) return -1;
-    while (flock(fd, LOCK_EX) != 0) {
-        if (errno != EINTR) { close(fd); return -1; }
-    }
-    return fd;
-}
-
-static void release_denyset_lock(int fd) {
-    if (fd >= 0) {
-        (void)flock(fd, LOCK_UN);
-        close(fd);
-    }
-}
-
-/* P0-03, P0-05 & A7-P1-01: Monotonic durable revocation deny-set (`<store_dir>/.revoked_dnas`).
- * Persisted under a dedicated store flock BEFORE any target/DB mutation whenever signed
- * FP_ACTION_REVOKE events are authenticated; corrupt lines or read errors fail closed! */
-static int deny_set_contains(const char *store_dir, const fp_dna_t *dna) {
-    if (!store_dir || !dna) return 0;
-    char path[PATH_MAX], hex[65];
-    fp_hex_encode(dna->bytes, FP_DNA_LEN, hex);
-    if (snprintf(path, sizeof(path), "%s/.revoked_dnas", store_dir) >= (int)sizeof(path)) return 1;
-    FILE *f = fopen(path, "r");
-    if (!f) return (errno == ENOENT) ? 0 : 1; /* Fail closed on unexpected I/O error */
-    char line[128];
-    int found = 0;
-    while (fgets(line, sizeof(line), f)) {
-        size_t l = strlen(line);
-        if (l == sizeof(line) - 1u && line[l - 1u] != '\n' && !feof(f)) {
-            found = 1; /* Oversized/corrupt line -> fail closed */
-            break;
-        }
-        while (l > 0 && (line[l - 1u] == '\n' || line[l - 1u] == '\r')) line[--l] = '\0';
-        if (l == 0) continue;
-        if (!is_hex64_str(line)) {
-            found = 1; /* Corrupt/truncated entry -> fail closed */
-            break;
-        }
-        if (strcmp(line, hex) == 0) {
-            found = 1;
-            break;
-        }
-    }
-    if (ferror(f)) found = 1;
-    fclose(f);
-    return found;
-}
-
-static fp_err_t deny_set_add_dna(const char *store_dir, const fp_dna_t *dna) {
-    if (!store_dir || !dna) return FP_ERR_INVALID;
-    char path[PATH_MAX], hex[65];
-    fp_hex_encode(dna->bytes, FP_DNA_LEN, hex);
-    if (snprintf(path, sizeof(path), "%s/.revoked_dnas", store_dir) >= (int)sizeof(path)) {
-        return FP_ERR_BOUNDS;
-    }
-    int lfd = acquire_denyset_lock(store_dir);
-    if (lfd < 0) return FP_ERR_IO;
-
-    uint8_t *old_buf = NULL;
-    size_t old_len = 0;
-    fp_err_t rerr = read_file_small(path, (1u << 20), &old_buf, &old_len);
-    if (rerr != FP_OK && rerr != FP_ERR_NOT_FOUND) {
-        release_denyset_lock(lfd);
-        return rerr;
-    }
-
-    if (old_buf && old_len > 0) {
-        size_t pos = 0;
-        while (pos < old_len) {
-            size_t eol = pos;
-            while (eol < old_len && old_buf[eol] != '\n' && old_buf[eol] != '\r') eol++;
-            if (eol - pos == 64u && memcmp(old_buf + pos, hex, 64u) == 0) {
-                free(old_buf);
-                release_denyset_lock(lfd);
-                return FP_OK;
-            }
-            pos = eol;
-            while (pos < old_len && (old_buf[pos] == '\n' || old_buf[pos] == '\r')) pos++;
-        }
-    }
-    size_t need_nl = (old_len > 0 && old_buf[old_len - 1] != '\n') ? 1u : 0u;
-    size_t new_len = old_len + need_nl + 65u;
-    uint8_t *nbuf = malloc(new_len);
-    if (!nbuf) { free(old_buf); release_denyset_lock(lfd); return FP_ERR_NOMEM; }
-    if (old_len > 0) memcpy(nbuf, old_buf, old_len);
-    if (need_nl) nbuf[old_len] = '\n';
-    memcpy(nbuf + old_len + need_nl, hex, 64u);
-    nbuf[old_len + need_nl + 64u] = '\n';
-    free(old_buf);
-
-    fp_err_t werr = write_file_atomic(path, nbuf, new_len);
-    free(nbuf);
-    release_denyset_lock(lfd);
-    return werr;
-}
+/* P0-03, A9-P0-04 & A9-P1-04: Durable revocation deny-set lives globally in `src/bundle.c`
+ * (`fp_denyset_check()` / `fp_denyset_add()`) as Single Activation Authority across both
+ * `fp_bundle_*` and `fp_agent_sync_once()` with tri-state error separation! */
 
 /* P1-04: Dynamic verified historical root chain (supports 64+ rotations; verifies continuity up to active_root) */
 typedef struct {
@@ -618,9 +523,9 @@ static void cleanup_pending_events(const char *store_dir, uint64_t start_serial,
 static fp_err_t verify_system_invariants(const fp_agent_cfg_t *cfg, const fp_dna_t *expected_dna,
                                          fp_sql_ctx_t *sql, int check_ledger, uint64_t expected_serial) {
     if (!cfg || !expected_dna) return FP_ERR_INVALID;
-    if (deny_set_contains(cfg->store_dir, expected_dna)) {
-        return FP_ERR_REVOKED;
-    }
+    fp_deny_status_t ds = fp_denyset_check(cfg->store_dir, expected_dna);
+    if (ds == FP_DENY_REVOKED) return FP_ERR_REVOKED;
+    if (ds != FP_DENY_ALLOWED) return FP_ERR_INTEGRITY;
     char exp_hex[65], live_cur[65], cur_link[PATH_MAX];
     fp_hex_encode(expected_dna->bytes, FP_DNA_LEN, exp_hex);
     if (!read_current_gen_hex(cfg->target_dir, live_cur) || strcmp(live_cur, exp_hex) != 0) {
@@ -663,18 +568,21 @@ static fp_err_t verify_system_invariants(const fp_agent_cfg_t *cfg, const fp_dna
 }
 
 static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
-    /* 0. A8-P0-04: Unconditional boot-time revocation fence BEFORE bundle recovery or journal parsing!
+    /* 0. A8-P0-04 + A9-P1-04: Unconditional boot-time revocation fence BEFORE bundle recovery or journal parsing!
      * Even if .sf_tx_journal or .sf_ota_state is present or corrupted, a revoked `current` symlink
-     * is ALWAYS unlinked first! */
+     * is ALWAYS unlinked first; a corrupted deny-set fails closed with FP_ERR_INTEGRITY! */
     {
         char boot_cur[65];
         if (read_current_gen_hex(cfg->target_dir, boot_cur)) {
             fp_dna_t boot_dna;
-            if (fp_hex_decode(boot_cur, boot_dna.bytes, FP_DNA_LEN) == FP_OK &&
-                deny_set_contains(cfg->store_dir, &boot_dna)) {
-                fp_err_t ferr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
-                                                       "REVOKED_BOOT_FENCE=1\n");
-                if (ferr != FP_OK) return ferr;
+            if (fp_hex_decode(boot_cur, boot_dna.bytes, FP_DNA_LEN) == FP_OK) {
+                fp_deny_status_t ds = fp_denyset_check(cfg->store_dir, &boot_dna);
+                if (ds == FP_DENY_ERROR) return FP_ERR_INTEGRITY;
+                if (ds == FP_DENY_REVOKED) {
+                    fp_err_t ferr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
+                                                           "REVOKED_BOOT_FENCE=1\n");
+                    if (ferr != FP_OK) return ferr;
+                }
             }
         }
     }
@@ -704,16 +612,19 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
         return rerr;
     }
 
-    /* Re-enforce boot fence in case fp_bundle_recover() reconciled a journal targeting a revoked DNA */
+    /* Re-enforce boot fence in case `current` was already pointing to a revoked DNA */
     {
         char post_cur[65];
         if (read_current_gen_hex(cfg->target_dir, post_cur)) {
             fp_dna_t post_dna;
-            if (fp_hex_decode(post_cur, post_dna.bytes, FP_DNA_LEN) == FP_OK &&
-                deny_set_contains(cfg->store_dir, &post_dna)) {
-                fp_err_t ferr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
-                                                       "REVOKED_BOOT_FENCE=1\n");
-                if (ferr != FP_OK) { fp_sql_close(rec_sql); return ferr; }
+            if (fp_hex_decode(post_cur, post_dna.bytes, FP_DNA_LEN) == FP_OK) {
+                fp_deny_status_t ds = fp_denyset_check(cfg->store_dir, &post_dna);
+                if (ds == FP_DENY_ERROR) { fp_sql_close(rec_sql); return FP_ERR_INTEGRITY; }
+                if (ds == FP_DENY_REVOKED) {
+                    fp_err_t ferr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
+                                                           "REVOKED_BOOT_FENCE=1\n");
+                    if (ferr != FP_OK) { fp_sql_close(rec_sql); return ferr; }
+                }
             }
         }
     }
@@ -765,8 +676,13 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
         int quarantine = (strcmp(ol.state, "HEALTH_RUNNING") == 0 &&
                           actual_hex != NULL && strcmp(actual_hex, ol.new_hex) == 0);
 
-        /* P0-03: Never reactivate a revoked previous generation during offline crash recovery! */
-        int prev_revoked = (ol.has_prev && deny_set_contains(cfg->store_dir, &pdna));
+        /* P0-03 + A9-P1-04: Never reactivate a revoked previous generation during offline crash recovery! */
+        int prev_revoked = 0;
+        if (ol.has_prev) {
+            fp_deny_status_t pds = fp_denyset_check(cfg->store_dir, &pdna);
+            if (pds == FP_DENY_ERROR) { fp_sql_close(rec_sql); return FP_ERR_INTEGRITY; }
+            prev_revoked = (pds == FP_DENY_REVOKED);
+        }
         if (ol.has_prev && !prev_revoked) {
             int prev_active = (has_live && strcmp(live_cur, ol.prev_hex) == 0) &&
                               (!rec_sql || strcmp(sql_dna, ol.prev_hex) == 0);
@@ -774,7 +690,10 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
                 /* Crashed at ANY intermediate or final step -> roll back from actual_dna all the way to prev_dna! */
                 rerr = fp_bundle_rollback(cfg->store_dir, &actual_dna, &pdna, cfg->target_dir, rec_sql);
                 if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
-                if (quarantine) save_failed_serial(cfg->store_dir, ol.q_serial, 1);
+                if (quarantine) {
+                    rerr = save_failed_serial(cfg->store_dir, ol.q_serial, 1);
+                    if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
+                }
             }
             /* Else: crashed BEFORE apply OR AFTER rollback already completed -> idempotent cleanup! */
             cleanup_pending_events(cfg->store_dir, ol.start_serial, ol.serial);
@@ -789,7 +708,10 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
             }
             rerr = deactivate_live_target(cfg->target_dir, ".sf_revoked", "REVOKED_OFFLINE_RECOVERY=1\n");
             if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
-            if (quarantine) save_failed_serial(cfg->store_dir, ol.q_serial, 0);
+            if (quarantine) {
+                rerr = save_failed_serial(cfg->store_dir, ol.q_serial, 0);
+                if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
+            }
             cleanup_pending_events(cfg->store_dir, ol.start_serial, ol.serial);
             rerr = clear_ota_lifecycle(cfg->target_dir);
         } else {
@@ -806,14 +728,20 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
                 }
                 rerr = deactivate_live_target(cfg->target_dir, ".sf_revoked", "REVOKED_OFFLINE_RECOVERY=1\n");
                 if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
-                if (quarantine) save_failed_serial(cfg->store_dir, ol.q_serial, 0);
+                if (quarantine) {
+                    rerr = save_failed_serial(cfg->store_dir, ol.q_serial, 0);
+                    if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
+                }
             } else {
                 int any_applied = has_live || (rec_sql && (sql_seq > 0 || sql_dna[0] != '\0'));
                 if (any_applied) {
                     /* R1 + P1-01: Initial install (single or multi-step) crashed after apply -> invert ALL SQLite steps & unlink current! */
                     rerr = fp_bundle_rollback(cfg->store_dir, &actual_dna, NULL, cfg->target_dir, rec_sql);
                     if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
-                    if (quarantine) save_failed_serial(cfg->store_dir, ol.q_serial, 0);
+                    if (quarantine) {
+                        rerr = save_failed_serial(cfg->store_dir, ol.q_serial, 0);
+                        if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
+                    }
                 } else {
                     rerr = deactivate_live_target(cfg->target_dir, NULL, NULL);
                     if (rerr != FP_OK) { fp_sql_close(rec_sql); return rerr; }
@@ -830,7 +758,9 @@ static fp_err_t recover_ota_lifecycle_offline(const fp_agent_cfg_t *cfg) {
      * If offline health check passes, transition to LEDGER_PENDING and commit local ledger offline immediately! */
     int resume_ledger_after_rb = 0;
     if (strcmp(ol.state, "ROLLBACK_HEALTH_PENDING") == 0) {
-        if (deny_set_contains(cfg->store_dir, &ndna)) {
+        fp_deny_status_t nds = fp_denyset_check(cfg->store_dir, &ndna);
+        if (nds == FP_DENY_ERROR) { fp_sql_close(rec_sql); return FP_ERR_INTEGRITY; }
+        if (nds == FP_DENY_REVOKED) {
             fp_sql_close(rec_sql);
             rerr = deactivate_live_target(cfg->target_dir, ".sf_revoked", "REVOKED_ROLLBACK_TARGET=1\n");
             if (rerr != FP_OK) return rerr;
@@ -1332,18 +1262,26 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     rep.attempted_bundle_dna = latest_ev.target_dna;
 
     if (latest_ev.serial <= st.serial) {
-        /* A7-P1-02: Enforce durable deny-set even when remote serial has not advanced! */
-        if (st.has_current && deny_set_contains(cfg->store_dir, &st.current_dna)) {
-            fp_err_t derr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
-                                                   "REVOKED_UP_TO_DATE=1\n");
-            rep.outcome = FP_AGENT_REVOKED;
-            rep.active_serial = 0;
-            memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
-            snprintf(rep.detail, sizeof(rep.detail),
-                     "active release at serial %llu is in revocation deny-set; target deactivated",
-                     (unsigned long long)st.serial);
-            err = (derr == FP_OK) ? FP_ERR_POLICY : derr;
-            goto done;
+        /* A7-P1-02 + A9-P1-04: Enforce tri-state durable deny-set even when remote serial has not advanced! */
+        if (st.has_current) {
+            fp_deny_status_t cds = fp_denyset_check(cfg->store_dir, &st.current_dna);
+            if (cds == FP_DENY_ERROR) {
+                err = FP_ERR_INTEGRITY;
+                snprintf(rep.detail, sizeof(rep.detail), "revocation deny-set unreadable/corrupt");
+                goto done;
+            }
+            if (cds == FP_DENY_REVOKED) {
+                fp_err_t derr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
+                                                       "REVOKED_UP_TO_DATE=1\n");
+                rep.outcome = FP_AGENT_REVOKED;
+                rep.active_serial = 0;
+                memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
+                snprintf(rep.detail, sizeof(rep.detail),
+                         "active release at serial %llu is in revocation deny-set; target deactivated",
+                         (unsigned long long)st.serial);
+                err = (derr == FP_OK) ? FP_ERR_POLICY : derr;
+                goto done;
+            }
         }
         rep.outcome = FP_AGENT_UP_TO_DATE;
         snprintf(rep.detail, sizeof(rep.detail), "up to date at serial %llu", (unsigned long long)st.serial);
@@ -1354,17 +1292,25 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     int failed_had_prev = 1;
     uint64_t failed_serial = load_failed_serial(cfg->store_dir, &failed_had_prev);
     if (latest_ev.serial == failed_serial) {
-        if (st.has_current && deny_set_contains(cfg->store_dir, &st.current_dna)) {
-            fp_err_t derr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
-                                                   "REVOKED_FAILED_SERIAL=1\n");
-            rep.outcome = FP_AGENT_REVOKED;
-            rep.active_serial = 0;
-            memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
-            snprintf(rep.detail, sizeof(rep.detail),
-                     "active release is revoked while serial %llu previously failed health-check; target deactivated",
-                     (unsigned long long)failed_serial);
-            err = (derr == FP_OK) ? FP_ERR_POLICY : derr;
-            goto done;
+        if (st.has_current) {
+            fp_deny_status_t cds = fp_denyset_check(cfg->store_dir, &st.current_dna);
+            if (cds == FP_DENY_ERROR) {
+                err = FP_ERR_INTEGRITY;
+                snprintf(rep.detail, sizeof(rep.detail), "revocation deny-set unreadable/corrupt");
+                goto done;
+            }
+            if (cds == FP_DENY_REVOKED) {
+                fp_err_t derr = deactivate_live_target(cfg->target_dir, ".sf_revoked",
+                                                       "REVOKED_FAILED_SERIAL=1\n");
+                rep.outcome = FP_AGENT_REVOKED;
+                rep.active_serial = 0;
+                memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
+                snprintf(rep.detail, sizeof(rep.detail),
+                         "active release is revoked while serial %llu previously failed health-check; target deactivated",
+                         (unsigned long long)failed_serial);
+                err = (derr == FP_OK) ? FP_ERR_POLICY : derr;
+                goto done;
+            }
         }
         if (failed_had_prev && st.has_current) {
             rep.outcome = FP_AGENT_ROLLED_BACK;
@@ -1458,14 +1404,21 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         }
     }
 
-    /* P0-03, P0-05, A7-P0-02 & A8-P0-04: Immediate ENOSPC-safe revocation fencing & durable deny-set!
-     * If the currently active release is revoked in this chain (or already in `.revoked_dnas`),
-     * unlink `current` FIRST (requires zero disk space!) and persist its deny-set entry BEFORE
-     * processing any other revocations or replacement downloads so no I/O error on a later entry
-     * or marker file can ever leave a revoked active release live! */
+    /* P0-03, P0-05, A7-P0-02, A8-P0-04, A9-P1-03 & A9-P1-04:
+     * Immediate ENOSPC-safe revocation fencing & tri-state durable deny-set!
+     * A corrupted/unreadable `.revoked_dnas` fails closed with FP_ERR_INTEGRITY WITHOUT
+     * calling fp_denyset_add() on an unrevoked active DNA! And if deactivate_live_target()
+     * fails, report FENCE_FAILED accurately without claiming `current unlinked`! */
     int active_revoked_in_chain = 0;
     if (st.has_current) {
-        if (deny_set_contains(cfg->store_dir, &st.current_dna)) {
+        fp_deny_status_t cds = fp_denyset_check(cfg->store_dir, &st.current_dna);
+        if (cds == FP_DENY_ERROR) {
+            free(chain); free(chain_ridx);
+            err = FP_ERR_INTEGRITY;
+            snprintf(rep.detail, sizeof(rep.detail), "revocation deny-set unreadable/corrupt; failing closed");
+            goto done;
+        }
+        if (cds == FP_DENY_REVOKED) {
             active_revoked_in_chain = 1;
         } else {
             for (uint64_t i = 0; i < chain_len; i++) {
@@ -1482,22 +1435,24 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
         snprintf(rev_marker, sizeof(rev_marker), "REVOKED_SERIAL=%llu\n", (unsigned long long)latest_ev.serial);
         /* deactivate_live_target() unlinks `<target_dir>/current` BEFORE attempting marker write! */
         fp_err_t ferr = deactivate_live_target(cfg->target_dir, ".sf_revoked", rev_marker);
-        fp_err_t derr = deny_set_add_dna(cfg->store_dir, &st.current_dna);
+        fp_err_t derr = fp_denyset_add(cfg->store_dir, &st.current_dna);
         if (ferr != FP_OK || derr != FP_OK) {
-            err = (derr != FP_OK) ? derr : ferr;
+            err = (ferr != FP_OK) ? ferr : derr;
             free(chain); free(chain_ridx);
-            rep.outcome = FP_AGENT_REVOKED;
+            rep.outcome = (ferr == FP_OK) ? FP_AGENT_REVOKED : FP_AGENT_REJECTED;
             rep.active_serial = 0;
             memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
             snprintf(rep.detail, sizeof(rep.detail),
-                     "active release revoked at serial %llu; current unlinked but durable persist failed (%s)",
+                     ferr != FP_OK
+                         ? "CRITICAL: active release revoked at serial %llu; FENCE_FAILED (%s)"
+                         : "active release revoked at serial %llu; current unlinked but FENCE_PERSIST_FAILED (%s)",
                      (unsigned long long)latest_ev.serial, fp_strerror(err));
             goto done;
         }
     }
     for (uint64_t i = 0; i < chain_len; i++) {
         if (chain[i].action == FP_ACTION_REVOKE) {
-            err = deny_set_add_dna(cfg->store_dir, &chain[i].target_dna);
+            err = fp_denyset_add(cfg->store_dir, &chain[i].target_dna);
             if (err != FP_OK) {
                 free(chain); free(chain_ridx);
                 if (active_revoked_in_chain) {
@@ -1917,14 +1872,40 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
     rep.health_exit_code = hrc;
     if (hrc != 0) {
         uint64_t q_serial = eff_q_serial;
-        int prev_is_revoked = (st.has_current && deny_set_contains(cfg->store_dir, &st.current_dna));
+        int prev_is_revoked = 0;
+        if (st.has_current) {
+            fp_deny_status_t pds = fp_denyset_check(cfg->store_dir, &st.current_dna);
+            if (pds == FP_DENY_ERROR) {
+                fp_sql_close(sql);
+                free(chain); free(chain_ridx);
+                rep.outcome = FP_AGENT_ROLLBACK_FAILED;
+                rep.active_serial = 0;
+                memset(&rep.active_bundle_dna, 0, sizeof(rep.active_bundle_dna));
+                snprintf(rep.detail, sizeof(rep.detail),
+                         "CRITICAL: health-check failed (exit=%d) AND deny-set corrupted/unreadable", hrc);
+                err = FP_ERR_INTEGRITY;
+                goto done;
+            }
+            prev_is_revoked = (pds == FP_DENY_REVOKED);
+        }
         if (st.has_current && !is_explicit_rollback && !prev_is_revoked) {
             fp_err_t rerr = fp_bundle_rollback(cfg->store_dir, &final_target_dna,
                                                &st.current_dna, cfg->target_dir, sql);
             fp_sql_close(sql);
             free(chain); free(chain_ridx);
             if (rerr == FP_OK) {
-                save_failed_serial(cfg->store_dir, q_serial, 1);
+                /* A9-P1-08: Persist quarantine BEFORE clearing `.sf_ota_state` so failure preserves recovery state! */
+                fp_err_t qerr = save_failed_serial(cfg->store_dir, q_serial, 1);
+                if (qerr != FP_OK) {
+                    rep.outcome = FP_AGENT_ROLLBACK_FAILED;
+                    rep.active_serial = st.serial;
+                    rep.active_bundle_dna = st.current_dna;
+                    snprintf(rep.detail, sizeof(rep.detail),
+                             "auto-rolled back to serial %llu but quarantine persist failed (%s)",
+                             (unsigned long long)st.serial, fp_strerror(qerr));
+                    err = qerr;
+                    goto done;
+                }
                 cleanup_pending_events(cfg->store_dir, chain_first_serial, latest_ev.serial);
                 (void)clear_ota_lifecycle(cfg->target_dir);
                 rep.outcome = FP_AGENT_ROLLED_BACK;
@@ -1960,7 +1941,9 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
             fp_sql_close(sql);
             free(chain); free(chain_ridx);
             if (derr == FP_OK) {
-                save_failed_serial(cfg->store_dir, q_serial, 0);
+                derr = save_failed_serial(cfg->store_dir, q_serial, 0);
+            }
+            if (derr == FP_OK) {
                 cleanup_pending_events(cfg->store_dir, chain_first_serial, latest_ev.serial);
                 derr = clear_ota_lifecycle(cfg->target_dir);
             }
@@ -1970,7 +1953,7 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
             snprintf(rep.detail, sizeof(rep.detail),
                      derr == FP_OK
                          ? "health-check failed (exit=%d) on serial %llu and prior DNA is REVOKED; SQLite reverted & target deactivated"
-                         : "CRITICAL: health-check failed (exit=%d) on serial %llu and prior DNA is REVOKED; SQLite revert/deactivation failed (%s)",
+                         : "CRITICAL: health-check failed (exit=%d) on serial %llu and prior DNA is REVOKED; SQLite revert/deactivation/quarantine failed (%s)",
                      hrc, (unsigned long long)q_serial, fp_strerror(derr));
             err = (derr == FP_OK) ? FP_ERR_POLICY : derr;
             goto done;
@@ -1995,7 +1978,9 @@ fp_err_t fp_agent_sync_once(const fp_agent_cfg_t *cfg, fp_agent_report_t *out_re
             fp_sql_close(sql);
             free(chain); free(chain_ridx);
             if (derr == FP_OK) {
-                save_failed_serial(cfg->store_dir, q_serial, 0);
+                derr = save_failed_serial(cfg->store_dir, q_serial, 0);
+            }
+            if (derr == FP_OK) {
                 cleanup_pending_events(cfg->store_dir, chain_first_serial, latest_ev.serial);
                 (void)clear_ota_lifecycle(cfg->target_dir);
             }

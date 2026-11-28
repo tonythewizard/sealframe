@@ -127,6 +127,9 @@ fp_err_t fp_sql_open(const char *db_path, fp_sql_ctx_t **out_ctx) {
         "PRAGMA journal_mode=WAL;"
         "PRAGMA synchronous=FULL;"
         "PRAGMA busy_timeout=5000;"
+        "PRAGMA foreign_keys=ON;"
+        "PRAGMA recursive_triggers=OFF;"
+        "PRAGMA trusted_schema=OFF;"
         "CREATE TABLE IF NOT EXISTS _fp_progress ("
         "  id INTEGER PRIMARY KEY CHECK(id=1),"
         "  seq INTEGER NOT NULL,"
@@ -168,13 +171,49 @@ fp_err_t fp_sql_exec(fp_sql_ctx_t *ctx, const char *sql) {
     return sqlite3_exec(ctx->db, sql, NULL, NULL, NULL) == SQLITE_OK ? FP_OK : FP_ERR_IO;
 }
 
-/* A7-P0-01: Schema-bound changeset envelope (`SFCS1`) binds the exact destination table
- * schema (column order, names, types, notnull, defaults, PK positions) via BLAKE3-256 so
- * SQLite Session's positional column format can NEVER silently swap reordered columns.
- * Legacy raw SQLite changeset blobs remain readable for backward compatibility. */
+/* A7-P0-01 / A8-P0-01 / A9-P0-02 / A9-P0-03: Versioned schema-bound changeset envelope (`SFCS2`).
+ * Binds table_xinfo, canonical sqlite_master DDL, indexes/triggers, connection PRAGMA profile
+ * (foreign_keys, recursive_triggers, trusted_schema), and inbound FK clauses via BLAKE3-256.
+ * Magic `SFCS2` is explicitly distinct from legacy raw and `SFCS1` (zero silent format ambiguity). */
 #define SFCS1_MAGIC     "SFCS1"
-#define SFCS1_MAGIC_LEN 5u
-#define SFCS1_HDR_LEN   42u /* 5 magic + 1 flags + 32 schema_hash + 4 raw_len BE */
+#define SFCS2_MAGIC     "SFCS2"
+#define SFCS2_MAGIC_LEN 5u
+#define SFCS2_HDR_LEN   42u /* 5 magic + 1 flags + 32 schema_hash + 4 raw_len BE */
+
+static fp_err_t query_pragma_int(sqlite3 *db, const char *pragma_sql, int *out_val) {
+    if (!db || !pragma_sql || !out_val) return FP_ERR_INVALID;
+    sqlite3_stmt *ps = NULL;
+    if (sqlite3_prepare_v2(db, pragma_sql, -1, &ps, NULL) != SQLITE_OK) return FP_ERR_IO;
+    int rc = sqlite3_step(ps);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(ps);
+        return FP_ERR_IO;
+    }
+    *out_val = sqlite3_column_int(ps, 0);
+    sqlite3_finalize(ps);
+    return FP_OK;
+}
+
+static fp_err_t check_foreign_key_integrity(sqlite3 *db) {
+    if (!db) return FP_ERR_INVALID;
+    sqlite3_stmt *ps = NULL;
+    if (sqlite3_prepare_v2(db, "PRAGMA foreign_key_check;", -1, &ps, NULL) != SQLITE_OK) {
+        return FP_ERR_IO;
+    }
+    int rc = sqlite3_step(ps);
+    sqlite3_finalize(ps);
+    if (rc == SQLITE_ROW) return FP_ERR_INTEGRITY; /* At least one FK violation! */
+    return (rc == SQLITE_DONE) ? FP_OK : FP_ERR_IO;
+}
+
+/* A9-P1-01: Safe COMMIT that guarantees rollback if COMMIT fails leaving an open transaction. */
+static fp_err_t commit_or_rollback(sqlite3 *db) {
+    if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) return FP_OK;
+    if (!sqlite3_get_autocommit(db)) {
+        (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    }
+    return FP_ERR_IO;
+}
 
 static void blake3_update_ascii_lower(blake3_hasher *h, const char *s, size_t len) {
     uint8_t buf[128];
@@ -195,14 +234,19 @@ static void blake3_update_ascii_lower(blake3_hasher *h, const char *s, size_t le
 static fp_err_t compute_table_schema_hash(sqlite3 *db, const char *table_name,
                                           uint8_t out_hash[FP_DNA_LEN],
                                           uint32_t *out_col_count,
-                                          uint32_t *out_trigger_count) {
+                                          uint32_t *out_trigger_count,
+                                          uint32_t *out_inbound_cascade) {
     if (out_col_count) *out_col_count = 0;
     if (out_trigger_count) *out_trigger_count = 0;
+    if (out_inbound_cascade) *out_inbound_cascade = 0;
     if (!db || !table_name || !out_hash || !safe_ident(table_name)) return FP_ERR_INVALID;
 
-    /* A8-P0-01 + A8-P1-02: Use PRAGMA table_xinfo (includes hidden/generated columns) AND bind
-     * canonical table DDL + all dependent indexes & triggers from sqlite_master into the BLAKE3
-     * schema hash so COLLATE, CHECK, UNIQUE, FK, STRICT, WITHOUT ROWID & triggers cannot diverge! */
+    int fk_on = 0, rec_trig = 0, trusted_sch = 0;
+    fp_err_t perr = query_pragma_int(db, "PRAGMA foreign_keys;", &fk_on);
+    if (perr == FP_OK) perr = query_pragma_int(db, "PRAGMA recursive_triggers;", &rec_trig);
+    if (perr == FP_OK) perr = query_pragma_int(db, "PRAGMA trusted_schema;", &trusted_sch);
+    if (perr != FP_OK) return perr;
+
     char pragma_sql[192];
     if (snprintf(pragma_sql, sizeof(pragma_sql), "PRAGMA table_xinfo(\"%s\");", table_name) >= (int)sizeof(pragma_sql)) {
         return FP_ERR_BOUNDS;
@@ -210,13 +254,17 @@ static fp_err_t compute_table_schema_hash(sqlite3 *db, const char *table_name,
     sqlite3_stmt *ps = NULL;
     if (sqlite3_prepare_v2(db, pragma_sql, -1, &ps, NULL) != SQLITE_OK) return FP_ERR_IO;
 
-    static const uint8_t tag[15] = "SF2/SQLSCHEMA";
+    static const uint8_t tag[14] = "SF3/SQLSCHEMA";
     blake3_hasher h;
     blake3_hasher_init(&h);
     blake3_hasher_update(&h, tag, sizeof(tag));
     blake3_update_ascii_lower(&h, table_name, strlen(table_name));
     uint8_t nul = 0;
     blake3_hasher_update(&h, &nul, 1);
+
+    /* A9-P0-02: Bind connection PRAGMA profile into schema hash */
+    uint8_t prof[3] = { fk_on ? 1u : 0u, rec_trig ? 1u : 0u, trusted_sch ? 1u : 0u };
+    blake3_hasher_update(&h, prof, sizeof(prof));
 
     uint32_t col_count = 0;
     int prc;
@@ -296,16 +344,21 @@ static fp_err_t compute_table_schema_hash(sqlite3 *db, const char *table_name,
     if (ddl && ddl_len > 0) blake3_hasher_update(&h, ddl, (size_t)ddl_len);
     sqlite3_finalize(ms);
 
-    /* Bind all dependent indexes and triggers ordered deterministically by (type, lower(name)) */
+    /* Bind all dependent indexes and triggers (both persistent sqlite_master and TEMP triggers!) */
     sqlite3_stmt *ds = NULL;
     if (sqlite3_prepare_v2(db,
-            "SELECT type, lower(name), COALESCE(sql,'') FROM sqlite_master "
-            "WHERE lower(tbl_name)=lower(?) AND type IN ('index','trigger') "
-            "ORDER BY type COLLATE BINARY, lower(name) COLLATE BINARY;",
+            "SELECT t, n, q FROM ("
+            "  SELECT type AS t, lower(name) AS n, COALESCE(sql,'') AS q FROM sqlite_master "
+            "  WHERE lower(tbl_name)=lower(?) AND type IN ('index','trigger') "
+            "  UNION ALL "
+            "  SELECT type AS t, lower(name) AS n, COALESCE(sql,'') AS q FROM sqlite_temp_master "
+            "  WHERE lower(tbl_name)=lower(?) AND type='trigger'"
+            ") ORDER BY t COLLATE BINARY, n COLLATE BINARY;",
             -1, &ds, NULL) != SQLITE_OK) {
         return FP_ERR_IO;
     }
     sqlite3_bind_text(ds, 1, table_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ds, 2, table_name, -1, SQLITE_TRANSIENT);
     uint32_t dep_count = 0, trig_count = 0;
     int drc;
     while ((drc = sqlite3_step(ds)) == SQLITE_ROW) {
@@ -333,14 +386,82 @@ static fp_err_t compute_table_schema_hash(sqlite3 *db, const char *table_name,
     sqlite3_finalize(ds);
     if (drc != SQLITE_DONE) return FP_ERR_IO;
 
+    /* A9-P0-02: Inspect inbound foreign-key dependencies from OTHER tables referencing `table_name`!
+     * Any inbound ON DELETE/UPDATE CASCADE, SET NULL, or SET DEFAULT would mutate an unattached table
+     * outside the single-table changeset and is counted in `inbound_cascade` + bound into schema_hash! */
+    uint32_t inbound_fk_cnt = 0, inbound_cascade = 0;
+    sqlite3_stmt *ts = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT name FROM sqlite_master WHERE type='table' AND lower(name)!=lower(?) "
+            "AND lower(name) NOT LIKE '_fp_%' AND lower(name) NOT LIKE 'sqlite_%' "
+            "ORDER BY lower(name) COLLATE BINARY;",
+            -1, &ts, NULL) != SQLITE_OK) {
+        return FP_ERR_IO;
+    }
+    sqlite3_bind_text(ts, 1, table_name, -1, SQLITE_TRANSIENT);
+    int trc;
+    while ((trc = sqlite3_step(ts)) == SQLITE_ROW) {
+        const char *other = (const char *)sqlite3_column_text(ts, 0);
+        if (!other || !safe_ident(other)) continue;
+        char fk_sql[192];
+        if (snprintf(fk_sql, sizeof(fk_sql), "PRAGMA foreign_key_list(\"%s\");", other) >= (int)sizeof(fk_sql)) {
+            sqlite3_finalize(ts);
+            return FP_ERR_BOUNDS;
+        }
+        sqlite3_stmt *fks = NULL;
+        if (sqlite3_prepare_v2(db, fk_sql, -1, &fks, NULL) != SQLITE_OK) {
+            sqlite3_finalize(ts);
+            return FP_ERR_IO;
+        }
+        int fkrc;
+        while ((fkrc = sqlite3_step(fks)) == SQLITE_ROW) {
+            const char *ref_tbl = (const char *)sqlite3_column_text(fks, 2);
+            if (!ref_tbl || sqlite3_stricmp(ref_tbl, table_name) != 0) continue;
+            const char *from_col = (const char *)sqlite3_column_text(fks, 3);
+            const char *to_col   = (const char *)sqlite3_column_text(fks, 4);
+            const char *on_upd   = (const char *)sqlite3_column_text(fks, 5);
+            const char *on_del   = (const char *)sqlite3_column_text(fks, 6);
+            if (!from_col) from_col = "";
+            if (!to_col)   to_col = "";
+            if (!on_upd)   on_upd = "NO ACTION";
+            if (!on_del)   on_del = "NO ACTION";
+            if (sqlite3_stricmp(on_del, "NO ACTION") != 0 && sqlite3_stricmp(on_del, "RESTRICT") != 0) {
+                inbound_cascade++;
+            }
+            if (sqlite3_stricmp(on_upd, "NO ACTION") != 0 && sqlite3_stricmp(on_upd, "RESTRICT") != 0) {
+                inbound_cascade++;
+            }
+            const char *parts[5] = { other, from_col, to_col, on_upd, on_del };
+            for (int pi = 0; pi < 5; pi++) {
+                size_t pl = strlen(parts[pi]);
+                put_be32(cb, (uint32_t)pl);
+                blake3_hasher_update(&h, cb, 4);
+                blake3_update_ascii_lower(&h, parts[pi], pl);
+            }
+            inbound_fk_cnt++;
+        }
+        sqlite3_finalize(fks);
+        if (fkrc != SQLITE_DONE) {
+            sqlite3_finalize(ts);
+            return FP_ERR_IO;
+        }
+    }
+    sqlite3_finalize(ts);
+    if (trc != SQLITE_DONE) return FP_ERR_IO;
+
     put_be32(cb, dep_count);
     blake3_hasher_update(&h, cb, 4);
     put_be32(cb, trig_count);
+    blake3_hasher_update(&h, cb, 4);
+    put_be32(cb, inbound_fk_cnt);
+    blake3_hasher_update(&h, cb, 4);
+    put_be32(cb, inbound_cascade);
     blake3_hasher_update(&h, cb, 4);
 
     blake3_hasher_finalize(&h, out_hash, FP_DNA_LEN);
     if (out_col_count) *out_col_count = col_count;
     if (out_trigger_count) *out_trigger_count = trig_count;
+    if (out_inbound_cascade) *out_inbound_cascade = inbound_cascade;
     return FP_OK;
 }
 
@@ -348,45 +469,75 @@ static fp_err_t unwrap_changeset_blob(sqlite3 *db, const uint8_t *blob, size_t b
                                       const char *table_name, int allow_legacy_raw,
                                       const uint8_t **out_raw, size_t *out_raw_len) {
     if (!blob || blob_len == 0 || !out_raw || !out_raw_len) return FP_ERR_INVALID;
-    if (blob_len >= SFCS1_MAGIC_LEN && memcmp(blob, SFCS1_MAGIC, SFCS1_MAGIC_LEN) == 0) {
-        if (blob_len < SFCS1_HDR_LEN) return FP_ERR_INTEGRITY;
+    if (blob_len >= SFCS2_MAGIC_LEN && memcmp(blob, SFCS2_MAGIC, SFCS2_MAGIC_LEN) == 0) {
+        if (blob_len < SFCS2_HDR_LEN) return FP_ERR_INTEGRITY;
         if (blob[5] != 0u) return FP_ERR_INTEGRITY; /* unsupported flags */
         uint32_t raw_len = get_be32(blob + 38);
-        if ((size_t)raw_len != blob_len - SFCS1_HDR_LEN) return FP_ERR_INTEGRITY;
+        if ((size_t)raw_len != blob_len - SFCS2_HDR_LEN) return FP_ERR_INTEGRITY;
         if (db != NULL) {
             uint8_t actual_hash[FP_DNA_LEN];
-            uint32_t trig_cnt = 0;
-            fp_err_t serr = compute_table_schema_hash(db, table_name, actual_hash, NULL, &trig_cnt);
+            uint32_t trig_cnt = 0, inbound_cascade = 0;
+            fp_err_t serr = compute_table_schema_hash(db, table_name, actual_hash,
+                                                      NULL, &trig_cnt, &inbound_cascade);
             if (serr != FP_OK) return serr;
-            /* A8-P0-01: Deterministic profile rejects untracked triggers on governed tables fail-closed! */
-            if (trig_cnt > 0u) return FP_ERR_POLICY;
+            /* A8-P0-01 + A9-P0-02: Deterministic profile rejects triggers & unattached inbound FK cascades! */
+            if (trig_cnt > 0u || inbound_cascade > 0u) return FP_ERR_POLICY;
             if (memcmp(actual_hash, blob + 6, FP_DNA_LEN) != 0) {
                 return FP_ERR_INTEGRITY;
             }
         }
-        *out_raw = blob + SFCS1_HDR_LEN;
+        *out_raw = blob + SFCS2_HDR_LEN;
         *out_raw_len = (size_t)raw_len;
         return FP_OK;
     }
-    /* A8-P0-02: Legacy raw SQLite changesets without SFCS1 schema attestation are rejected fail-closed
+    /* A9-P0-03: Explicit version rejection for legacy SFCS1 blobs (never silently confused with SFCS2!) */
+    if (blob_len >= SFCS2_MAGIC_LEN && memcmp(blob, SFCS1_MAGIC, SFCS2_MAGIC_LEN) == 0) {
+        return FP_ERR_POLICY;
+    }
+    /* A8-P0-02: Legacy raw SQLite changesets without SFCS2 schema attestation are rejected fail-closed
      * unless explicitly permitted (used ONLY for in-memory sqlite3changeset_invert() outputs). */
     if (!allow_legacy_raw) {
         return FP_ERR_POLICY;
     }
     if (db != NULL) {
         uint8_t dummy_hash[FP_DNA_LEN];
-        uint32_t trig_cnt = 0;
-        fp_err_t serr = compute_table_schema_hash(db, table_name, dummy_hash, NULL, &trig_cnt);
+        uint32_t trig_cnt = 0, inbound_cascade = 0;
+        fp_err_t serr = compute_table_schema_hash(db, table_name, dummy_hash,
+                                                  NULL, &trig_cnt, &inbound_cascade);
         if (serr != FP_OK) return serr;
-        if (trig_cnt > 0u) return FP_ERR_POLICY;
+        if (trig_cnt > 0u || inbound_cascade > 0u) return FP_ERR_POLICY;
     }
     *out_raw = blob;
     *out_raw_len = blob_len;
     return FP_OK;
 }
 
-/* A8-P1-01: Transactional snapshot capture — compute schema_hash, reject triggers/no-op,
- * and allocate SFCS1 wrapper INSIDE the transaction BEFORE COMMIT so any error rolls back cleanly! */
+/* A9-P0-01: Strict SQLite authorizer active during fp_sql_capture_changeset()!
+ * Permits ONLY INSERT/UPDATE/DELETE on the single declared `allowed_table` in `main` (+ SELECT/READ).
+ * Denies fail-closed: writes to any other table, COMMIT/ROLLBACK/SAVEPOINT, ATTACH/DETACH, PRAGMA,
+ * DDL (CREATE/DROP/ALTER), triggers, VACUUM, REINDEX. */
+static int capture_authorizer(void *user_data, int action, const char *arg1, const char *arg2,
+                              const char *db_name, const char *trigger_name) {
+    const char *allowed = (const char *)user_data;
+    (void)arg2;
+    if (trigger_name != NULL) return SQLITE_DENY;
+    if (action == SQLITE_SELECT || action == SQLITE_FUNCTION) return SQLITE_OK;
+    if (action == SQLITE_READ) {
+        if (db_name && sqlite3_stricmp(db_name, "main") != 0) return SQLITE_DENY;
+        if (arg1 && sqlite3_strnicmp(arg1, "_fp_", 4) == 0) return SQLITE_DENY;
+        return SQLITE_OK;
+    }
+    if (action == SQLITE_INSERT || action == SQLITE_UPDATE || action == SQLITE_DELETE) {
+        if (db_name && sqlite3_stricmp(db_name, "main") != 0) return SQLITE_DENY;
+        if (arg1 && allowed && sqlite3_stricmp(arg1, allowed) == 0) return SQLITE_OK;
+        return SQLITE_DENY;
+    }
+    return SQLITE_DENY;
+}
+
+/* A8-P1-01 + A9-P0-01 + A9-P0-02 + A9-P0-03: Confined transactional snapshot capture!
+ * Authorizer restricts DML strictly to `table_name`, checks FK integrity & exact delta == ops,
+ * and builds the SFCS2 wrapper INSIDE the transaction BEFORE COMMIT so any error rolls back 100%! */
 fp_err_t fp_sql_capture_changeset(fp_sql_ctx_t *ctx, const char *table_name,
                                   const char *sql,
                                   uint8_t **out_cs, size_t *out_len) {
@@ -408,46 +559,98 @@ fp_err_t fp_sql_capture_changeset(fp_sql_ctx_t *ctx, const char *table_name,
     }
 
     uint8_t pre_hash[FP_DNA_LEN], post_hash[FP_DNA_LEN];
-    uint32_t pre_trig = 0, post_trig = 0;
-    err = compute_table_schema_hash(ctx->db, table_name, pre_hash, NULL, &pre_trig);
-    if (err == FP_OK && pre_trig > 0u) err = FP_ERR_POLICY;
+    uint32_t pre_trig = 0, post_trig = 0, pre_casc = 0, post_casc = 0;
+    err = compute_table_schema_hash(ctx->db, table_name, pre_hash, NULL, &pre_trig, &pre_casc);
+    if (err == FP_OK && (pre_trig > 0u || pre_casc > 0u)) err = FP_ERR_POLICY;
 
+    sqlite3_int64 ch_before = sqlite3_total_changes64(ctx->db);
     if (err == FP_OK) {
         int rc = sqlite3session_create(ctx->db, "main", &sess);
         if (rc == SQLITE_OK) rc = sqlite3session_attach(sess, table_name);
-        if (rc == SQLITE_OK) rc = sqlite3_exec(ctx->db, sql, NULL, NULL, NULL);
-        if (rc == SQLITE_OK) rc = sqlite3session_changeset(sess, &raw_sz, &raw);
-        if (rc != SQLITE_OK || raw_sz < 0) err = FP_ERR_IO;
+        if (rc == SQLITE_OK) {
+            /* A9-P0-01: Prepare EACH SQL statement under `capture_authorizer`, then clear
+             * authorizer before `sqlite3_step()` so `sqlite3session`'s internal preupdate
+             * schema lookup (`PRAGMA table_info`) succeeds while EVERY user statement is
+             * strictly confined to `table_name`! */
+            const char *tail = sql;
+            while (tail && *tail && err == FP_OK) {
+                sqlite3_stmt *stmt = NULL;
+                if (sqlite3_set_authorizer(ctx->db, capture_authorizer, (void *)table_name) != SQLITE_OK) {
+                    err = FP_ERR_IO;
+                    break;
+                }
+                int prc = sqlite3_prepare_v2(ctx->db, tail, -1, &stmt, &tail);
+                (void)sqlite3_set_authorizer(ctx->db, NULL, NULL);
+                if (prc == SQLITE_AUTH) { err = FP_ERR_POLICY; break; }
+                if (prc != SQLITE_OK) { err = FP_ERR_IO; break; }
+                if (!stmt) continue;
+                int src;
+                while ((src = sqlite3_step(stmt)) == SQLITE_ROW) { /* drain */ }
+                int frc = sqlite3_finalize(stmt);
+                if (src != SQLITE_DONE || frc != SQLITE_OK) {
+                    err = (src == SQLITE_AUTH || frc == SQLITE_AUTH) ? FP_ERR_POLICY : FP_ERR_IO;
+                    break;
+                }
+            }
+        } else {
+            err = FP_ERR_IO;
+        }
+        if (err == FP_OK && sqlite3_get_autocommit(ctx->db) != 0) {
+            err = FP_ERR_POLICY; /* Transaction was closed unexpectedly */
+        }
+        if (err == FP_OK) {
+            rc = sqlite3session_changeset(sess, &raw_sz, &raw);
+            if (rc != SQLITE_OK || raw_sz < 0) err = FP_ERR_IO;
+        }
     }
+    sqlite3_int64 ch_after = sqlite3_total_changes64(ctx->db);
     if (sess) {
         sqlite3session_delete(sess);
         sess = NULL;
     }
 
     if (err == FP_OK) {
-        err = compute_table_schema_hash(ctx->db, table_name, post_hash, NULL, &post_trig);
-        if (err == FP_OK && post_trig > 0u) err = FP_ERR_POLICY;
+        err = compute_table_schema_hash(ctx->db, table_name, post_hash, NULL, &post_trig, &post_casc);
+        if (err == FP_OK && (post_trig > 0u || post_casc > 0u)) err = FP_ERR_POLICY;
         if (err == FP_OK && memcmp(pre_hash, post_hash, FP_DNA_LEN) != 0) err = FP_ERR_POLICY;
     }
+    if (err == FP_OK) {
+        err = check_foreign_key_integrity(ctx->db);
+    }
     if (err == FP_OK && raw_sz == 0) {
-        /* Reject no-op capture cleanly (would produce invalid raw_len=0 changeset) */
         err = FP_ERR_INVALID;
     }
     if (err == FP_OK) {
+        /* Verify every row change made during SQL exec is accounted for in the captured changeset */
+        sqlite3_changeset_iter *it = NULL;
+        if (sqlite3changeset_start(&it, raw_sz, raw) != SQLITE_OK || !it) {
+            err = FP_ERR_INTEGRITY;
+        } else {
+            int cap_ops = 0;
+            int irc;
+            while ((irc = sqlite3changeset_next(it)) == SQLITE_ROW) cap_ops++;
+            int frc = sqlite3changeset_finalize(it);
+            if (irc != SQLITE_DONE || frc != SQLITE_OK || cap_ops <= 0 ||
+                (ch_after - ch_before) < (sqlite3_int64)cap_ops) {
+                err = FP_ERR_INTEGRITY;
+            }
+        }
+    }
+    if (err == FP_OK) {
         size_t rlen = (size_t)raw_sz;
-        if (rlen > (size_t)UINT32_MAX - SFCS1_HDR_LEN) {
+        if (rlen > (size_t)UINT32_MAX - SFCS2_HDR_LEN) {
             err = FP_ERR_BOUNDS;
         } else {
-            total_len = SFCS1_HDR_LEN + rlen;
+            total_len = SFCS2_HDR_LEN + rlen;
             wrapped = malloc(total_len);
             if (!wrapped) {
                 err = FP_ERR_NOMEM;
             } else {
-                memcpy(wrapped, SFCS1_MAGIC, SFCS1_MAGIC_LEN);
+                memcpy(wrapped, SFCS2_MAGIC, SFCS2_MAGIC_LEN);
                 wrapped[5] = 0u;
                 memcpy(wrapped + 6, post_hash, FP_DNA_LEN);
                 put_be32(wrapped + 38, (uint32_t)rlen);
-                memcpy(wrapped + SFCS1_HDR_LEN, raw, rlen);
+                memcpy(wrapped + SFCS2_HDR_LEN, raw, rlen);
             }
         }
     }
@@ -455,12 +658,11 @@ fp_err_t fp_sql_capture_changeset(fp_sql_ctx_t *ctx, const char *table_name,
     raw = NULL;
 
     if (err == FP_OK) {
-        if (sqlite3_exec(ctx->db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
-            err = FP_ERR_IO;
-        }
+        err = commit_or_rollback(ctx->db);
+    } else if (!sqlite3_get_autocommit(ctx->db)) {
+        (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
     }
     if (err != FP_OK) {
-        (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
         free(wrapped);
         return err;
     }
@@ -473,13 +675,20 @@ fp_err_t fp_sql_capture_changeset(fp_sql_ctx_t *ctx, const char *table_name,
 fp_err_t fp_sql_state_digest(fp_sql_ctx_t *ctx, const char *table_name, fp_dna_t *out_dna) {
     if (!ctx || !table_name || !out_dna || !safe_ident(table_name)) return FP_ERR_INVALID;
 
-    /* A7-P1-05 + A8-P1-02: Bind full DDL/schema hash + column count + per-row delimiter,
-     * support up to 64 PK columns (fail closed on >64 or invalid PK identifier), and force
-     * explicit `COLLATE BINARY` on ORDER BY so ordering never depends on table collation! */
+    /* A9-P1-06: Take a single read-consistent snapshot if not already inside a transaction! */
+    int started_sp = 0;
+    if (sqlite3_get_autocommit(ctx->db)) {
+        if (sqlite3_exec(ctx->db, "BEGIN DEFERRED", NULL, NULL, NULL) != SQLITE_OK) return FP_ERR_IO;
+        started_sp = 1;
+    }
+
     uint8_t schema_hash[FP_DNA_LEN];
     uint32_t schema_cols = 0;
-    fp_err_t serr = compute_table_schema_hash(ctx->db, table_name, schema_hash, &schema_cols, NULL);
-    if (serr != FP_OK) return serr;
+    fp_err_t serr = compute_table_schema_hash(ctx->db, table_name, schema_hash, &schema_cols, NULL, NULL);
+    if (serr != FP_OK) {
+        if (started_sp) (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
+        return serr;
+    }
 
     char pk_cols[64][65];
     memset(pk_cols, 0, sizeof(pk_cols));
@@ -487,53 +696,76 @@ fp_err_t fp_sql_state_digest(fp_sql_ctx_t *ctx, const char *table_name, fp_dna_t
     {
         char pinfo[192];
         if (snprintf(pinfo, sizeof(pinfo), "PRAGMA table_xinfo(\"%s\");", table_name) >= (int)sizeof(pinfo)) {
+            if (started_sp) (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
             return FP_ERR_BOUNDS;
         }
         sqlite3_stmt *ps = NULL;
-        if (sqlite3_prepare_v2(ctx->db, pinfo, -1, &ps, NULL) != SQLITE_OK) return FP_ERR_IO;
+        if (sqlite3_prepare_v2(ctx->db, pinfo, -1, &ps, NULL) != SQLITE_OK) {
+            if (started_sp) (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
+            return FP_ERR_IO;
+        }
         int prc;
         while ((prc = sqlite3_step(ps)) == SQLITE_ROW) {
             int pk = sqlite3_column_int(ps, 5);
             if (pk <= 0) continue;
             if (pk > 64) {
                 sqlite3_finalize(ps);
+                if (started_sp) (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
                 return FP_ERR_BOUNDS;
             }
             const char *cname = (const char *)sqlite3_column_text(ps, 1);
             if (!cname || !safe_ident(cname) || strlen(cname) >= sizeof(pk_cols[0])) {
                 sqlite3_finalize(ps);
+                if (started_sp) (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
                 return FP_ERR_POLICY;
             }
             snprintf(pk_cols[pk - 1], sizeof(pk_cols[0]), "%s", cname);
             if (pk > max_pk) max_pk = pk;
         }
         sqlite3_finalize(ps);
-        if (prc != SQLITE_DONE) return FP_ERR_IO;
+        if (prc != SQLITE_DONE) {
+            if (started_sp) (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
+            return FP_ERR_IO;
+        }
     }
 
     char query[6144];
     int qpos = snprintf(query, sizeof(query), "SELECT * FROM \"%s\" ORDER BY ", table_name);
-    if (qpos <= 0 || (size_t)qpos >= sizeof(query)) return FP_ERR_BOUNDS;
+    if (qpos <= 0 || (size_t)qpos >= sizeof(query)) {
+        if (started_sp) (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
+        return FP_ERR_BOUNDS;
+    }
     int added_pk = 0;
     for (int i = 0; i < max_pk; i++) {
-        if (!pk_cols[i][0]) return FP_ERR_INTEGRITY; /* non-contiguous PK index */
+        if (!pk_cols[i][0]) {
+            if (started_sp) (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
+            return FP_ERR_INTEGRITY;
+        }
         int w = snprintf(query + qpos, sizeof(query) - (size_t)qpos, "%s\"%s\" COLLATE BINARY",
                          added_pk ? ", " : "", pk_cols[i]);
-        if (w <= 0 || (size_t)(qpos + w) >= sizeof(query)) return FP_ERR_BOUNDS;
+        if (w <= 0 || (size_t)(qpos + w) >= sizeof(query)) {
+            if (started_sp) (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
+            return FP_ERR_BOUNDS;
+        }
         qpos += w;
         added_pk = 1;
     }
     if (!added_pk) {
         int w = snprintf(query + qpos, sizeof(query) - (size_t)qpos, "rowid");
-        if (w <= 0 || (size_t)(qpos + w) >= sizeof(query)) return FP_ERR_BOUNDS;
+        if (w <= 0 || (size_t)(qpos + w) >= sizeof(query)) {
+            if (started_sp) (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
+            return FP_ERR_BOUNDS;
+        }
     }
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(ctx->db, query, -1, &stmt, NULL) != SQLITE_OK) {
+        if (started_sp) (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
         return FP_ERR_IO;
     }
 
-    static const uint8_t tag[13] = "FP1/SQLSTATE";
+    /* A9-P0-03: Explicit domain version FP2/SQLSTATE matching SF2/SQLSCHEMA */
+    static const uint8_t tag[13] = "FP2/SQLSTATE";
     blake3_hasher h;
     blake3_hasher_init(&h);
     blake3_hasher_update(&h, tag, sizeof(tag));
@@ -576,6 +808,7 @@ fp_err_t fp_sql_state_digest(fp_sql_ctx_t *ctx, const char *table_name, fp_dna_t
         blake3_hasher_update(&h, &row_delim, 1);
     }
     sqlite3_finalize(stmt);
+    if (started_sp) (void)sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
     if (rc != SQLITE_DONE) return FP_ERR_IO;
 
     blake3_hasher_finalize(&h, out_dna->bytes, FP_DNA_LEN);
@@ -861,6 +1094,203 @@ static fp_err_t stream_stage_object_at(int stage_root_fd, const char *store_dir,
     return FP_OK;
 }
 
+static int is_valid_hex64(const char *s) {
+    if (!s || strlen(s) != 64u) return 0;
+    for (size_t i = 0; i < 64u; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0;
+    }
+    return 1;
+}
+
+static int acquire_denyset_lock(const char *store_dir) {
+    char lpath[PATH_MAX];
+    if (snprintf(lpath, sizeof(lpath), "%s/.revoked_dnas.lock", store_dir) >= (int)sizeof(lpath)) return -1;
+    (void)mkdir(store_dir, 0700);
+    int fd = open(lpath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    while (flock(fd, LOCK_EX) != 0) {
+        if (errno != EINTR) { close(fd); return -1; }
+    }
+    return fd;
+}
+
+static void release_denyset_lock(int fd) {
+    if (fd >= 0) {
+        (void)flock(fd, LOCK_UN);
+        close(fd);
+    }
+}
+
+/* A9-P0-04 + A9-P1-04: Global tri-state durable revocation deny-set (`<store_dir>/.revoked_dnas`).
+ * Single Activation Authority: EVERY symlink activation path (including fp_bundle_recover,
+ * fp_bundle_apply, fp_bundle_apply_chain, fp_bundle_rollback) MUST check this gate!
+ * Distinguishes FP_DENY_ALLOWED (0), FP_DENY_REVOKED (1), and FP_DENY_ERROR (-1) so I/O or
+ * corruption fails closed WITHOUT misclassifying healthy DNAs as revoked! */
+fp_deny_status_t fp_denyset_check(const char *store_dir, const fp_dna_t *dna) {
+    if (!store_dir || !store_dir[0] || !dna) return FP_DENY_ERROR;
+    char path[PATH_MAX], hex[65];
+    fp_hex_encode(dna->bytes, FP_DNA_LEN, hex);
+    if (snprintf(path, sizeof(path), "%s/.revoked_dnas", store_dir) >= (int)sizeof(path)) {
+        return FP_DENY_ERROR;
+    }
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return (errno == ENOENT) ? FP_DENY_ALLOWED : FP_DENY_ERROR;
+    }
+    FILE *f = fdopen(fd, "r");
+    if (!f) {
+        close(fd);
+        return FP_DENY_ERROR;
+    }
+    char line[128];
+    int found = 0;
+    int corrupt = 0;
+    while (fgets(line, sizeof(line), f)) {
+        size_t l = strlen(line);
+        if (l == sizeof(line) - 1u && line[l - 1u] != '\n' && !feof(f)) {
+            corrupt = 1;
+            break;
+        }
+        while (l > 0 && (line[l - 1u] == '\n' || line[l - 1u] == '\r')) line[--l] = '\0';
+        if (l == 0) continue;
+        if (!is_valid_hex64(line)) {
+            corrupt = 1;
+            break;
+        }
+        if (strcmp(line, hex) == 0) {
+            found = 1;
+        }
+    }
+    if (ferror(f)) corrupt = 1;
+    fclose(f);
+    if (found) return FP_DENY_REVOKED;
+    if (corrupt) return FP_DENY_ERROR;
+    return FP_DENY_ALLOWED;
+}
+
+fp_err_t fp_denyset_add(const char *store_dir, const fp_dna_t *dna) {
+    if (!store_dir || !store_dir[0] || !dna) return FP_ERR_INVALID;
+    char path[PATH_MAX], hex[65];
+    fp_hex_encode(dna->bytes, FP_DNA_LEN, hex);
+    if (snprintf(path, sizeof(path), "%s/.revoked_dnas", store_dir) >= (int)sizeof(path)) {
+        return FP_ERR_BOUNDS;
+    }
+    int lfd = acquire_denyset_lock(store_dir);
+    if (lfd < 0) return FP_ERR_IO;
+
+    uint8_t *old_buf = NULL;
+    size_t old_len = 0;
+    int rfd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (rfd >= 0) {
+        struct stat sb;
+        if (fstat(rfd, &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size < 0 ||
+            (uint64_t)sb.st_size > (1u << 20)) {
+            close(rfd);
+            release_denyset_lock(lfd);
+            return FP_ERR_INTEGRITY;
+        }
+        old_len = (size_t)sb.st_size;
+        if (old_len > 0) {
+            old_buf = malloc(old_len + 1u);
+            if (!old_buf) { close(rfd); release_denyset_lock(lfd); return FP_ERR_NOMEM; }
+            size_t pos = 0;
+            while (pos < old_len) {
+                ssize_t r = read(rfd, old_buf + pos, old_len - pos);
+                if (r < 0) {
+                    if (errno == EINTR) continue;
+                    free(old_buf); close(rfd); release_denyset_lock(lfd);
+                    return FP_ERR_IO;
+                }
+                if (r == 0) break;
+                pos += (size_t)r;
+            }
+            if (pos != old_len) {
+                free(old_buf); close(rfd); release_denyset_lock(lfd);
+                return FP_ERR_IO;
+            }
+            old_buf[old_len] = '\0';
+        }
+        close(rfd);
+    } else if (errno != ENOENT) {
+        release_denyset_lock(lfd);
+        return FP_ERR_IO;
+    }
+
+    if (old_buf && old_len > 0) {
+        int already = 0;
+        size_t pos = 0;
+        while (pos < old_len) {
+            size_t eol = pos;
+            while (eol < old_len && old_buf[eol] != '\n' && old_buf[eol] != '\r') eol++;
+            size_t ll = eol - pos;
+            if (ll > 0) {
+                if (ll != 64u) {
+                    free(old_buf);
+                    release_denyset_lock(lfd);
+                    return FP_ERR_INTEGRITY;
+                }
+                char tmp_hex[65];
+                memcpy(tmp_hex, old_buf + pos, 64u);
+                tmp_hex[64] = '\0';
+                if (!is_valid_hex64(tmp_hex)) {
+                    free(old_buf);
+                    release_denyset_lock(lfd);
+                    return FP_ERR_INTEGRITY;
+                }
+                if (memcmp(tmp_hex, hex, 64u) == 0) already = 1;
+            }
+            pos = eol;
+            while (pos < old_len && (old_buf[pos] == '\n' || old_buf[pos] == '\r')) pos++;
+        }
+        if (already) {
+            free(old_buf);
+            release_denyset_lock(lfd);
+            return FP_OK;
+        }
+    }
+
+    size_t need_nl = (old_len > 0 && old_buf[old_len - 1u] != '\n') ? 1u : 0u;
+    size_t new_len = old_len + need_nl + 65u;
+    uint8_t *nbuf = malloc(new_len);
+    if (!nbuf) { free(old_buf); release_denyset_lock(lfd); return FP_ERR_NOMEM; }
+    if (old_len > 0) memcpy(nbuf, old_buf, old_len);
+    if (need_nl) nbuf[old_len] = '\n';
+    memcpy(nbuf + old_len + need_nl, hex, 64u);
+    nbuf[old_len + need_nl + 64u] = '\n';
+    free(old_buf);
+
+    uint64_t uq = atomic_fetch_add(&g_bundle_tmp_seq, 1) + 1u;
+    char tmp[PATH_MAX];
+    if (snprintf(tmp, sizeof(tmp), "%s/.revoked_dnas.tmp.%ld.%llu",
+                 store_dir, (long)getpid(), (unsigned long long)uq) >= (int)sizeof(tmp)) {
+        free(nbuf);
+        release_denyset_lock(lfd);
+        return FP_ERR_BOUNDS;
+    }
+    int wfd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (wfd < 0) { free(nbuf); release_denyset_lock(lfd); return FP_ERR_IO; }
+    size_t wp = 0;
+    fp_err_t werr = FP_OK;
+    while (wp < new_len) {
+        ssize_t w = write(wfd, nbuf + wp, new_len - wp);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            werr = FP_ERR_IO;
+            break;
+        }
+        wp += (size_t)w;
+    }
+    free(nbuf);
+    if (werr == FP_OK && fsync(wfd) != 0) werr = FP_ERR_IO;
+    close(wfd);
+    if (werr != FP_OK) { unlink(tmp); release_denyset_lock(lfd); return werr; }
+    if (rename(tmp, path) != 0) { unlink(tmp); release_denyset_lock(lfd); return FP_ERR_IO; }
+    werr = sync_dir_path(store_dir);
+    release_denyset_lock(lfd);
+    return werr;
+}
+
 static fp_err_t atomic_flip_current(const char *target_dir, const char *gen_rel) {
     char link_tmp[PATH_MAX], link_dst[PATH_MAX];
     int n1 = snprintf(link_tmp, sizeof(link_tmp), "%s/.current-new-%ld", target_dir, (long)getpid());
@@ -875,6 +1305,15 @@ static fp_err_t atomic_flip_current(const char *target_dir, const char *gen_rel)
         return FP_ERR_IO;
     }
     return sync_dir_path(target_dir);
+}
+
+/* A9-P0-04: Single Activation Authority — NO symlink activation may bypass fp_denyset_check()! */
+static fp_err_t atomic_flip_current_checked(const char *store_dir, const char *target_dir,
+                                            const fp_dna_t *bundle_dna, const char *gen_rel) {
+    fp_deny_status_t ds = fp_denyset_check(store_dir, bundle_dna);
+    if (ds == FP_DENY_REVOKED) return FP_ERR_REVOKED;
+    if (ds != FP_DENY_ALLOWED) return FP_ERR_INTEGRITY;
+    return atomic_flip_current(target_dir, gen_rel);
 }
 
 /* SQLite changeset callbacks & preflight strict table validator (SEC-01, SEC-02) */
@@ -1143,15 +1582,6 @@ typedef enum {
     TXJ_IO_ERROR  = 3
 } tx_journal_status_t;
 
-static int is_valid_hex64(const char *s) {
-    if (!s || strlen(s) != 64u) return 0;
-    for (size_t i = 0; i < 64u; i++) {
-        char c = s[i];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0;
-    }
-    return 1;
-}
-
 static int is_valid_tx_state(const char *st) {
     return strcmp(st, "STAGING") == 0 ||
            strcmp(st, "ACTIVATION_PENDING") == 0 ||
@@ -1378,6 +1808,25 @@ static fp_err_t bundle_recover_locked(const char *store_dir, const char *target_
     if (js == TXJ_CORRUPTED) return FP_ERR_INTEGRITY; /* Fail-closed: preserve corrupt journal evidence! */
 
     if (strcmp(state, "COMMITTED") == 0) {
+        fp_dna_t cdna;
+        if (fp_hex_decode(dna_hex, cdna.bytes, FP_DNA_LEN) == FP_OK) {
+            fp_deny_status_t ds = fp_denyset_check(store_dir, &cdna);
+            if (ds == FP_DENY_ERROR) return FP_ERR_INTEGRITY;
+            if (ds == FP_DENY_REVOKED) {
+                char cur_link[PATH_MAX];
+                if (snprintf(cur_link, sizeof(cur_link), "%s/current", target_dir) >= (int)sizeof(cur_link)) {
+                    return FP_ERR_BOUNDS;
+                }
+                if (unlink(cur_link) != 0 && errno != ENOENT) return FP_ERR_IO;
+                fp_err_t serr = sync_dir_path(target_dir);
+                if (serr != FP_OK) return serr;
+                char jpath[PATH_MAX];
+                if (snprintf(jpath, sizeof(jpath), "%s/.sf_tx_journal", target_dir) < (int)sizeof(jpath)) {
+                    if (unlink(jpath) != 0 && errno != ENOENT) return FP_ERR_IO;
+                    (void)sync_dir_path(target_dir);
+                }
+            }
+        }
         return FP_OK;
     }
     if (strcmp(state, "ACTIVATION_PENDING") == 0 || strcmp(state, "ROLLBACK_PENDING") == 0) {
@@ -1396,8 +1845,29 @@ static fp_err_t bundle_recover_locked(const char *store_dir, const char *target_
             }
         }
         if (db_committed) {
-            /* SQLite already committed (apply or rollback) before crash: reconcile symlink forward! */
+            /* SQLite already committed (apply or rollback) before crash: reconcile symlink forward,
+             * UNLESS the target DNA is in `<store_dir>/.revoked_dnas` (A9-P0-04)! */
             if (is_empty_target) {
+                char cur_link[PATH_MAX];
+                if (snprintf(cur_link, sizeof(cur_link), "%s/current", target_dir) >= (int)sizeof(cur_link)) {
+                    return FP_ERR_BOUNDS;
+                }
+                if (unlink(cur_link) != 0 && errno != ENOENT) return FP_ERR_IO;
+                fp_err_t serr = sync_dir_path(target_dir);
+                if (serr != FP_OK) return serr;
+                char jpath[PATH_MAX];
+                if (snprintf(jpath, sizeof(jpath), "%s/.sf_tx_journal", target_dir) < (int)sizeof(jpath)) {
+                    if (unlink(jpath) != 0 && errno != ENOENT) return FP_ERR_IO;
+                    (void)sync_dir_path(target_dir);
+                }
+                return FP_OK;
+            }
+            fp_dna_t bdna;
+            if (fp_hex_decode(dna_hex, bdna.bytes, FP_DNA_LEN) != FP_OK) return FP_ERR_INTEGRITY;
+            /* A9-P0-04: Enforce Single Activation Authority BEFORE staging or flipping `current`! */
+            fp_deny_status_t ds = fp_denyset_check(store_dir, &bdna);
+            if (ds == FP_DENY_ERROR) return FP_ERR_INTEGRITY;
+            if (ds == FP_DENY_REVOKED) {
                 char cur_link[PATH_MAX];
                 if (snprintf(cur_link, sizeof(cur_link), "%s/current", target_dir) >= (int)sizeof(cur_link)) {
                     return FP_ERR_BOUNDS;
@@ -1415,8 +1885,6 @@ static fp_err_t bundle_recover_locked(const char *store_dir, const char *target_
             char gen_dir[PATH_MAX], rel[128];
             int gn = snprintf(gen_dir, sizeof(gen_dir), "%s/gen/%s", target_dir, dna_hex);
             if (gn < 0 || (size_t)gn >= sizeof(gen_dir)) return FP_ERR_BOUNDS;
-            fp_dna_t bdna;
-            if (fp_hex_decode(dna_hex, bdna.bytes, FP_DNA_LEN) != FP_OK) return FP_ERR_INTEGRITY;
             fp_bundle_t b;
             fp_err_t err = load_and_verify_bundle(store_dir, &bdna, &b);
             if (err != FP_OK) return err;
@@ -1425,7 +1893,7 @@ static fp_err_t bundle_recover_locked(const char *store_dir, const char *target_
                 if (err != FP_OK) return err;
             }
             snprintf(rel, sizeof(rel), "gen/%s", dna_hex);
-            err = atomic_flip_current(target_dir, rel);
+            err = atomic_flip_current_checked(store_dir, target_dir, &bdna, rel);
             if (err != FP_OK) return err;
             return tx_journal_write(target_dir, "COMMITTED", jseq, dna_hex, has_sql);
         }
@@ -1472,6 +1940,13 @@ static fp_err_t bundle_apply_impl(const char *store_dir, const fp_dna_t *bundle_
     /* Reconcile any prior interrupted transaction deterministically before starting */
     fp_err_t rec_err = bundle_recover_locked(store_dir, target_dir, sql_ctx);
     if (rec_err != FP_OK) { release_target_lock(lfd); return rec_err; }
+
+    /* A9-P0-04: Single Activation Authority — reject revoked targets BEFORE staging or SQL mutation! */
+    if (!sql_only) {
+        fp_deny_status_t ds = fp_denyset_check(store_dir, bundle_dna);
+        if (ds == FP_DENY_REVOKED) { release_target_lock(lfd); return FP_ERR_REVOKED; }
+        if (ds != FP_DENY_ALLOWED) { release_target_lock(lfd); return FP_ERR_INTEGRITY; }
+    }
 
     fp_bundle_t b;
     fp_err_t err = load_and_verify_bundle(store_dir, bundle_dna, &b);
@@ -1588,13 +2063,14 @@ static fp_err_t bundle_apply_impl(const char *store_dir, const fp_dna_t *bundle_
                 if (err == FP_OK) {
                     err = write_progress(sql_ctx, expected_seq, dna_hex);
                 }
+                if (err == FP_OK) {
+                    err = check_foreign_key_integrity(sql_ctx->db);
+                }
                 if (err == FP_OK && !sql_only && fault_mode == 1) {
                     raise(SIGKILL); /* Fault 1: OS SIGKILL BEFORE SQLite COMMIT */
                 }
                 if (err == FP_OK) {
-                    if (sqlite3_exec(sql_ctx->db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
-                        err = FP_ERR_IO;
-                    }
+                    err = commit_or_rollback(sql_ctx->db);
                 } else {
                     (void)sqlite3_exec(sql_ctx->db, "ROLLBACK", NULL, NULL, NULL);
                 }
@@ -1616,7 +2092,7 @@ static fp_err_t bundle_apply_impl(const char *store_dir, const fp_dna_t *bundle_
     /* Atomic POSIX symlink flip: activates the new generation in 1 atomic operation */
     char rel[128];
     snprintf(rel, sizeof(rel), "gen/%s", dna_hex);
-    err = atomic_flip_current(target_dir, rel);
+    err = atomic_flip_current_checked(store_dir, target_dir, bundle_dna, rel);
     if (err != FP_OK) goto cleanup;
 
     if (fault_mode == 3) {
@@ -1669,6 +2145,14 @@ fp_err_t fp_bundle_apply_chain(const char *store_dir,
 
     fp_err_t err = bundle_recover_locked(store_dir, target_dir, sql_ctx);
     if (err != FP_OK) { release_target_lock(lfd); return err; }
+
+    /* A9-P0-04: Single Activation Authority — final activated generation MUST NOT be revoked!
+     * (Intermediate SQL-only steps may be historically revoked in [INSTALL V2, REVOKE V2, INSTALL V3].) */
+    {
+        fp_deny_status_t ds = fp_denyset_check(store_dir, &steps[step_count - 1u].bundle_dna);
+        if (ds == FP_DENY_REVOKED) { release_target_lock(lfd); return FP_ERR_REVOKED; }
+        if (ds != FP_DENY_ALLOWED) { release_target_lock(lfd); return FP_ERR_INTEGRITY; }
+    }
 
     chain_step_mem_t *mem = calloc(step_count, sizeof(*mem));
     if (!mem) { release_target_lock(lfd); return FP_ERR_NOMEM; }
@@ -1778,9 +2262,10 @@ fp_err_t fp_bundle_apply_chain(const char *store_dir,
                     err = write_progress(sql_ctx, final_seq, final_step->dna_hex);
                 }
                 if (err == FP_OK) {
-                    if (sqlite3_exec(sql_ctx->db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
-                        err = FP_ERR_IO;
-                    }
+                    err = check_foreign_key_integrity(sql_ctx->db);
+                }
+                if (err == FP_OK) {
+                    err = commit_or_rollback(sql_ctx->db);
                 } else {
                     (void)sqlite3_exec(sql_ctx->db, "ROLLBACK", NULL, NULL, NULL);
                 }
@@ -1793,7 +2278,8 @@ fp_err_t fp_bundle_apply_chain(const char *store_dir,
 
     char rel[128];
     snprintf(rel, sizeof(rel), "gen/%s", final_step->dna_hex);
-    err = atomic_flip_current(target_dir, rel);
+    err = atomic_flip_current_checked(store_dir, target_dir,
+                                      &steps[step_count - 1u].bundle_dna, rel);
     if (err != FP_OK) goto cleanup;
 
     err = tx_journal_write(target_dir, "COMMITTED", final_seq, final_step->dna_hex, 1);
@@ -1836,6 +2322,14 @@ static fp_err_t bundle_rollback_impl(const char *store_dir,
 
     fp_err_t err = bundle_recover_locked(store_dir, target_dir, sql_ctx);
     if (err != FP_OK) { release_target_lock(lfd); return err; }
+
+    /* A9-P0-04: Single Activation Authority — NEVER reactivate a revoked generation via rollback!
+     * (sql_only=1 only reverts SQLite baseline without activating `current`.) */
+    if (!sql_only && prev_bundle_dna != NULL) {
+        fp_deny_status_t ds = fp_denyset_check(store_dir, prev_bundle_dna);
+        if (ds == FP_DENY_REVOKED) { release_target_lock(lfd); return FP_ERR_REVOKED; }
+        if (ds != FP_DENY_ALLOWED) { release_target_lock(lfd); return FP_ERR_INTEGRITY; }
+    }
 
     char cur_hex[65], prev_hex[65], journal_dna_hex[65];
     fp_hex_encode(current_bundle_dna->bytes, FP_DNA_LEN, cur_hex);
@@ -2026,9 +2520,10 @@ static fp_err_t bundle_rollback_impl(const char *store_dir,
             err = write_progress(sql_ctx, target_seq, prev_hex);
         }
         if (err == FP_OK) {
-            if (sqlite3_exec(sql_ctx->db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
-                err = FP_ERR_IO;
-            }
+            err = check_foreign_key_integrity(sql_ctx->db);
+        }
+        if (err == FP_OK) {
+            err = commit_or_rollback(sql_ctx->db);
         } else {
             (void)sqlite3_exec(sql_ctx->db, "ROLLBACK", NULL, NULL, NULL);
         }
@@ -2044,7 +2539,7 @@ static fp_err_t bundle_rollback_impl(const char *store_dir,
     if (prev_bundle_dna) {
         char rel[128];
         snprintf(rel, sizeof(rel), "gen/%s", prev_hex);
-        err = atomic_flip_current(target_dir, rel);
+        err = atomic_flip_current_checked(store_dir, target_dir, prev_bundle_dna, rel);
         if (err == FP_OK) {
             err = tx_journal_write(target_dir, "COMMITTED", target_seq, prev_hex, need_sql_rb);
         }

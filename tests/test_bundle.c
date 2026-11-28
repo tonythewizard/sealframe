@@ -778,6 +778,148 @@ static void test_m4_mixed_rollback_and_sql_namespace_guards(void) {
         printf("[PASS] A8-P0-01/02/03 & A8-P1-01/02: Trigger side-effects, legacy raw, COLLATE mismatch & single-TX batch verified!\n");
     }
 
+    /* A9-P0-01/02/03/04: Confined capture authorizer, FK/CASCADE fail-closed, SFCS1 rejection & global activation gate! */
+    {
+        /* SQL-01 (A9-P0-01): Exact Audit #9 Appendix A reproducer — multi-table DML & transaction-escape attempts
+         * inside fp_sql_capture_changeset() MUST return FP_ERR_POLICY and leave BOTH tables 100% unchanged! */
+        char a9_dbp[256];
+        snprintf(a9_dbp, sizeof(a9_dbp), "%s/a9_auth.db", tmp);
+        fp_sql_ctx_t *a9db = NULL;
+        assert(fp_sql_open(a9_dbp, &a9db) == FP_OK);
+        assert(fp_sql_exec(a9db, "CREATE TABLE kv(k INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+        assert(fp_sql_exec(a9db, "CREATE TABLE extra(k INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+        assert(fp_sql_exec(a9db, "INSERT INTO kv VALUES(1,10); INSERT INTO extra VALUES(1,20);") == FP_OK);
+        fp_dna_t kv0, ex0, kv1, ex1;
+        assert(fp_sql_state_digest(a9db, "kv", &kv0) == FP_OK);
+        assert(fp_sql_state_digest(a9db, "extra", &ex0) == FP_OK);
+
+        uint8_t *bad_cs = NULL; size_t bad_l = 0;
+        assert(fp_sql_capture_changeset(a9db, "kv",
+                                        "UPDATE kv SET v=11 WHERE k=1; UPDATE extra SET v=21 WHERE k=1;",
+                                        &bad_cs, &bad_l) == FP_ERR_POLICY);
+        assert(bad_cs == NULL && bad_l == 0);
+        assert(fp_sql_state_digest(a9db, "kv", &kv1) == FP_OK && fp_dna_equal(&kv0, &kv1));
+        assert(fp_sql_state_digest(a9db, "extra", &ex1) == FP_OK && fp_dna_equal(&ex0, &ex1));
+
+        /* Also reject COMMIT escape / PRAGMA / DDL inside capture */
+        assert(fp_sql_capture_changeset(a9db, "kv",
+                                        "UPDATE kv SET v=12 WHERE k=1; COMMIT;",
+                                        &bad_cs, &bad_l) == FP_ERR_POLICY);
+        assert(fp_sql_capture_changeset(a9db, "kv",
+                                        "PRAGMA foreign_keys=OFF; UPDATE kv SET v=12 WHERE k=1;",
+                                        &bad_cs, &bad_l) == FP_ERR_POLICY);
+        assert(fp_sql_state_digest(a9db, "kv", &kv1) == FP_OK && fp_dna_equal(&kv0, &kv1));
+
+        /* Valid single-table capture produces SFCS2 header and succeeds cleanly */
+        uint8_t *ok_cs = NULL; size_t ok_l = 0;
+        assert(fp_sql_capture_changeset(a9db, "kv", "UPDATE kv SET v=99 WHERE k=1;", &ok_cs, &ok_l) == FP_OK);
+        assert(ok_l > 42u && memcmp(ok_cs, "SFCS2", 5) == 0);
+
+        /* COMPAT-01 (A9-P0-03): Explicit SFCS1 magic MUST be rejected fail-closed (FP_ERR_POLICY) */
+        uint8_t *sfcs1_cs = malloc(ok_l);
+        assert(sfcs1_cs != NULL);
+        memcpy(sfcs1_cs, ok_cs, ok_l);
+        memcpy(sfcs1_cs, "SFCS1", 5);
+        fp_bundle_t b_sfcs1;
+        memset(&b_sfcs1, 0, sizeof(b_sfcs1));
+        b_sfcs1.version = 1; b_sfcs1.entry_count = 1;
+        b_sfcs1.entries[0].role = FP_ROLE_SQLITE_CHANGESET; b_sfcs1.entries[0].size = ok_l;
+        snprintf(b_sfcs1.entries[0].path, sizeof(b_sfcs1.entries[0].path), "kv");
+        assert(fp_store_put_object(store, sfcs1_cs, ok_l, &b_sfcs1.entries[0].dna) == FP_OK);
+        free(sfcs1_cs);
+        free(ok_cs);
+        fp_dna_t b_sfcs1_dna;
+        assert(fp_bundle_pack(store, &b_sfcs1, &b_sfcs1_dna) == FP_OK);
+        char a9_tgt[256];
+        snprintf(a9_tgt, sizeof(a9_tgt), "%s/a9_tgt", tmp);
+        assert(fp_bundle_apply(store, &b_sfcs1_dna, a9_tgt, a9db, 1, 0) == FP_ERR_POLICY);
+        fp_sql_close(a9db);
+
+        /* SQL-02 (A9-P0-02): Exact Audit #9 Appendix A Experiment B — inbound ON DELETE CASCADE MUST be
+         * rejected fail-closed at capture (FP_ERR_POLICY), and PRAGMA foreign_keys mismatch rejected! */
+        char fk_p[256], fk2_p[256];
+        snprintf(fk_p, sizeof(fk_p), "%s/a9_fk.db", tmp);
+        snprintf(fk2_p, sizeof(fk2_p), "%s/a9_fk2.db", tmp);
+        fp_sql_ctx_t *fkdb = NULL, *fkdb2 = NULL;
+        assert(fp_sql_open(fk_p, &fkdb) == FP_OK && fp_sql_open(fk2_p, &fkdb2) == FP_OK);
+        assert(fp_sql_exec(fkdb, "CREATE TABLE parent(id INTEGER PRIMARY KEY);") == FP_OK);
+        assert(fp_sql_exec(fkdb, "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE);") == FP_OK);
+        assert(fp_sql_exec(fkdb, "INSERT INTO parent VALUES(1); INSERT INTO child VALUES(10,1);") == FP_OK);
+        assert(fp_sql_capture_changeset(fkdb, "parent", "DELETE FROM parent WHERE id=1;", &bad_cs, &bad_l) == FP_ERR_POLICY);
+        /* Also test PRAGMA foreign_keys=ON vs OFF mismatch on non-cascading table */
+        assert(fp_sql_exec(fkdb2, "CREATE TABLE p2(id INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+        assert(fp_sql_exec(fkdb, "CREATE TABLE p2(id INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+        assert(fp_sql_capture_changeset(fkdb, "p2", "INSERT INTO p2 VALUES(1,10);", &ok_cs, &ok_l) == FP_OK);
+        assert(fp_sql_exec(fkdb2, "PRAGMA foreign_keys=OFF;") == FP_OK);
+        fp_bundle_t b_fk;
+        memset(&b_fk, 0, sizeof(b_fk));
+        b_fk.version = 1; b_fk.entry_count = 1;
+        b_fk.entries[0].role = FP_ROLE_SQLITE_CHANGESET; b_fk.entries[0].size = ok_l;
+        snprintf(b_fk.entries[0].path, sizeof(b_fk.entries[0].path), "p2");
+        assert(fp_store_put_object(store, ok_cs, ok_l, &b_fk.entries[0].dna) == FP_OK);
+        free(ok_cs);
+        fp_dna_t b_fk_dna;
+        assert(fp_bundle_pack(store, &b_fk, &b_fk_dna) == FP_OK);
+        assert(fp_bundle_apply(store, &b_fk_dna, a9_tgt, fkdb2, 1, 0) == FP_ERR_INTEGRITY);
+        fp_sql_close(fkdb);
+        fp_sql_close(fkdb2);
+
+        /* REV-01 (A9-P0-04): Single Activation Authority — ACTIVATION_PENDING journal for a DNA in
+         * `<store_dir>/.revoked_dnas` MUST NEVER create/flip `current` during fp_bundle_recover(),
+         * AND direct fp_bundle_apply() on a revoked DNA MUST return FP_ERR_REVOKED! */
+        char rev_store[256], rev_tgt[256], rev_dbp[256], rev_j[320], rev_cur[320];
+        snprintf(rev_store, sizeof(rev_store), "%s/a9_rev_store", tmp);
+        snprintf(rev_tgt, sizeof(rev_tgt), "%s/a9_rev_tgt", tmp);
+        snprintf(rev_dbp, sizeof(rev_dbp), "%s/a9_rev.db", tmp);
+        snprintf(rev_j, sizeof(rev_j), "%s/.sf_tx_journal", rev_tgt);
+        snprintf(rev_cur, sizeof(rev_cur), "%s/current", rev_tgt);
+        assert(mkdir(rev_store, 0755) == 0 && mkdir(rev_tgt, 0755) == 0);
+        fp_sql_ctx_t *rdb = NULL;
+        assert(fp_sql_open(rev_dbp, &rdb) == FP_OK);
+        assert(fp_sql_exec(rdb, "CREATE TABLE kv(k INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+        uint8_t *rcs = NULL; size_t rcsl = 0;
+        assert(fp_sql_capture_changeset(rdb, "kv", "INSERT INTO kv VALUES(7,70);", &rcs, &rcsl) == FP_OK);
+        fp_bundle_t rb;
+        memset(&rb, 0, sizeof(rb));
+        rb.version = 1; rb.entry_count = 2;
+        rb.entries[0].role = FP_ROLE_FILE; rb.entries[0].mode = 0644; rb.entries[0].size = 5;
+        snprintf(rb.entries[0].path, sizeof(rb.entries[0].path), "r.txt");
+        assert(fp_store_put_object(rev_store, (const uint8_t *)"REV!\n", 5, &rb.entries[0].dna) == FP_OK);
+        rb.entries[1].role = FP_ROLE_SQLITE_CHANGESET; rb.entries[1].size = rcsl;
+        snprintf(rb.entries[1].path, sizeof(rb.entries[1].path), "kv");
+        assert(fp_store_put_object(rev_store, rcs, rcsl, &rb.entries[1].dna) == FP_OK);
+        free(rcs);
+        fp_dna_t rb_dna;
+        assert(fp_bundle_pack(rev_store, &rb, &rb_dna) == FP_OK);
+        fp_sql_close(rdb);
+
+        /* Prepare fresh DB committed at seq=1 / rb_dna, write ACTIVATION_PENDING journal, add rb_dna to deny-set */
+        char rev_dbp2[256];
+        snprintf(rev_dbp2, sizeof(rev_dbp2), "%s/a9_rev2.db", tmp);
+        assert(fp_sql_open(rev_dbp2, &rdb) == FP_OK);
+        assert(fp_sql_exec(rdb, "CREATE TABLE kv(k INTEGER PRIMARY KEY, v INTEGER);") == FP_OK);
+        assert(fp_bundle_apply_sql_only(rev_store, &rb_dna, rev_tgt, rdb, 1) == FP_OK);
+        char rb_hex[65], jline[160];
+        fp_hex_encode(rb_dna.bytes, FP_DNA_LEN, rb_hex);
+        int jln = snprintf(jline, sizeof(jline), "SFTX1 ACTIVATION_PENDING 1 %s 1\n", rb_hex);
+        FILE *jf = fopen(rev_j, "wb");
+        assert(jf != NULL && fwrite(jline, 1, (size_t)jln, jf) == (size_t)jln && fclose(jf) == 0);
+        assert(fp_denyset_add(rev_store, &rb_dna) == FP_OK);
+        assert(fp_denyset_check(rev_store, &rb_dna) == FP_DENY_REVOKED);
+
+        /* Recover MUST NOT flip `current` to revoked DNA and MUST be idempotent R(R(S))==R(S) */
+        assert(fp_bundle_recover(rev_store, rev_tgt, rdb) == FP_OK);
+        struct stat rsb;
+        assert(lstat(rev_cur, &rsb) != 0);
+        assert(fp_bundle_recover(rev_store, rev_tgt, rdb) == FP_OK);
+        assert(lstat(rev_cur, &rsb) != 0);
+        /* Direct fp_bundle_apply() on revoked DNA MUST return FP_ERR_REVOKED */
+        assert(fp_bundle_apply(rev_store, &rb_dna, rev_tgt, rdb, 2, 0) == FP_ERR_REVOKED);
+        assert(lstat(rev_cur, &rsb) != 0);
+        fp_sql_close(rdb);
+        printf("[PASS] A9-P0-01/02/03/04 (SQL-01/SQL-02/COMPAT-01/REV-01): Authorizer, FK cascade, SFCS2 & global activation gate verified!\n");
+    }
+
     fp_sql_close(src_db);
     fp_sql_close(dst_db);
 }

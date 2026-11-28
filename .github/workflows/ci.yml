@@ -24,7 +24,7 @@ jobs:
             build-essential clang pkg-config \
             libsodium-dev libzstd-dev libsqlite3-dev binutils
 
-      - name: Build, run all 11 test suites, ELF hardening & SBOM (${{ matrix.compiler }})
+      - name: Build, run all 12 test suites, ELF hardening & SBOM (${{ matrix.compiler }})
         run: |
           make CC=${{ matrix.compiler }} clean
           make CC=${{ matrix.compiler }} -j$(nproc) all
@@ -35,13 +35,13 @@ jobs:
           ./bin/sf-llama-bridge --selftest --transport udp --cast int8 --fec auto --logits-topk 64 --drop 2
           ./bin/sf-llama-bridge --selftest --transport udp --cast int4o --fec auto --logits-topk 64 --drop 2
 
-      - name: AddressSanitizer + UBSan verification (GCC, all 11 suites)
+      - name: AddressSanitizer + UBSan verification (GCC, all 12 suites)
         if: matrix.compiler == 'gcc'
         run: |
           make clean
           make -j$(nproc) CC=gcc CFLAGS="-std=c11 -O1 -g -fPIC -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Werror -pedantic -Iinclude -Ithird_party/blake3 -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0" \
                LDFLAGS="-fsanitize=address,undefined -lsodium -lzstd -lsqlite3 -lpthread -lm" \
-               all build/test_particle build/test_net build/test_cdc build/test_bundle build/test_trust build/test_swarm build/test_agent build/test_chaos build/test_chain_adapters build/test_split_shim build/test_redteam
-          for t in build/test_particle build/test_net build/test_cdc build/test_bundle build/test_trust build/test_swarm build/test_agent build/test_chaos build/test_chain_adapters build/test_split_shim build/test_redteam; do
+               all build/test_particle build/test_net build/test_cdc build/test_bundle build/test_trust build/test_swarm build/test_agent build/test_chaos build/test_chain_adapters build/test_split_shim build/test_redteam build/test_model_checker
+          for t in build/test_particle build/test_net build/test_cdc build/test_bundle build/test_trust build/test_swarm build/test_agent build/test_chaos build/test_chain_adapters build/test_split_shim build/test_redteam build/test_model_checker; do
             ./"$t"
           done

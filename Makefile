@@ -36,7 +36,7 @@ LDFLAGS        := $(HARDEN_LDFLAGS) $(PKG_LIBS) -lpthread -lm
 
 LIB_SRCS := src/dna.c src/morph.c src/lineage.c src/store.c src/anchor.c src/net.c src/cdc.c src/bundle.c src/trust.c src/swarm.c src/udp.c src/http.c src/agent.c src/tensor.c src/chain_adapters.c src/split_shim.c
 LIB_OBJS := $(patsubst src/%.c,build/%.o,$(LIB_SRCS)) $(BLAKE3_OBJS)
-TESTS    := test_particle test_net test_cdc test_bundle test_trust test_swarm test_chaos test_agent test_chain_adapters test_split_shim test_redteam
+TESTS    := test_particle test_net test_cdc test_bundle test_trust test_swarm test_chaos test_agent test_chain_adapters test_split_shim test_redteam test_model_checker
 
 .PHONY: all examples examples-py test test-asan test-clang fuzz libfuzzer bench compare security-check sbom lint deb physical-kit install uninstall clean
 
