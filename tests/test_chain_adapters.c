@@ -141,6 +141,27 @@ static void *mock_rpc_thread(void *arg) {
             send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"\"}");
         } else if (m->evil_mode == 3) {
             send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"verified\":\"true\",\"note\":\"\\\"verified\\\":true\"}}");
+        } else if (m->evil_mode == 4) {
+            /* A9-SEC-01: Duplicate JSON key (parser differential attack) */
+            send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"verified\":false,\"verified\":true}}");
+        } else if (m->evil_mode == 5) {
+            /* A9-SEC-01: Leading-zero number (invalid RFC 8259) */
+            send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":01,\"result\":\"gen_tx_leadzero\"}");
+        } else if (m->evil_mode == 6) {
+            /* A9-SEC-02: Semantically rejected derivation result (`false`) */
+            send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":false}");
+        } else if (m->evil_mode == 7) {
+            /* A9-SEC-02: Empty object `{}` derivation result */
+            send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}");
+        } else if (m->evil_mode == 8) {
+            /* A9-SEC-03: Truncated HTTP body (Content-Length > actual bytes sent) */
+            const char *trunc =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: 200\r\n"
+                "Connection: close\r\n\r\n"
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"short\"}";
+            (void)send(c, trunc, strlen(trunc), MSG_NOSIGNAL);
         } else if (strcmp(method, "sealframe_anchorPublish") == 0) {
             extract_str(body, "commitment", m->generic_comm, sizeof(m->generic_comm));
             send_http_json(c, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"gen_tx_0001\"}");
@@ -338,8 +359,24 @@ int main(void) {
         pthread_mutex_lock(&rpc.mu); rpc.evil_mode = 3; pthread_mutex_unlock(&rpc.mu);
         assert(eops.verify(eops.user_ctx, &comm) == FP_ERR_INTEGRITY);
 
+        /* A9-SEC-01/02/03: Duplicate JSON keys, leading-zero numbers, false/{} derivation result, truncated HTTP body */
+        pthread_mutex_lock(&rpc.mu); rpc.evil_mode = 4; pthread_mutex_unlock(&rpc.mu);
+        assert(eops.verify(eops.user_ctx, &comm) == FP_ERR_INTEGRITY);
+
+        pthread_mutex_lock(&rpc.mu); rpc.evil_mode = 5; pthread_mutex_unlock(&rpc.mu);
+        assert(eops.publish(eops.user_ctx, &comm) == FP_ERR_INTEGRITY);
+
+        pthread_mutex_lock(&rpc.mu); rpc.evil_mode = 6; pthread_mutex_unlock(&rpc.mu);
+        assert(sf_chain_submit_derivation(&ectx, &drv, &other_dna) == FP_ERR_INTEGRITY);
+
+        pthread_mutex_lock(&rpc.mu); rpc.evil_mode = 7; pthread_mutex_unlock(&rpc.mu);
+        assert(sf_chain_submit_derivation(&ectx, &drv, &other_dna) == FP_ERR_INTEGRITY);
+
+        pthread_mutex_lock(&rpc.mu); rpc.evil_mode = 8; pthread_mutex_unlock(&rpc.mu);
+        assert(eops.publish(eops.user_ctx, &comm) == FP_ERR_IO);
+
         pthread_mutex_lock(&rpc.mu); rpc.evil_mode = 0; pthread_mutex_unlock(&rpc.mu);
-        printf("[PASS] A8-SEC-04 (CHAIN-01): Strict JSON-RPC 2.0 rejects wrong id, empty tx_id & spoofed substrings!\n");
+        printf("[PASS] A8-SEC-04 & A9-SEC-01/02/03 (RPC-01/02/03): Strict RFC 8259 JSON, dup-key, semantic derivation & HTTP framing verified!\n");
     }
 
     /* --- 4. Pure-C11 RFC 6455 WebSocket wRPC-JSON client test --- */

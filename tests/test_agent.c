@@ -2113,7 +2113,27 @@ int main(void) {
                         assert(fp_agent_sync_once(&t2acfg, &rep) == FP_ERR_INTEGRITY); /* start=9 > serial=4 rejected! */
                         assert(lstat(t2cur, &st_chk) != 0); /* Boot fence STILL removed revoked `current` BEFORE journal fail! */
                         assert(unlink(t2ota) == 0);
-                        printf("[PASS] A8-P0-04/05 & A8-P1-03 (TX-02/REV-04/TX-05): SQL baseline preserved across revoke+fail, boot fence before journal & strict parser!\n");
+
+                        /* A9-P1-04 (REV-04): Corrupted `.revoked_dnas` MUST return FP_DENY_ERROR -> FP_ERR_INTEGRITY
+                         * fail-closed WITHOUT falsely adding the healthy active DNA (t2bd[2]) to `.revoked_dnas`! */
+                        char t2v3h[65], t2deny[360];
+                        fp_hex_encode(t2bd[2].bytes, FP_DNA_LEN, t2v3h);
+                        snprintf(frel, sizeof(frel), "gen/%s", t2v3h);
+                        assert(symlink(frel, t2cur) == 0);
+                        snprintf(t2deny, sizeof(t2deny), "%s/.revoked_dnas", t2store);
+                        const char *corrupt_deny = "not-a-valid-64-hex-dna\n";
+                        write_bytes_file(t2deny, (const uint8_t *)corrupt_deny, strlen(corrupt_deny));
+                        assert(fp_denyset_check(t2store, &t2bd[2]) == FP_DENY_ERROR);
+                        assert(fp_agent_sync_once(&t2acfg, &rep) == FP_ERR_INTEGRITY);
+                        /* Verify healthy V3 was NOT falsely appended to `.revoked_dnas`! */
+                        FILE *cdf = fopen(t2deny, "rb");
+                        assert(cdf != NULL);
+                        char cdbuf[256];
+                        size_t cdn = fread(cdbuf, 1, sizeof(cdbuf) - 1u, cdf);
+                        fclose(cdf);
+                        cdbuf[cdn] = '\0';
+                        assert(strstr(cdbuf, t2v3h) == NULL);
+                        printf("[PASS] A8-P0-04/05, A8-P1-03 & A9-P1-04 (TX-02/REV-04/TX-05): SQL baseline, boot fence, strict parser & tri-state deny-set verified!\n");
                     }
                 }
             }

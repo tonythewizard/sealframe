@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -363,7 +364,13 @@ static fp_err_t http_post_json(const char *url, const char *bearer, const char *
     size_t blen = strlen(body);
     char auth_hdr[320] = "";
     if (bearer && bearer[0]) {
-        snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s\r\n", bearer);
+        for (const char *q = bearer; *q; q++) {
+            if ((unsigned char)*q < 0x20u || *q == '\r' || *q == '\n') { close(fd); return FP_ERR_INVALID; }
+        }
+        if (snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s\r\n", bearer) >= (int)sizeof(auth_hdr)) {
+            close(fd);
+            return FP_ERR_BOUNDS;
+        }
     }
     char hdr[1024];
     int hn = snprintf(
@@ -390,17 +397,24 @@ static fp_err_t http_post_json(const char *url, const char *bearer, const char *
         }
     }
 
-    /* Read response */
+    /* A9-SEC-03: Read complete HTTP response strictly (fail on recv error, NUL bytes, truncation or Content-Length mismatch) */
     char *raw = malloc(65536u);
     if (!raw) { close(fd); return FP_ERR_NOMEM; }
     size_t got = 0;
+    int read_err = 0;
     while (got + 1u < 65536u) {
         ssize_t r = recv(fd, raw + got, 65535u - got, 0);
-        if (r < 0) { if (errno == EINTR) continue; break; }
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            read_err = 1;
+            break;
+        }
         if (r == 0) break;
         got += (size_t)r;
     }
     close(fd);
+    if (read_err || got == 0 || got >= 65535u) { free(raw); return FP_ERR_IO; }
+    if (memchr(raw, '\0', got) != NULL) { free(raw); return FP_ERR_INTEGRITY; }
     raw[got] = '\0';
 
     int code = 0;
@@ -410,32 +424,101 @@ static fp_err_t http_post_json(const char *url, const char *bearer, const char *
     if (http_status) *http_status = code;
     char *sep = strstr(raw, "\r\n\r\n");
     if (!sep) { free(raw); return FP_ERR_IO; }
+    size_t hdr_len = (size_t)(sep - raw);
     const char *rbody = sep + 4;
-    size_t rblen = strlen(rbody);
-    if (rblen >= resp_cap) rblen = resp_cap - 1u;
+    size_t rblen = got - (hdr_len + 4u);
+
+    /* Validate Content-Length if present (case-insensitive) */
+    const char *hp = raw;
+    while (hp < sep) {
+        const char *eol = strstr(hp, "\r\n");
+        if (!eol || eol > sep) eol = sep;
+        if ((size_t)(eol - hp) > 15u && strncasecmp(hp, "Content-Length:", 15u) == 0) {
+            const char *vp = hp + 15u;
+            while (vp < eol && (*vp == ' ' || *vp == '\t')) vp++;
+            char *endp = NULL;
+            errno = 0;
+            unsigned long long cl = strtoull(vp, &endp, 10);
+            if (errno != 0 || endp == vp) { free(raw); return FP_ERR_INTEGRITY; }
+            while (endp < eol && (*endp == ' ' || *endp == '\t')) endp++;
+            if (endp != eol || (size_t)cl != rblen) { free(raw); return FP_ERR_IO; }
+        }
+        hp = (eol < sep) ? eol + 2 : sep;
+    }
+
+    if (rblen >= resp_cap) { free(raw); return FP_ERR_BOUNDS; }
     memcpy(resp_buf, rbody, rblen);
     resp_buf[rblen] = '\0';
     free(raw);
     return (code >= 200 && code < 300) ? FP_OK : FP_ERR_IO;
 }
 
-/* A8-SEC-04: Strict pure-C11 JSON-RPC 2.0 structural parser (replaces substring matching). */
+/* A8-SEC-04 + A9-SEC-01: Strict RFC 8259 JSON-RPC 2.0 structural parser
+ * (rejects duplicate object keys, unescaped control chars, invalid escapes, and leading-zero numbers). */
 static const char *j_skip_ws(const char *p) {
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     return p;
+}
+
+static int j_is_hex(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
 static const char *j_skip_str(const char *p) {
     if (*p != '"') return NULL;
     p++;
     while (*p && *p != '"') {
-        if (*p == '\\') {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20u) return NULL; /* RFC 8259 forbids unescaped control characters */
+        if (c == '\\') {
             p++;
-            if (!*p) return NULL;
+            switch (*p) {
+                case '"': case '\\': case '/': case 'b': case 'f': case 'n': case 'r': case 't':
+                    p++;
+                    break;
+                case 'u':
+                    if (!j_is_hex(p[1]) || !j_is_hex(p[2]) || !j_is_hex(p[3]) || !j_is_hex(p[4])) return NULL;
+                    p += 5;
+                    break;
+                default:
+                    return NULL;
+            }
+        } else {
+            p++;
         }
-        p++;
     }
     return (*p == '"') ? p + 1 : NULL;
+}
+
+static int j_parse_str(const char *p, char *out, size_t cap) {
+    if (!p || !out || cap == 0) return -1;
+    p = j_skip_ws(p);
+    if (*p != '"') return -1;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"') {
+        unsigned char c = (unsigned char)*p++;
+        if (c < 0x20u) return -1;
+        char ch = (char)c;
+        if (ch == '\\') {
+            switch (*p++) {
+                case '"':  ch = '"';  break;
+                case '\\': ch = '\\'; break;
+                case '/':  ch = '/';  break;
+                case 'b':  ch = '\b'; break;
+                case 'f':  ch = '\f'; break;
+                case 'n':  ch = '\n'; break;
+                case 'r':  ch = '\r'; break;
+                case 't':  ch = '\t'; break;
+                default:   return -1; /* Reject non-ASCII \uXXXX or invalid escape in protocol fields */
+            }
+        }
+        if (i + 1u >= cap) return -1;
+        out[i++] = ch;
+    }
+    if (*p != '"') return -1;
+    out[i] = '\0';
+    return 0;
 }
 
 static const char *j_skip_val(const char *p, int depth) {
@@ -445,7 +528,20 @@ static const char *j_skip_val(const char *p, int depth) {
     if (*p == '{') {
         p = j_skip_ws(p + 1);
         if (*p == '}') return p + 1;
+        /* Track up to 32 decoded keys per object to reject duplicate keys fail-closed (A9-SEC-01) */
+        char seen[32][64];
+        size_t seen_cnt = 0;
         for (;;) {
+            if (*p != '"') return NULL;
+            char kbuf[64];
+            if (j_parse_str(p, kbuf, sizeof(kbuf)) == 0) {
+                for (size_t si = 0; si < seen_cnt; si++) {
+                    if (strcmp(seen[si], kbuf) == 0) return NULL; /* Duplicate key! */
+                }
+                if (seen_cnt < 32u) {
+                    snprintf(seen[seen_cnt++], sizeof(seen[0]), "%s", kbuf);
+                }
+            }
             p = j_skip_str(p);
             if (!p) return NULL;
             p = j_skip_ws(p);
@@ -475,8 +571,14 @@ static const char *j_skip_val(const char *p, int depth) {
     if (strncmp(p, "null", 4) == 0)  return p + 4;
     if (*p == '-' || (*p >= '0' && *p <= '9')) {
         if (*p == '-') p++;
-        if (!(*p >= '0' && *p <= '9')) return NULL;
-        while (*p >= '0' && *p <= '9') p++;
+        if (*p == '0') {
+            p++;
+            if (*p >= '0' && *p <= '9') return NULL; /* RFC 8259 forbids leading zeros like 01 */
+        } else if (*p >= '1' && *p <= '9') {
+            while (*p >= '0' && *p <= '9') p++;
+        } else {
+            return NULL;
+        }
         if (*p == '.') {
             p++;
             if (!(*p >= '0' && *p <= '9')) return NULL;
@@ -493,29 +595,11 @@ static const char *j_skip_val(const char *p, int depth) {
     return NULL;
 }
 
-static int j_parse_str(const char *p, char *out, size_t cap) {
-    if (!p || !out || cap == 0) return -1;
-    p = j_skip_ws(p);
-    if (*p != '"') return -1;
-    p++;
-    size_t i = 0;
-    while (*p && *p != '"') {
-        char ch = *p++;
-        if (ch == '\\') {
-            if (!*p) return -1;
-            ch = *p++;
-        }
-        if (i + 1u >= cap) return -1;
-        out[i++] = ch;
-    }
-    if (*p != '"') return -1;
-    out[i] = '\0';
-    return 0;
-}
-
 static int j_parse_i64(const char *p, int64_t *out) {
     p = j_skip_ws(p);
     if (!(*p == '-' || (*p >= '0' && *p <= '9'))) return -1;
+    const char *q = (*p == '-') ? p + 1 : p;
+    if (*q == '0' && q[1] >= '0' && q[1] <= '9') return -1; /* Reject leading zero */
     char *end = NULL;
     errno = 0;
     long long v = strtoll(p, &end, 10);
@@ -531,17 +615,16 @@ static const char *j_find_top_field(const char *obj, const char *key) {
     if (*p != '{') return NULL;
     p = j_skip_ws(p + 1);
     if (*p == '}') return NULL;
-    size_t klen = strlen(key);
     for (;;) {
         if (*p != '"') return NULL;
-        const char *kstart = p + 1;
+        char kbuf[64];
+        int k_ok = (j_parse_str(p, kbuf, sizeof(kbuf)) == 0);
         const char *kend = j_skip_str(p);
         if (!kend) return NULL;
-        size_t found_len = (size_t)((kend - 1) - kstart);
         p = j_skip_ws(kend);
         if (*p != ':') return NULL;
         const char *val = j_skip_ws(p + 1);
-        if (found_len == klen && memcmp(kstart, key, klen) == 0) {
+        if (k_ok && strcmp(kbuf, key) == 0) {
             return val;
         }
         p = j_skip_val(val, 1);
@@ -742,5 +825,29 @@ fp_err_t sf_chain_submit_derivation(sf_chain_ctx_t *ctx, const fp_derivation_t *
                          ctx->cfg.io_timeout_ms, &status, resp, sizeof(resp));
     if (err != FP_OK) return err;
     const char *res_v = NULL;
-    return validate_jsonrpc_resp(resp, 3, &res_v);
+    err = validate_jsonrpc_resp(resp, 3, &res_v);
+    if (err != FP_OK) return err;
+    /* A9-SEC-02: Validate derivation submission result semantically (reject false, 0, {}, accepted:false) */
+    if (*res_v == '"') {
+        char receipt[160];
+        if (j_parse_str(res_v, receipt, sizeof(receipt)) != 0 || receipt[0] == '\0') {
+            return FP_ERR_INTEGRITY;
+        }
+        return FP_OK;
+    }
+    if (*res_v == '{') {
+        const char *acc_v = j_find_top_field(res_v, "accepted");
+        if (acc_v != NULL) {
+            if (strncmp(acc_v, "true", 4) != 0) return FP_ERR_INTEGRITY;
+            const char *after = j_skip_ws(acc_v + 4);
+            return (*after == ',' || *after == '}') ? FP_OK : FP_ERR_INTEGRITY;
+        }
+        const char *tx_v = j_find_top_field(res_v, "tx_id");
+        char receipt[160];
+        if (tx_v && j_parse_str(tx_v, receipt, sizeof(receipt)) == 0 && receipt[0] != '\0') {
+            return FP_OK;
+        }
+        return FP_ERR_INTEGRITY;
+    }
+    return FP_ERR_INTEGRITY;
 }
