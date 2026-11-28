@@ -130,6 +130,9 @@ test-clang:
 	$(MAKE) clean
 	$(MAKE) CC=clang USE_SYSTEM_BLAKE3=$(USE_SYSTEM_BLAKE3) all test examples security-check
 
+build/bench_fpm_transfer: bench/bench_fpm_transfer.c build/libsealframe.a | build
+	$(CC) $(CFLAGS) $< build/libsealframe.a -Wl,--wrap=fp_merkle_verify,--wrap=send,--wrap=sendto $(LDFLAGS) -o $@
+
 build/bench_%: bench/bench_%.c build/libsealframe.a | build
 	$(CC) $(CFLAGS) $< build/libsealframe.a $(LDFLAGS) -o $@
 
